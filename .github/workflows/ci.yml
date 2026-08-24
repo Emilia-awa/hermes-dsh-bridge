@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck
+        run: npx tsc -b --pretty false
+
+      - name: Build (tsdown bundle)
+        run: npm run build
+
+      - name: Unit tests (mock ctx, standalone)
+        run: node tests/unit_mock_p1.mjs
+
+      - name: Python client syntax check
+        run: python3 -m py_compile examples/hermes_dsh_mcp.py
+
+      # NOTE: integration suites (tests/integration_p1.py, tests/integration_p1_phase2.py)
+      # require a real Harness instance with a live LLM provider — run them locally.
