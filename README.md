@@ -1,85 +1,86 @@
 # hermes-dsh-bridge
 
-> Expose [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agent capabilities as an **MCP server**, letting any MCP client (e.g. [Hermes](https://hermes-agent.nousresearch.com/)) drive Harness to execute real coding tasks.
+> 专门桥接 **Hermes ↔ DeepSeek Harness** 的 MCP 插件：在 Harness 内部启动一个 MCP server，让外部 MCP 客户端（如 [Hermes](https://hermes-agent.nousresearch.com/)）驱动 Harness 的 Agent 执行真实编码任务。
 
-**Hermes is the brain, Harness is the arms — 1+1>2.**
+**Hermes 是大脑，Harness 是双手。**
 
 [![license](https://img.shields.io/badge/license-GPLv3-blue.svg)](./LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D22.18-orange)](https://nodejs.org)
+[![CI](https://github.com/Emilia-awa/hermes-dsh-bridge/workflows/CI/badge.svg)](https://github.com/Emilia-awa/hermes-dsh-bridge/actions)
 
-## Why this exists
+## 为什么存在
 
-Harness ships a powerful agent runtime (tools, LLM, agents, sessions), but it is a **Cordis app**, not something another agent can call. This plugin turns Harness inside-out: it starts a real **MCP server** (StreamableHTTP) *inside* Harness and bridges Harness's core services — `ctx.agents`, `ctx.agentPresets`, `ctx.tools` — so an external "brain" can delegate real work to Harness's "arms".
+Harness 自带强大的 Agent 运行时（工具、LLM、Agent、会话），但它是 **Cordis 应用**，别的 Agent 调不动它。这个插件把 Harness 翻了个面：在 Harness **内部**启动一个真正的 **MCP server**（StreamableHTTP），桥接 Harness 核心服务（`ctx.agents` / `ctx.agentPresets` / `ctx.tools`），让外部"大脑"把真正的活派给 Harness 的"双手"。
 
 ```
-Hermes (MCP client, brain)
+Hermes (MCP client, 大脑)
    │  agent_run / task_inbox / fs_read / session_stats ... (HTTP)
    ▼
-hermes-dsh-bridge (MCP server, :8090)
+harness-mcp-server (MCP server, :8090)
    │  ctx.agents.create → mount 'standard' preset
    ▼
-Harness agent — full toolset: bash, fs, todo, web…
+Harness agent — 完整工具集: bash, fs, todo, web…
 ```
 
-## Tools (19)
+## 工具（19 个）
 
-### Tasks
-| Tool | Direction | Purpose |
-|------|-----------|---------|
-| `agent_run` | → Harness | Run a task synchronously; returns structured result + run-scoped `stats` |
-| `task_inbox` | → Harness | Push a structured task (task + memory context + cwd) to an async queue |
-| `task_result` | ← Harness | Poll a queued task's structured result |
-| `task_list` | ← Harness | Snapshot of the async task queue (id/status/createdAt/error) |
+### 任务
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `agent_run` | → Harness | 同步执行任务；返回结构化结果 + 本轮 `stats` 统计 |
+| `task_inbox` | → Harness | 推结构化任务（任务+记忆上下文+cwd）进异步队列 |
+| `task_result` | ← Harness | 取回队列任务的结构化结果 |
+| `task_list` | ← Harness | 异步任务队列快照（id/status/createdAt/error） |
 
-### Sessions
-| Tool | Direction | Purpose |
-|------|-----------|---------|
-| `session_list` | ← | List sessions (live + persisted merged), with token/LLM-time summary per row |
-| `session_log` | ← | Read a session's event log (reasoning stripped), tail N events, filter by type |
-| `session_stats` | ← | Session statistics: rounds/steps/llmTime/toolTime/ttft/tokensPerSec/cacheHitRate/inputTokens/outputTokens |
-| `rename_session` | ← | Rename a session (archive-friendly) |
-| `attach_session` | ← | Group a session into a workspace |
+### 会话
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `session_list` | ← | 列会话（live+持久化合并），每行带 token/LLM 用时摘要 |
+| `session_log` | ← | 读会话事件日志（已剥离 reasoning），tail N 条、按类型过滤 |
+| `session_stats` | ← | 会话统计：rounds/steps/llmTime/toolTime/ttft/tokensPerSec/cacheHitRate/inputTokens/outputTokens |
+| `rename_session` | ← | 会话改名（便于归档区分） |
+| `attach_session` | ← | 会话归组到工作区 |
 
-### Files (jail-enforced)
-| Tool | Direction | Purpose |
-|------|-----------|---------|
-| `fs_read` | ← | Read text files with line-number pagination (path jail + sensitive-name blacklist) |
-| `fs_list` | ← | List directories recursively (sensitive entries hidden) |
-| `fs_stat` | ← | File/dir metadata |
-| `fs_write` | → | Write files (overwrite/append/create-new) — **opt-in** (`enableFsWrite: true`), workspaceRoots only |
+### 文件（受 path jail 约束）
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `fs_read` | ← | 读文本文件（行号分页；路径 jail + 敏感名黑名单） |
+| `fs_list` | ← | 列目录（递归 depth 层，敏感项自动隐藏） |
+| `fs_stat` | ← | 文件/目录元数据 |
+| `fs_write` | → | 写文件（overwrite/append/create-new）——**opt-in**（`enableFsWrite: true` 才注册），仅限 workspaceRoots |
 
-### Status & config
-| Tool | Direction | Purpose |
-|------|-----------|---------|
-| `status_get` | ← | Version/uptime/provider/model/preset/live agents/queue depth |
-| `config_get` | ← | Runtime config summary (authToken masked as `***`) |
+### 状态与配置
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `status_get` | ← | 版本/uptime/provider/model/preset/live agents/队列深度 |
+| `config_get` | ← | 运行时配置摘要（authToken 打码为 `***`） |
 
-### Presets
-| Tool | Direction | Purpose |
-|------|-----------|---------|
-| `preset_list` | ← | List available agent presets + default |
-| `preset_get` | ← | Query the effective preset of a session (or the default) |
-| `preset_set` | → | Switch default preset (`scope=new-default`) or a blank session's preset (`scope=session`) |
+### 预设
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `preset_list` | ← | 列出可用 agent preset + 默认 |
+| `preset_get` | ← | 查询会话实际生效的 preset（或默认） |
+| `preset_set` | → | 切换默认 preset（`scope=new-default`）或空白会话的 preset（`scope=session`） |
 
-### Meta
-| Tool | Direction | Purpose |
-|------|-----------|---------|
-| `echo` | — | Verify MCP connectivity |
-| `harness_list_tools` | — | List tool names registered inside Harness |
+### 元
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `echo` | — | 验证 MCP 连通 |
+| `harness_list_tools` | — | 列出 Harness 内部注册的工具名 |
 
-### Structured results & stats
+### 结构化结果与统计
 
-Every `agent_run` result is structured and includes run-level usage stats:
+每次 `agent_run` 返回结构化结果，并附带本轮用量统计：
 
 ```json
 {
   "sessionId": "...",
-  "assistantText": "final answer",
+  "assistantText": "最终回答",
   "toolCalls": [{ "name": "bash", "args": "..." }],
-  "toolResults": ["command output"],
-  "changes": "what was changed",
-  "verification": "how it was verified",
-  "leftovers": "open issues",
+  "toolResults": ["命令输出"],
+  "changes": "改了什么",
+  "verification": "怎么验证的",
+  "leftovers": "遗留问题",
   "stats": {
     "rounds": 1, "steps": 3,
     "llmTime": 13.9, "toolTime": 0.04,
@@ -89,82 +90,154 @@ Every `agent_run` result is structured and includes run-level usage stats:
 }
 ```
 
-This closes the loop between the client's persistent memory and Harness's coding: memory is fed into each task as `context`, and the result (`changes` / `verification` / `leftovers`) can be persisted back to the client's memory for the next run.
+闭环：客户端把记忆作为 `context` 喂进每次任务，结果（`changes`/`verification`/`leftovers`）再存回客户端记忆，供下一轮使用。
 
-## Install
+## 安装
 
-### Option A — from npm
+### 方式 A — 从 npm 安装到 Harness profile
 
 ```bash
+# 在 Harness profile 的 node_modules 下
+cd ~/.dsh/profiles/<你的profile>/node_modules
 npm install hermes-dsh-bridge
 ```
 
-Then reference the plugin from your Harness profile's cordis patch (see below).
-
-### Option B — from source
+### 方式 B — 源码构建
 
 ```bash
 git clone https://github.com/Emilia-awa/hermes-dsh-bridge.git
 cd hermes-dsh-bridge
-npm install && npm run build
-# copy the package (or symlink node_modules) into your Harness profile:
-#   ~/.dsh/profiles/<name>/node_modules/hermes-dsh-bridge
+npm install && npm run build   # 产出 lib/index.js
+# 把构建产物放进 Harness profile:
+#   ~/.dsh/profiles/<你的profile>/node_modules/hermes-dsh-bridge
 ```
 
-> ⚠️ **dual-package hazard**: Harness resolves `@deepseek-ai/*` modules from its *global* tree while this plugin's own `node_modules` may contain parallel copies — two module instances ⇒ `Symbol` mismatch ⇒ agents silently lose all tools. Fix: symlink the plugin's `@deepseek-ai/*` deps to the global tree:
+> ⚠️ **dual-package hazard（必读）**：Harness 从**全局树**解析 `@deepseek-ai/*`，而插件自身 node_modules 可能带平行副本——两个模块实例 ⇒ `Symbol` 不匹配 ⇒ Agent 悄悄失去全部工具（表现为 `agent_run` 只输出 `<tool_calls>` 文本、`toolCalls` 恒为空数组）。修复：把插件的 `@deepseek-ai/*` 依赖 symlink 到 Harness 全局树：
 > ```bash
-> PROFILE=~/.dsh/profiles/web/node_modules
+> PROFILE=~/.dsh/profiles/<你的profile>/node_modules
 > GLOBAL=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
-> for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope schemastery; do
+> for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
+>            dsh-agent-presets dsh-code-runtime dsh-system-prompt dsh-typert-protocol \
+>            dsh-attachment dsh-brand dsh-invariants dsh-timeout dsh-settings \
+>            dsh-home-paths dsh-atomic-write dsh-user-approval \
+>            cordis-plugin-include cordis-plugin-loader; do
 >   rm -rf "$PROFILE/@deepseek-ai/$pkg" && ln -sfn "$GLOBAL/$pkg" "$PROFILE/@deepseek-ai/$pkg"
 > done
 > ```
+> （`cordis-plugin-include/loader` 未发布到 npm registry，只在 Harness 全局树里，必须 symlink。）
 
-## Run
+### Patch 配置
 
-```bash
-export DEEPSEEK_API_KEY=...            # or any provider key your Harness uses
-dsh --profile <name> web --port 3080 --trusted-host your.host
-```
-
-The MCP server listens on `127.0.0.1:8090` (StreamableHTTP). Point any MCP client at `http://127.0.0.1:8090/mcp`.
-
-> ⚠️ **Security**: by default the server binds to `127.0.0.1` only. It exposes **remote code execution via `agent_run`** — do **not** bind it to `0.0.0.0` or expose it to the internet/LAN without adding authentication (Bearer token), TLS, and a reverse proxy first. See `docs/SECURITY.md`.
-
-## cordis.yml (patch format)
+在你的 Harness profile 的 `cordis.patch.yml`（或等价 patch 文件）末尾追加：
 
 ```yaml
 - insert:
-    - id: harness-mcp-server
+    - id: hermes-dsh-bridge
       name: 'hermes-dsh-bridge'
       config:
         http: true
         port: 8090
         host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
-        # authToken: 'your-secret-token'     # 可选: Bearer token 认证
-        # workspaceRoots: ['/workspace']      # 可选: cwd 白名单
-        # enableFsWrite: true                 # 可选: 开启 fs_write 工具(默认关)
-        # ⚠️ 必须显式声明 provider/model, 否则 agent 组装会因空 {model} 崩溃:
-        # provider: opencode-go
-        # model: deepseek-v4-flash
+        # authToken: '你的随机长token'     # 可选: Bearer token 认证
+        # workspaceRoots: ['/workspace']  # 可选: cwd 白名单
+        # enableFsWrite: true             # 可选: 开启 fs_write(默认关)
+        # ⚠️ 必须显式声明 provider/model, 否则 agent 组装会因空 {{model}} 崩溃:
+        provider: opencode-go
+        model: deepseek-v4-flash
 ```
 
-## Docs
+### 重启并验证
 
-- `docs/TOOLS.md` — full tool reference (params/schema/limits/error codes)
-- `docs/CONFIG.md` — config fields, security defaults
-- `docs/TROUBLESHOOTING.md` — known pitfalls (SSE parsing, 8KB truncation, dual-package hazard, …)
-- `docs/SECURITY.md` — threat model
-- `examples/hermes_dsh_mcp.py` — dependency-free Python MCP client (stdlib only)
+```bash
+systemctl restart dsh.service        # 或你管理 Harness 的方式
+# 验证 19 个工具全在线:
+python3 examples/hermes_dsh_mcp.py list
+python3 examples/hermes_dsh_mcp.py call status_get '{}'
+```
 
-## Positioning
+## 🤖 AI 一键安装指南（给 AI Agent 看的安装说明）
 
-This is best used as a **fallback tool**, not a daily driver: for everyday code edits, drive your primary agent directly. Reach for this when you need **context isolation** (huge refactors that would blow the client's context) or **parallel execution** of unrelated tasks.
+> 下面的步骤是给 **另一个 AI Agent** 看的：如果你是一个 AI agent，要把这个插件装到你管理的 Harness 环境里，请严格按以下编号步骤执行，每步做完检查输出再继续。
 
-- The agent session is **reused per cwd** (avoids re-loading project context on every call).
-- Bash runs sandboxed (`workspace-write`): install `bubblewrap` on the host, or the sandbox will refuse write commands.
-- Reasoning/thinking chunks are **stripped** from every result (double filter: plugin-side + text-level fallback).
+**前置检查（先做这 3 步）**
+1. 确认 Node ≥ 22.18：`node --version`（低于 22.18 会报 zstd/`stripTypeScriptTypes` 缺失，先升级 Node）。
+2. 确认目标 Harness profile 存在：`ls ~/.dsh/profiles/`（找到你要装的 profile 名，下文用 `<PROFILE>` 代替）。
+3. 确认 Harness 全局树存在：`npm root -g`（下文用 `$GLOBAL_TREE` 代替 `npm root -g`）。
+
+**安装步骤（复制即可执行）**
+```bash
+# ① 安装插件到 profile
+cd ~/.dsh/profiles/<PROFILE>/node_modules
+npm install hermes-dsh-bridge        # 未发布到 npm 前用方式 B（源码）
+
+# ② 修复 dual-package hazard: 把所有 @deepseek-ai/* 和 cordis-plugin-* symlink 到全局树
+GLOBAL_TREE=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
+for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
+           dsh-agent-presets dsh-code-runtime dsh-system-prompt dsh-typert-protocol \
+           dsh-attachment dsh-brand dsh-invariants dsh-timeout dsh-settings \
+           dsh-home-paths dsh-atomic-write dsh-user-approval \
+           cordis-plugin-include cordis-plugin-loader; do
+  rm -rf "@deepseek-ai/$pkg" 2>/dev/null
+  ln -sfn "$GLOBAL_TREE/$pkg" "@deepseek-ai/$pkg"
+done
+
+# ③ 在 profile 的 cordis patch 文件(cordis.patch.yml)末尾追加配置
+cat >> ~/.dsh/profiles/<PROFILE>/cordis.patch.yml <<'EOF'
+- insert:
+    - id: hermes-dsh-bridge
+      name: 'hermes-dsh-bridge'
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1
+        provider: opencode-go      # ← 换成你自己的 provider id
+        model: deepseek-v4-flash   # ← 换成你自己的 model id
+EOF
+
+# ④ 重启 Harness(注意: 若你正跑在 Harness 里, 用 systemd-run 脱离进程树重启)
+systemctl restart dsh.service
+
+# ⑤ 验证: 等 8 秒后检查 MCP server 起来 + 工具列表
+sleep 8
+curl -s -X POST http://127.0.0.1:8090/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ai-setup","version":"1.0"}}}' \
+  | tail -1 | head -c 300
+python3 examples/hermes_dsh_mcp.py list | grep -cE "agent_run|session_stats|preset_set"   # 期望 ≥ 3
+```
+
+**验收标准**
+- `dsh_mcp.py list` 输出 ≥ 19 个工具，其中必须包含 `agent_run`、`session_stats`、`preset_set`、`fs_read`。
+- `status_get` 返回的 `version` 为 `0.3.0`，`provider`/`model` 是你配置的值。
+- 跑一个冒烟任务 `python3 examples/hermes_dsh_mcp.py run '回复:安装成功'`，返回里含 `stats` 字段。
+
+**常见失败与对策（遇到再查）**
+| 症状 | 原因 | 对策 |
+|---|---|---|
+| `agent_run` 返回文本但 toolCalls 恒空 | dual-package hazard，symlink 被 npm 重装还原 | 重做第②步 symlink，重启 |
+| 启动报 `prompt variable "{{model}}" has no value` | patch 没写 provider/model | 补第③步的 provider/model |
+| `MISSING_CREDENTIAL: <provider>` | API key 没注入 Harness 进程 env | 在 systemd unit 加 `Environment=KEY=...` 或 export |
+| `Cannot find package '@deepseek-ai/cordis-plugin-include'` | 第②步漏了 cordis-plugin-* | 补 symlink 这两个包 |
+| 版本号符合但行为像旧版 | 系统里有双 npm 全局树，装错树 | `which dsh` + `npm prefix -g` 核对，统一到实际启动的树 |
+
+完整排障见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
+
+## 文档
+
+- [docs/TOOLS.md](docs/TOOLS.md) — 19 个工具的完整参考（入参/出参/限额/错误码）
+- [docs/CONFIG.md](docs/CONFIG.md) — 配置字段、安全默认值
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 已知坑（SSE 解析、8KB 截断、dual-package hazard…）
+- [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型
+- [examples/hermes_dsh_mcp.py](examples/hermes_dsh_mcp.py) — 零依赖 Python MCP 客户端（仅标准库）
+
+## 定位
+
+适合做**备用工具**而非日常主力：日常改代码请直接驱动你的主 Agent。需要**上下文隔离**（大重构会撑爆客户端上下文）或**并行执行**不相关任务时再找它。
+
+- Agent 会话按 cwd **复用**（避免每次调用重新加载项目上下文）。
+- Bash 沙箱化（`workspace-write`）：宿主机装 `bubblewrap`，否则写命令会被拒。
+- reasoning/thinking 块在返回前**剥离**（插件侧 + 文本级兜底双层过滤）。
 
 ## License
 
-[GPL-3.0-only](./LICENSE), with upstream MIT portions retained — see [NOTICE.md](./NOTICE.md).
+[GPL-3.0-only](./LICENSE)，上游 MIT 部分保留——见 [NOTICE.md](./NOTICE.md)。
