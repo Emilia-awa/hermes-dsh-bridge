@@ -23,6 +23,11 @@
  *   - fs_write                    : 写文件(opt-in: enableFsWrite, 仅限 workspaceRoots 内的路径 jail)
  *   - agent_run 结果新增 stats    : 本次执行的增量会话统计(同 session_stats 字段)
  *
+ *   -- P2 批次新增 --
+ *   - task_cancel                 : 取消队列任务(queued 移除 / running 尽力中止 / 终态报错)
+ *   - session_search              : 跨会话搜索(标题 + 尽力内容, 单会话 2s 超时)
+ *   - agent_run/task_inbox 新增 preset?: 请求级 preset 覆盖(仅影响新建/resume 的会话组合)
+ *
  * sessionId 续接: 指定 sessionId 时按 本进程池 → live 会话(UI 手开)→ 持久化 resume 三级接管,
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
  * 工作区分组: cwd 先 realpath 规范化再 `workspaceRegistry.resolveByPath ?? create` + attachSession;
@@ -51,6 +56,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { randomUUID } from 'node:crypto'
 import { readdir, readFile, realpath, stat, writeFile, appendFile, mkdir } from 'node:fs/promises'
 import http from 'node:http'
+import { zstdDecompressSync } from 'node:zlib'
 import { homedir } from 'node:os'
 import { join as joinPath, resolve, dirname, basename } from 'node:path'
 
@@ -58,7 +64,7 @@ import { join as joinPath, resolve, dirname, basename } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(status_get 上报; 与 package.json 保持同步) */
-const PLUGIN_VERSION = '0.3.0'
+const PLUGIN_VERSION = '0.4.0'
 
 /**
  * 声明依赖的核心服务。
@@ -337,8 +343,8 @@ async function attachSessionCwd(ctx: Context, sessionId: SessionId, cwd: string 
   await attachToWorkspace(ctx, await canonicalCwd(cwd), sessionId)
 }
 
-/** 常驻 agent 会话(按 cwd 复用, 省 token: 避免每次全量加载项目上下文) */
-const liveAgents = new Map<string, { sessionId: SessionId; handle: AgentHandle }>()
+/** 常驻 agent 会话(按 cwd 复用, 省 token: 避免每次全量加载项目上下文); preset 记录组合时所用值 */
+const liveAgents = new Map<string, { sessionId: SessionId; handle: AgentHandle; preset: string }>()
 
 /** sessionId → cwd 索引(支持按 session 续接: 指定 sessionId 时定位到对应 cwd 的常驻会话) */
 const sessionToCwd = new Map<string, string>()
@@ -354,8 +360,11 @@ interface ResolvedAgent {
   disposeAfter?: boolean
 }
 
-/** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名 */
-async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string): Promise<ResolvedAgent> {
+/** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名;
+ *  传 requestPreset 时本次组装用该 preset(A: 请求级覆盖, 仅影响新建/resume, 已有会话组合固化不换) */
+async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string, requestPreset?: string): Promise<ResolvedAgent> {
+  // A: 生效 preset = 请求级覆盖 ?? 运行时默认(三级覆盖链里的 request 级)
+  const effectivePreset = requestPreset ?? runtimeConfig.preset
   // 指定 sessionId: 接管已有会话(长任务分多轮投喂 / 中断后恢复 / UI 手开的会话)
   if (sessionId) {
     // 先看本进程常驻池(指定 sessionId 时定位到对应 cwd 的常驻会话; 命中 LRU 移到末尾, 保留上游语义)
@@ -393,7 +402,7 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
             console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
             return
           }
-          await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
+          await ctx.agentPresets.mount(agentCtx, effectivePreset)
         },
       })
     } catch (e) {
@@ -404,7 +413,8 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     return { sessionId: sid, handle, disposeAfter: true }
   }
   const existing = liveAgents.get(cwd)
-  if (existing) {
+  // A: 池会话的 preset 在组合时已固化; 请求级覆盖与其不一致时不复用, 落到下方创建不入池的专用会话
+  if (existing && (requestPreset === undefined || existing.preset === requestPreset)) {
     // LRU: 命中则移到末尾(最近使用)
     liveAgents.delete(cwd)
     liveAgents.set(cwd, existing)
@@ -430,7 +440,7 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
   const handle = await ctx.agents.create({
     sessionId: newSessionId,
     // 声明 preset: 为未来 Harness 版本消费 meta.agentPreset 做准备; 当前版本靠 setup 里手动 mount 兜底。
-    meta: { cwd: canonical, agentPreset: runtimeConfig.preset },
+    meta: { cwd: canonical, agentPreset: effectivePreset },
     agentOptions: {
       provider: runtimeConfig.provider,
       // model 为空则省略, 让 dsh 跟随用户/默认设置; 显式配置则覆盖
@@ -446,12 +456,15 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
         console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
         return
       }
-      await ctx.agentPresets.mount(agentCtx, runtimeConfig.preset)
+      await ctx.agentPresets.mount(agentCtx, effectivePreset)
     },
   })
-  const rec = { sessionId: newSessionId, handle }
-  liveAgents.set(cwd, rec)
-  sessionToCwd.set(String(newSessionId), cwd)
+  const rec = { sessionId: newSessionId, handle, preset: effectivePreset }
+  // A: 只有默认 preset 的会话进 cwd 池; 请求级覆盖的专用会话不入池(避免污染后续默认调用的复用键)
+  if (requestPreset === undefined || requestPreset === runtimeConfig.preset) {
+    liveAgents.set(cwd, rec)
+    sessionToCwd.set(String(newSessionId), cwd)
+  }
 
   // 分组: 把会话归属到 cwd 对应的工作区(resolveByPath ?? create + attachSession; 可选依赖; headless 环境自动跳过)
   void (async () => {
@@ -538,8 +551,18 @@ function truncateResult(result: TaskResult): TaskResult {
   }
 }
 
-/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果 */
-async function executeTask(ctx: Context, task: string, context: string, cwd: string, resumeSessionId?: string, title?: string): Promise<TaskResult> {
+/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
+ *  P2 opts: preset=请求级覆盖; onSessionStart=拿到 agent 会话后回调(B 登记 taskRunSessions);
+ *  isCancelled=协作取消探测(B: 锁内/followup 前两个检查点)。 */
+async function executeTask(
+  ctx: Context,
+  task: string,
+  context: string,
+  cwd: string,
+  resumeSessionId?: string,
+  title?: string,
+  opts?: { preset?: string; onSessionStart?: (sid: string) => void; isCancelled?: () => boolean },
+): Promise<TaskResult> {
   // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
   // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
   const workdir = await canonicalCwd(cwd ? resolve(cwd) : process.cwd())
@@ -556,8 +579,13 @@ async function executeTask(ctx: Context, task: string, context: string, cwd: str
   // sessionId 用 session 锁, 否则用 cwd 锁——都防同一 agent 会话被并发 followup
   const lockKey = resumeSessionId ? `session:${resumeSessionId}` : workdir
   return withLock(lockKey, async () => {
-    const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title)
+    // B 协作取消点 1: 还在等锁/未起 agent 时被取消 → 直接放弃执行
+    if (opts?.isCancelled?.()) throw new Error('task cancelled before execution')
+    const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title, opts?.preset)
+    opts?.onSessionStart?.(String(sessionId))
     lastAgentSessionId = String(sessionId) // 供 session_stats 无参调用返回"当前 Agent 会话"
+    // B 协作取消点 2: 等锁期间被取消、刚拿到 agent → followup 前放弃(不发 LLM 请求)
+    if (opts?.isCancelled?.()) throw new Error('task cancelled before execution')
     const baseline = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? []).length
 
     // 组装完整任务文本: 记忆上下文 + 任务 + 结构化输出要求
@@ -651,13 +679,19 @@ interface TaskItem {
   cwd: string
   sessionId?: string
   title?: string
-  status: 'queued' | 'running' | 'done' | 'error'
+  /** A: 请求级 preset 覆盖(缺省用运行时默认) */
+  preset?: string
+  status: 'queued' | 'running' | 'done' | 'error' | 'cancelled'
+  /** B: 已请求取消(running 中止 / 锁内协作取消), 收尾时置 status='cancelled' 并丢弃结果 */
+  cancelled?: boolean
   result?: TaskResult
   error?: string
   createdAt: number
   finishedAt?: number
 }
 const taskQueue = new Map<string, TaskItem>()
+/** B: 执行中任务 → agent 会话 id(task_cancel 用它定位要中止的 Agent; executeTask onSessionStart 登记) */
+const taskRunSessions = new Map<string, string>()
 
 /** 找会话 header: live 优先, 其次持久化 list(轻量元数据扫描, 不加载整日志) */
 async function findSessionHeader(ctx: Context, sessionId: SessionId): Promise<SessionHeader | undefined> {
@@ -669,6 +703,18 @@ async function findSessionHeader(ctx: Context, sessionId: SessionId): Promise<Se
     if (header.id === sessionId) return header
   }
   return undefined
+}
+
+/** live + 持久化 header 合并(live 优先), 按 id 去重(session_list / 存量捞回 / session_search 共用) */
+async function listMergedHeaders(ctx: Context): Promise<Map<string, SessionHeader>> {
+  const headers = new Map<string, SessionHeader>()
+  const store = ctx.get('sessions') as SessionsStoreView | undefined
+  for (const s of store?.list?.() ?? []) headers.set(s.header.id, s.header)
+  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+  for (const h of (await persistence?.list?.()) ?? []) {
+    if (!headers.has(h.id)) headers.set(h.id, h)
+  }
+  return headers
 }
 
 // ═══════════════════════ 会话查看(session_list / session_log)辅助 ═══════════════════════
@@ -699,6 +745,28 @@ function presetFromEvents(header: SessionHeader | undefined, events: readonly un
     return resolveSessionPreset({ header, events: events as Parameters<typeof resolveSessionPreset>[0]['events'] })
   } catch {
     return header.agentPreset
+  }
+}
+
+/**
+ * A: 请求级 preset 覆盖预检(与 preset_set new-default 同款 resolve 校验)。
+ * 可用返回 undefined; 未知返回错误文案 `unknown preset <id>; available: [...]`
+ * (available 优先取 UnknownPresetError.available, 缺失时回退 list() 花名册)。
+ */
+async function presetOverrideError(ctx: Context, presetId: string): Promise<string | undefined> {
+  try {
+    await ctx.agentPresets.resolve(presetId)
+    return undefined
+  } catch (e) {
+    const fromErr = (e as { available?: readonly string[] })?.available
+    let names: string[] = fromErr ? [...fromErr] : []
+    if (names.length === 0) {
+      try {
+        const svc = ctx.agentPresets as unknown as { list?: () => Promise<{ id: string }[]> } | undefined
+        names = ((await svc?.list?.()) ?? []).map((p) => p.id)
+      } catch { /* 服务缺失 → 空名单 */ }
+    }
+    return `unknown preset ${presetId}; available: [${names.join(', ')}]`
   }
 }
 
@@ -920,6 +988,175 @@ function presentSessionStats(s: SessionStatsFold, opts: { scope: 'run' | 'sessio
   }
 }
 
+// ═══════════════════════ P2: session_search 辅助 ═══════════════════════
+
+/** 单会话内容搜索的读取时限(毫秒) */
+const SESSION_SEARCH_TIMEOUT_MS = 2000
+/** 单会话参与内容匹配的文本上限(chars), 防超大日志拖垮整体扫描 */
+const SESSION_SEARCH_MAX_TEXT_CHARS = 2 * 1024 * 1024
+/** zstd 帧魔数(小端 0xFD2FB528) */
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd])
+
+/**
+ * 解压 dsh 落盘的 session.jsonl.zstd: 多个 zstd 帧顺序拼接(每次 flush 追加一帧),
+ * 整文件单次 sync 解压只能拿到首帧。按魔数切分逐帧解压; 魔数若误现于帧载荷内,
+ * 向后合并相邻分段直到解压成功(合并到文件尾仍失败则该帧损坏, 跳过)。
+ */
+function decompressZstdFile(buf: Buffer): string {
+  const offs: number[] = []
+  for (let p = buf.indexOf(ZSTD_MAGIC); p !== -1; p = buf.indexOf(ZSTD_MAGIC, p + 4)) offs.push(p)
+  if (offs.length === 0) return ''
+  let text = ''
+  let k = 0
+  while (k < offs.length) {
+    const start = offs[k] as number
+    let end = k + 1
+    let decoded: string | null = null
+    for (;;) {
+      const seg = end < offs.length ? buf.subarray(start, offs[end] as number) : buf.subarray(start)
+      try {
+        decoded = zstdDecompressSync(seg).toString('utf8')
+        break
+      } catch {
+        if (end < offs.length) end += 1
+        else break
+      }
+    }
+    if (decoded !== null) text += decoded
+    k = decoded !== null ? end : k + 1
+  }
+  return text
+}
+
+/** Promise 限时: 超时返回 undefined(不中断原 promise, 只是不再等它) */
+async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<undefined>((res) => {
+    timer = setTimeout(() => res(undefined), ms)
+  })
+  try {
+    return await Promise.race([p, timeout])
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
+}
+
+/**
+ * 读单会话事件流(session_search 用): persistence.inspect(带 AbortSignal+限时, 已解压事件)
+ * → live log → locate(path) 落盘文件多帧 zstd 兜底。都不可得返回 undefined。
+ */
+async function readSessionEventsSearch(ctx: Context, header: SessionHeader): Promise<{ events: unknown[]; source: 'persisted' | 'live' | 'file' } | undefined> {
+  const sid = SessionId(header.id)
+  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+  if (persistence?.inspect) {
+    try {
+      const insp = await withTimeout(persistence.inspect(sid, AbortSignal.timeout(SESSION_SEARCH_TIMEOUT_MS)), SESSION_SEARCH_TIMEOUT_MS + 500)
+      if (insp) return { events: [...insp.events], source: 'persisted' }
+    } catch { /* 未持久化/超时/中止 → 回退 */ }
+  }
+  const store = ctx.get('sessions') as SessionsStoreView | undefined
+  const live = store?.get?.(sid) as { log?: unknown[] } | undefined
+  if (live?.log && live.log.length > 0) return { events: [...live.log], source: 'live' }
+  // 兜底: 直接读落盘文件(node:zlib 多帧 zstd)。locate 给真实路径, 不自算目录 slug。
+  if (persistence?.locate) {
+    try {
+      const loc = persistence.locate(header)
+      if (loc?.path) {
+        const buf = await readFile(loc.path)
+        const text = decompressZstdFile(buf)
+        if (text) {
+          const events: unknown[] = []
+          for (const line of text.split('\n')) {
+            if (!line.trim()) continue
+            try { events.push(JSON.parse(line)) } catch { /* 坏行跳过 */ }
+          }
+          return { events, source: 'file' }
+        }
+      }
+    } catch { /* 读不到/解压失败 → 放弃该会话内容搜索 */ }
+  }
+  return undefined
+}
+
+/** session_search 结果行 */
+interface SessionSearchRow {
+  sessionId: string
+  title: string
+  cwd?: string
+  updatedAt: number
+  matched: 'title' | 'content'
+  snippet?: string
+}
+
+/** 命中判定: 正则模式 re.test, 否则大小写不敏感子串 */
+function searchHit(text: string, re: RegExp | undefined, needle: string): boolean {
+  if (re) return re.test(text)
+  return text.toLowerCase().includes(needle)
+}
+
+/** 首个命中位置(正则 exec / 小写子串 indexOf; lowerText 为 text 的小写形式, 非 正则时必传) */
+function searchIndexOf(text: string, re: RegExp | undefined, lowerText: string, needle: string): number {
+  if (re) {
+    const m = re.exec(text)
+    return m ? m.index : -1
+  }
+  return lowerText.indexOf(needle)
+}
+
+/** 取命中 ±60 字符的 snippet(空白压缩成单空格) */
+function snippetAround(text: string, index: number, matchLen: number): string {
+  const start = Math.max(0, index - 60)
+  const end = Math.min(text.length, index + matchLen + 60)
+  return text.slice(start, end).replace(/\s+/g, ' ').trim()
+}
+
+/** 搜索单会话: 标题优先, 未命中再尽力扫内容(collectText 已跳过 reasoning 块)。 */
+async function searchOneSession(
+  ctx: Context,
+  header: SessionHeader,
+  updatedAt: number,
+  m: { re?: RegExp; needle: string; rawLen: number },
+): Promise<{ row?: SessionSearchRow; contentSearched: boolean }> {
+  let title = `(untitled ${String(header.id).slice(0, 8)})`
+  let found: { events: unknown[]; source: string } | undefined
+  try {
+    found = await readSessionEventsSearch(ctx, header)
+  } catch { /* 单会话读取失败 → 仅标题兜底 */ }
+  if (found) {
+    const t = titleFromEvents(found.events)
+    if (t !== undefined) title = t
+  }
+  if (searchHit(title, m.re, m.needle)) {
+    return {
+      row: { sessionId: String(header.id), title, ...(header.cwd !== undefined ? { cwd: header.cwd } : {}), updatedAt, matched: 'title' },
+      contentSearched: found !== undefined,
+    }
+  }
+  if (!found) return { contentSearched: false }
+  // 内容搜索: 逐文本块匹配(stripReasoning 剥推理), 总量封顶防超大日志
+  const texts: string[] = []
+  try { collectText(found.events, texts) } catch { /* 忽略畸形事件 */ }
+  let budget = SESSION_SEARCH_MAX_TEXT_CHARS
+  for (const raw of texts) {
+    if (budget <= 0) break
+    const chunk = raw.length > 20000 ? raw.slice(0, 20000) : raw
+    budget -= chunk.length
+    const cleaned = stripReasoning(chunk)
+    if (!cleaned) continue
+    const idx = searchIndexOf(cleaned, m.re, cleaned.toLowerCase(), m.needle)
+    if (idx >= 0) {
+      return {
+        row: {
+          sessionId: String(header.id), title, ...(header.cwd !== undefined ? { cwd: header.cwd } : {}),
+          updatedAt, matched: 'content', snippet: snippetAround(cleaned, idx, Math.max(1, m.rawLen)),
+        },
+        contentSearched: true,
+      }
+    }
+  }
+  return { contentSearched: true }
+}
+
 /** 当前 Agent 会话(最近一次 agent_run/task 执行的会话), 供 session_stats 无参调用 */
 let lastAgentSessionId: string | undefined
 
@@ -996,14 +1233,8 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
   for (const ws of registry?.list?.() ?? []) byPath.set(ws.path, ws)
   if (byPath.size === 0) return { attached: 0, failed: 0 }
 
-  // live + 持久化 header 合并(live 优先), 按 id 去重
-  const headers = new Map<string, SessionHeader>()
-  const sessions = ctx.get('sessions') as SessionsStoreView | undefined
-  for (const session of sessions?.list?.() ?? []) headers.set(session.header.id, session.header)
-  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
-  for (const header of (await persistence?.list?.()) ?? []) {
-    if (!headers.has(header.id)) headers.set(header.id, header)
-  }
+  // live + 持久化 header 合并(live 优先), 按 id 去重(共用实现)
+  const headers = await listMergedHeaders(ctx)
 
   let attached = 0
   let failed = 0
@@ -1243,14 +1474,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     async ({ cwd, limit }) => {
       try {
         const max = Math.min(Math.max(1, Math.trunc(limit ?? 20)), SESSION_LIST_MAX_ROWS)
-        // live + 持久化合并(live 优先), 按 id 去重
-        const headers = new Map<string, SessionHeader>()
-        const store = ctx.get('sessions') as SessionsStoreView | undefined
-        for (const s of store?.list?.() ?? []) headers.set(s.header.id, s.header)
-        const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
-        for (const h of (await persistence?.list?.()) ?? []) {
-          if (!headers.has(h.id)) headers.set(h.id, h)
-        }
+        // live + 持久化合并(live 优先), 按 id 去重(与存量捞回/session_search 共用)
+        const headers = await listMergedHeaders(ctx)
         let rows = [...headers.values()]
         // cwd 过滤: 双侧 realpath 规范化后精确比对
         if (cwd) {
@@ -1378,6 +1603,77 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         return out(JSON.stringify({ ...stats, source }, null, 2))
       } catch (e) {
         return out(JSON.stringify({ error: `session_stats failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+    },
+  )
+
+  // ── P2: 跨会话搜索(session_search) ──
+  mcp.tool(
+    'session_search',
+    '跨会话搜索: 标题匹配 + 尽力内容搜索(持久化事件, 单会话 2s 超时跳过)。返回 {query,regex,total,count,content_search,results:[{sessionId,title,cwd,updatedAt,matched,snippet?}]}(≤20 条)。',
+    {
+      query: z.string().min(1).describe('搜索词(regex=false 时为大小写不敏感子串)'),
+      cwd: z.string().optional().describe('按工作目录过滤(realpath 规范化后精确匹配)'),
+      regex: z.boolean().optional().describe('把 query 当正则(默认 false)'),
+      limit: z.number().int().min(1).max(200).optional().describe('最多扫描最近 N 个会话(默认 50)'),
+    },
+    async ({ query, cwd, regex, limit }) => {
+      try {
+        if (!query || !query.trim()) return out(JSON.stringify({ error: 'query must not be empty' }))
+        let re: RegExp | undefined
+        if (regex) {
+          try {
+            re = new RegExp(query)
+          } catch (e) {
+            return out(JSON.stringify({ error: `invalid regex: ${(e as Error)?.message ?? String(e)}` }))
+          }
+        }
+        const needle = query.toLowerCase()
+        const maxScan = Math.min(Math.max(1, Math.trunc(limit ?? 50)), 200)
+        const headers = await listMergedHeaders(ctx)
+        let rows = [...headers.values()]
+        // cwd 过滤: 双侧 realpath 规范化后精确比对
+        if (cwd) {
+          const target = await canonicalCwd(resolve(cwd))
+          const filtered: SessionHeader[] = []
+          for (const h of rows) {
+            if (h.cwd === undefined) continue
+            if (await canonicalCwd(h.cwd) === target) filtered.push(h)
+          }
+          rows = filtered
+        }
+        // 粗排(updatedAt desc)取最近 N 个扫描
+        const withRough = await Promise.all(rows.map(async (h) => ({ h, at: await roughUpdatedAt(ctx, h) })))
+        withRough.sort((a, b) => b.at - a.at)
+        const scanned = withRough.slice(0, maxScan)
+        // 并发 8 消费; 单会话读取有 ~2s 时限, 最坏总耗时 ≈ ceil(N/8)*2s
+        const hits: SessionSearchRow[] = []
+        let contentSearched = false
+        const queue = [...scanned]
+        const worker = async (): Promise<void> => {
+          for (;;) {
+            const it = queue.shift()
+            if (!it) return
+            try {
+              const r = await searchOneSession(ctx, it.h, Math.round(it.at), { re, needle, rawLen: query.length })
+              if (r.contentSearched) contentSearched = true
+              if (r.row) hits.push(r.row)
+            } catch { /* 单会话失败不影响整体 */ }
+          }
+        }
+        await Promise.all(Array.from({ length: Math.min(8, queue.length) }, worker))
+        hits.sort((a, b) => b.updatedAt - a.updatedAt)
+        return out(JSON.stringify({
+          query,
+          regex: Boolean(regex),
+          total: scanned.length,
+          count: hits.length,
+          truncated: hits.length > 20,
+          content_search: contentSearched,
+          results: hits.slice(0, 20),
+        }, null, 2))
+      } catch (e) {
+        return out(JSON.stringify({ error: `session_search failed: ${(e as Error)?.message ?? String(e)}` }))
       }
     },
   )
@@ -1575,9 +1871,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       cwd: z.string().optional().describe('工作目录(默认当前)'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
       title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
+      preset: z.string().optional().describe('本次任务的 preset 覆盖(见 preset_list); 仅影响新建/resume 的会话组合, 已有会话保持原 preset'),
     },
-    async ({ task, context, cwd, sessionId, title }) => {
-      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title)
+    async ({ task, context, cwd, sessionId, title, preset }) => {
+      // A: 请求级 preset 预检(未知即拒, 带 available 名单)
+      if (preset) {
+        const bad = await presetOverrideError(ctx, preset)
+        if (bad) return out(JSON.stringify({ error: bad }))
+      }
+      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title, preset ? { preset } : undefined)
       return out(JSON.stringify(truncateResult(result), null, 2))
     },
   )
@@ -1592,12 +1894,18 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       cwd: z.string().optional().describe('工作目录'),
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果)'),
       title: z.string().optional().describe('新会话的标题(创建时命名)'),
+      preset: z.string().optional().describe('本次任务的 preset 覆盖(见 preset_list); 仅影响新建/resume 的会话组合'),
     },
-    async ({ task, context, cwd, sessionId, title }) => {
+    async ({ task, context, cwd, sessionId, title, preset }) => {
+      // A: 请求级 preset 预检(入队前即拒, 不占队列容量)
+      if (preset) {
+        const bad = await presetOverrideError(ctx, preset)
+        if (bad) return out(JSON.stringify({ error: bad }))
+      }
       const now = Date.now()
-      // TTL 清理: 删除已完成/失败且超时的任务
+      // TTL 清理: 删除已完成/失败/已取消且超时的任务
       for (const [tid, t] of taskQueue) {
-        if ((t.status === 'done' || t.status === 'error') && t.finishedAt && now - t.finishedAt > runtimeConfig.taskTtlMs) {
+        if ((t.status === 'done' || t.status === 'error' || t.status === 'cancelled') && t.finishedAt && now - t.finishedAt > runtimeConfig.taskTtlMs) {
           taskQueue.delete(tid)
         }
       }
@@ -1612,18 +1920,30 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued', createdAt: now,
         ...(sessionId ? { sessionId } : {}),
         ...(title ? { title } : {}),
+        ...(preset ? { preset } : {}),
       }
       taskQueue.set(id, item)
       // 异步执行(不阻塞 Hermes)
       void (async () => {
         item.status = 'running'
         try {
-          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title)
+          item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, {
+            ...(item.preset ? { preset: item.preset } : {}),
+            onSessionStart: (sid) => { taskRunSessions.set(id, sid) },
+            isCancelled: () => item.cancelled === true,
+          })
           item.result.taskId = id
           item.status = 'done'
         } catch (e) {
           item.error = String(e)
           item.status = 'error'
+        }
+        taskRunSessions.delete(id)
+        // B 取消收尾: cancelled 标志压过 done/error(协作取消抛错也归此), 结果丢弃
+        if (item.cancelled) {
+          item.status = 'cancelled'
+          delete item.result
+          delete item.error
         }
         item.finishedAt = Date.now()
       })()
@@ -1651,7 +1971,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P1: 任务队列快照(task_list) ──
   mcp.tool(
     'task_list',
-    '异步任务队列快照: [{id,status,createdAt,error,...}](新任务在前, 最多 100 条)。status ∈ queued|running|done|error。',
+    '异步任务队列快照: [{id,status,createdAt,error,...}](新任务在前, 最多 100 条)。status ∈ queued|running|done|error|cancelled。',
     {},
     async () => {
       try {
@@ -1664,6 +1984,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           ...(t.finishedAt !== undefined ? { finishedAt: t.finishedAt } : {}),
           ...(t.error !== undefined ? { error: t.error } : {}),
           ...(t.title ? { title: t.title } : {}),
+          ...(t.preset ? { preset: t.preset } : {}),
           cwd: t.cwd,
           ...(t.sessionId ? { sessionId: t.sessionId } : {}),
           hasResult: Boolean(t.result),
@@ -1671,6 +1992,56 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         return out(JSON.stringify({ total: all.length, active, count: tasks.length, truncated: all.length > tasks.length, tasks }, null, 2))
       } catch (e) {
         return out(JSON.stringify({ error: `task_list failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+    },
+  )
+
+  // ── P2: 取消队列任务(task_cancel) ──
+  mcp.tool(
+    'task_cancel',
+    '取消 task_inbox 提交的任务。queued: 直接移除; running: 尽力中止(agent.cancel, 结果丢弃, 会话保留可续接; 未起 agent 时在锁内协作取消); done/error/cancelled/不存在: 明确报错不可取消。',
+    { taskId: z.string().describe('task_inbox 返回的 taskId') },
+    async ({ taskId }) => {
+      try {
+        const item = taskQueue.get(taskId)
+        if (!item) return out(JSON.stringify({ ok: false, error: `task ${taskId} not cancellable (status=missing)` }))
+        if (item.status === 'queued') {
+          // 还没开跑(仅存在于入队同 tick 的窗口): 直接出队即取消
+          item.status = 'cancelled'
+          taskQueue.delete(taskId)
+          return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'queued', taskId }))
+        }
+        if (item.status === 'running') {
+          const sid = taskRunSessions.get(taskId)
+          let agent: { cancel?: (cause: unknown, opts?: unknown) => void } | undefined
+          if (sid) {
+            try {
+              agent = ctx.agents.get(SessionId(sid)) as typeof agent
+            } catch { agent = undefined }
+          }
+          if (!sid || !agent?.cancel) {
+            // 定位不到 agent: 若任务还在等锁(未起 agent), cancelled 标志会在协作检查点生效;
+            // 已起但 registry 里找不到(rare race)则无法主动中止 → 明确失败
+            const waitingOnLock = sid === undefined
+            if (waitingOnLock) {
+              item.cancelled = true
+              return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'running', taskId, note: 'agent not started yet; will be cancelled at cooperative checkpoint' }))
+            }
+            return out(JSON.stringify({ ok: false, error: 'task running; no abort API', hint: '等待完成或 sessionId 续接接管' }))
+          }
+          // 先置标志再 cancel: 防 whenIdle 恰在此间收敛、runner 抢先落 done 的竞态
+          item.cancelled = true
+          try {
+            agent.cancel({ kind: 'user' })
+          } catch (e) {
+            delete item.cancelled
+            return out(JSON.stringify({ ok: false, error: `cancel failed: ${(e as Error)?.message ?? String(e)}`, hint: '等待完成或 sessionId 续接接管' }))
+          }
+          return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'running', taskId, sessionId: sid, note: 'abort requested; result will be discarded' }))
+        }
+        return out(JSON.stringify({ ok: false, error: `task ${taskId} not cancellable (status=${item.status})` }))
+      } catch (e) {
+        return out(JSON.stringify({ error: `task_cancel failed: ${(e as Error)?.message ?? String(e)}` }))
       }
     },
   )
@@ -1846,7 +2217,11 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       sessionToCwd.clear()
       agentLocks.clear()
       taskQueue.clear()
+      taskRunSessions.clear()
       lastAgentSessionId = undefined
     }
   }, 'harness-mcp-server')
 }
+
+/** 测试专用内部通道(mock 测试直接操纵队列状态, 绕开异步时序; 非公开 API) */
+export const __internals = { taskQueue, taskRunSessions }
