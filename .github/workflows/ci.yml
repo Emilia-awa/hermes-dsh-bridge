@@ -39,7 +39,9 @@ jobs:
         run: npm run build
 
       - name: Unit tests (mock ctx, standalone)
-        run: node tests/unit_mock_p1.mjs
+        run: |
+          node tests/unit_mock_p1.mjs
+          node tests/unit_mock_p2.mjs
 
       - name: Python client syntax check
         run: python3 -m py_compile examples/hermes_dsh_mcp.py
