@@ -8,7 +8,7 @@
   "files": [
     "lib",
     "src",
-    "cordis.yml",
+    "cordis.patch.yml",
     "README.md",
     "NOTICE.md"
   ],
@@ -34,7 +34,7 @@
   },
   "dsh": {
     "bundle": {
-      "patch": "./cordis.yml"
+      "patch": "./cordis.patch.yml"
     }
   },
   "license": "GPL-3.0-only",
