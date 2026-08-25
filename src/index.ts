@@ -1066,6 +1066,13 @@ function startApprovalsBridge(ctx: Context): () => void {
   }
 
   // builtin 降级/显式: 自注册 answerer(waterfall; 不调 next 即认领本次请求)
+  if (typeof (ctx as { on?: unknown }).on !== 'function') {
+    // 无事件能力的宿主(如部分 mock/headless 组合)无法注册 waterfall answerer → 关闭桥,
+    // 避免 ctx.on is not a function 崩溃; 审批请求按 fail-closed 无 answerer 处理。
+    activeBridgeKind = 'off'
+    console.warn('[approvals] host 无 ctx.on 事件能力, builtin 桥关闭(approvalsBridge=off)')
+    return () => {}
+  }
   activeBridgeKind = 'builtin'
   ctx.on('approval/request', (req, next) => {
     if (req.signal?.aborted === true) return Promise.resolve<ApprovalOutcome>('cancelled')
