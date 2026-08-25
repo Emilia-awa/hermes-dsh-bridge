@@ -4,7 +4,17 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.3.0] - 2026-08-25
+## [0.4.0] - 2026-08-25
+
+### Added
+- `agent_run`/`task_inbox` accept an optional `preset` parameter — per-task preset override (single-use, does not touch the global default; unknown id errors with the `available` list). The live-agent pool skips cached sessions whose preset differs from the request.
+- `task_cancel` tool: cancel queued tasks (removed from queue) or running tasks (real turn abort via `agent.cancel({kind:'user'})`; result discarded, session preserved for resume). Done/error/missing ids return explicit errors.
+- `session_search` tool: cross-session search over titles + content (persisted events via `persistence.inspect`, zstd multi-frame decompress fallback; per-session 2s timeout, concurrency 8, results capped at 20 with snippets).
+- Shared `listMergedHeaders()` helper reused by `session_list`, orphan reattach, and `session_search` (dedup).
+- `tests/unit_mock_p2.mjs`: mock-ctx unit suite covering all three features (preset validation/mount/pool-miss, task_cancel branches incl. cooperative cancel, session_search title/content/regex/limits/degradation).
+
+### Changed
+- Version 0.3.0 → 0.4.0.
 
 ### Added
 - `session_stats` tool: session statistics (rounds/steps/llmTime/toolTime/ttft/tokensPerSec/cacheHitRate/inputTokens/outputTokens); no-arg = most recent agent session.

@@ -22,15 +22,16 @@ harness-mcp-server (MCP server, :8090)
 Harness agent — 完整工具集: bash, fs, todo, web…
 ```
 
-## 工具（19 个）
+## 工具（21 个）
 
 ### 任务
 | 工具 | 方向 | 用途 |
 |------|------|------|
-| `agent_run` | → Harness | 同步执行任务；返回结构化结果 + 本轮 `stats` 统计 |
-| `task_inbox` | → Harness | 推结构化任务（任务+记忆上下文+cwd）进异步队列 |
+| `agent_run` | → Harness | 同步执行任务；返回结构化结果 + 本轮 `stats` 统计；可选 `preset` 参数单次覆盖预设 |
+| `task_inbox` | → Harness | 推结构化任务（任务+记忆上下文+cwd+可选 `preset`）进异步队列 |
 | `task_result` | ← Harness | 取回队列任务的结构化结果 |
 | `task_list` | ← Harness | 异步任务队列快照（id/status/createdAt/error） |
+| `task_cancel` | → | 取消队列任务：queued 直接移除；running 尽力中止（agent.cancel，结果丢弃、会话保留可续接） |
 
 ### 会话
 | 工具 | 方向 | 用途 |
@@ -38,6 +39,7 @@ Harness agent — 完整工具集: bash, fs, todo, web…
 | `session_list` | ← | 列会话（live+持久化合并），每行带 token/LLM 用时摘要 |
 | `session_log` | ← | 读会话事件日志（已剥离 reasoning），tail N 条、按类型过滤 |
 | `session_stats` | ← | 会话统计：rounds/steps/llmTime/toolTime/ttft/tokensPerSec/cacheHitRate/inputTokens/outputTokens |
+| `session_search` | ← | 跨会话搜索：标题匹配 + 内容搜索（持久化事件，单会话 2s 超时跳过），正则可选 |
 | `rename_session` | ← | 会话改名（便于归档区分） |
 | `attach_session` | ← | 会话归组到工作区 |
 

@@ -6,7 +6,7 @@ Output caps: `assistantText` ≤ 8000 chars, `toolCalls` ≤ 50 × 2000, `toolRe
 
 ## Task execution
 
-### `agent_run(task, context?, cwd?, sessionId?, title?)`
+### `agent_run(task, context?, cwd?, sessionId?, title?, preset?)`
 Synchronously run a task and return a structured result.
 
 | Field | Type | Notes |
@@ -16,6 +16,7 @@ Synchronously run a task and return a structured result.
 | `cwd` | string | working directory; agent sessions are keyed/reused by cwd |
 | `sessionId` | string | resume an existing session (3-level: live pool → live → persisted) |
 | `title` | string | session title (shown in `session_list`) |
+| `preset` | string | per-task preset override (single-use; does not touch global default). `standard` (default) / `code` (PTC) / `minimal` (bash+str_replace_editor only, cheapest, DeepSeek-friendly) / `cordis` (for authoring new presets). Unknown id → error with `available` list |
 
 Result: `{ sessionId, assistantText, toolCalls, toolResults, changes, verification, leftovers, stats }`.
 
@@ -35,6 +36,13 @@ Poll a queued task's result: `{ taskId, status: queued|running|done|error, resul
 ### `task_list()`
 Queue snapshot: `{ total, active, count, truncated, tasks: [{ id, status, createdAt, error?, title?, cwd?, hasResult }] }`.
 
+### `task_cancel(taskId)`
+Cancel a queued/running task:
+- `queued`: removed from queue → `{ ok: true, status: "cancelled", was: "queued" }`
+- `running`: sets the cancelled flag first, then `agent.cancel({kind:'user'})` (real turn abort; result discarded on completion; session preserved for `agent_run` resume). Returns `{ ok: true, status: "cancelled", was: "running", sessionId }`.
+- `done`/`error`/`cancelled`/missing: `{ ok: false, error: "task <id> not cancellable (status=...)" }`
+- Note: the queue executes immediately (no deferred worker), so `queued` is usually transient; the real value is aborting `running` tasks.
+
 ## Session inspection
 
 ### `session_list(cwd?, limit?)`
@@ -49,6 +57,14 @@ Read a session's event log. Default types: `assistant/message`, `tool/call`, `to
 Without `sessionId`, returns stats for the most recent agent session (error if none yet: `no active agent session yet`).
 
 Aggregation: `rounds` = count of `turn/end` events; `ttft` = avg time-to-first-token per step; `cacheHitRate` = hit/(hit+input) with a denominator heuristic covering DeepSeek and Anthropic token accounting.
+
+### `session_search(query, cwd?, regex?, limit?)`
+Cross-session search:
+- `query` (required): substring match, or regex when `regex: true` (invalid regex → error).
+- Matches session **titles** first, then **content** (persisted events via `persistence.inspect`; falls back to live log / zstd multi-frame decompress of `session.jsonl.zstd` when inspect is unavailable). Content search result reports `content_search: true/false`.
+- Per-session 2s timeout (skipped and counted in `total`); concurrency 8; `limit` default 50 (clamp 1..200 sessions scanned); results capped at 20 with ±60-char `snippet`.
+
+Result: `{ query, regex, total, count, content_search, results: [{ sessionId, title, cwd, updatedAt, matched: "title"|"content", snippet? }] }`.
 
 ### `rename_session(sessionId, title)`
 Rename a session (goes through the session-title service).
