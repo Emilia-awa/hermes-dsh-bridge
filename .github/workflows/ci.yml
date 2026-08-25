@@ -42,6 +42,7 @@ jobs:
         run: |
           node tests/unit_mock_p1.mjs
           node tests/unit_mock_p2.mjs
+          node tests/unit_mock_p3.mjs
 
       - name: Python client syntax check
         run: python3 -m py_compile examples/hermes_dsh_mcp.py

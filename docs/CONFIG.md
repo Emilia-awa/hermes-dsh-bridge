@@ -12,6 +12,9 @@ The plugin is configured through the cordis patch entry in your Harness profile 
 | `authToken` | string | empty | optional Bearer token; all requests must then send `Authorization: Bearer <token>` |
 | `workspaceRoots` | string[] | empty | cwd whitelist for `agent_run` **and** the fs_* path jail. Empty = default visible set (registered workspaces + `~/.dsh`) |
 | `enableFsWrite` | boolean | `false` | register `fs_write` (opt-in by design) |
+| `defaultSandbox` | string | `workspace-write` | default file-sandbox tier for newly created/resumed sessions: `read-only` \| `workspace-write` \| `danger-full-access`. Invalid values warn and keep the default. ⚠️ `danger-full-access` = unrestricted read/write, no approvals |
+| `approvalsBridge` | string | `web` | approval bridge mode: `web` (subscribe the apiProxy mux stream; answers route through `apiProxy.respond`) / `builtin` (plugin-internal answerer; also the automatic fallback when apiProxy is absent) / `off` (no bridge — approvals fall back to deployment defaults, fail-closed) |
+| `approvalTimeoutMs` | number | `120000` | how long a pending approval is waited for. On expiry it settles cancelled (builtin) or rejected (web) — **never auto-allows**. `agent_run` blocks while an approval is pending; prefer `task_inbox` for approval-prone workloads |
 | `provider` | string | — | **required**: LLM provider id for agent assembly (e.g. `opencode-go`) |
 | `model` | string | — | **required**: model id (e.g. `deepseek-v4-flash`) |
 
@@ -23,6 +26,8 @@ The plugin is configured through the cordis patch entry in your Harness profile 
 | `authToken` off but supported | convenient for local trust domains; **always enable** before any non-loopback exposure |
 | `enableFsWrite: false` | writing files through an agent-control channel widens the attack surface; enable explicitly when you need it |
 | sensitive-name blacklist | `.ssh/**`, `*.pem`, `*token*`, `.env` are never readable/writable through fs_* tools |
+| `defaultSandbox: workspace-write` | new sessions can work inside their workspace but stay fenced; raise to `danger-full-access` only in trusted environments (it disables confinement and approvals entirely) |
+| approvals never auto-allow on timeout | a timed-out approval settles cancelled/rejected after `approvalTimeoutMs`; escalation grants only ever come from an explicit `approval_respond('allowed-once')` (or the Web UI) |
 | provider/model explicit | an empty `{{model}}` prompt variable crashes agent assembly — fail loudly at config time |
 
 ## Minimal production example
@@ -38,6 +43,9 @@ The plugin is configured through the cordis patch entry in your Harness profile 
         authToken: '<generate-a-long-random-token>'
         workspaceRoots: ['/srv/app']
         enableFsWrite: false
+        defaultSandbox: workspace-write   # read-only | workspace-write | danger-full-access
+        approvalsBridge: web              # web | builtin | off
+        approvalTimeoutMs: 120000
         provider: opencode-go
         model: deepseek-v4-flash
 ```
@@ -47,7 +55,7 @@ If you only ever talk to it from the same host over loopback and trust all local
 ## Verification after config change
 
 ```bash
-# list tools — should show 19 including fs_*, session_*, preset_*
+# list tools — should show 25 including fs_*, session_*, preset_*, policy_get, set_policy, approval_*
 python3 examples/hermes_dsh_mcp.py list
 # health
 python3 examples/hermes_dsh_mcp.py call status_get '{}'

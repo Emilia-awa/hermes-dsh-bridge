@@ -22,13 +22,13 @@ harness-mcp-server (MCP server, :8090)
 Harness agent — 完整工具集: bash, fs, todo, web…
 ```
 
-## 工具（21 个）
+## 工具（25 个）
 
 ### 任务
 | 工具 | 方向 | 用途 |
 |------|------|------|
-| `agent_run` | → Harness | 同步执行任务；返回结构化结果 + 本轮 `stats` 统计；可选 `preset` 参数单次覆盖预设 |
-| `task_inbox` | → Harness | 推结构化任务（任务+记忆上下文+cwd+可选 `preset`）进异步队列 |
+| `agent_run` | → Harness | 同步执行任务；返回结构化结果 + 本轮 `stats` 统计；可选 `preset` 单次覆盖预设、`sandbox` 单次覆盖权限三档；需要提档审批时会挂起等审（见"权限三档与审批桥"） |
+| `task_inbox` | → Harness | 推结构化任务（任务+记忆上下文+cwd+可选 `preset`/`sandbox`）进异步队列；**审批转接的主路径**：挂起等审期间轮询 `approval_list` → `approval_respond` 即续跑 |
 | `task_result` | ← Harness | 取回队列任务的结构化结果 |
 | `task_list` | ← Harness | 异步任务队列快照（id/status/createdAt/error） |
 | `task_cancel` | → | 取消队列任务：queued 直接移除；running 尽力中止（agent.cancel，结果丢弃、会话保留可续接） |
@@ -51,12 +51,6 @@ Harness agent — 完整工具集: bash, fs, todo, web…
 | `fs_stat` | ← | 文件/目录元数据 |
 | `fs_write` | → | 写文件（overwrite/append/create-new）——**opt-in**（`enableFsWrite: true` 才注册），仅限 workspaceRoots |
 
-### 状态与配置
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `status_get` | ← | 版本/uptime/provider/model/preset/live agents/队列深度 |
-| `config_get` | ← | 运行时配置摘要（authToken 打码为 `***`） |
-
 ### 预设
 | 工具 | 方向 | 用途 |
 |------|------|------|
@@ -69,6 +63,20 @@ Harness agent — 完整工具集: bash, fs, todo, web…
 |------|------|------|
 | `echo` | — | 验证 MCP 连通 |
 | `harness_list_tools` | — | 列出 Harness 内部注册的工具名 |
+
+### 权限与审批
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `policy_get` | ← | 查询会话生效策略：`{sessionId, sandboxMode, source: override\|default, workspaceRoot, approvalPolicy}`；无参返回部署默认 |
+| `set_policy` | → | 切换 **live 会话** 的文件权限档（追加 `sandbox/mode` 事件，下一次受限调用生效，重启靠 replay 保持）；冷会话需先 resume 再切 |
+| `approval_list` | ← | 列出挂起审批（沙箱提档 escalation 等）：`[{approvalId, sessionId, toolName, callId?, reason?, requestedAt, waitedMs}]` + bridge 形态/超时配置 |
+| `approval_respond` | → | 回答挂起审批：`allowed-once`（仅本次放行）/`rejected`；与 Web UI 双通道**先答者胜**，败者回 `receipt=not-pending` |
+
+### 状态与配置
+| 工具 | 方向 | 用途 |
+|------|------|------|
+| `status_get` | ← | 版本/uptime/provider/model/preset/live agents/队列深度 + `sandboxPolicy{defaultMode,bridge,pendingApprovals}` |
+| `config_get` | ← | 运行时配置摘要（authToken 打码为 `***`）+ `defaultSandbox/approvalsBridge/approvalTimeoutMs` |
 
 ### 结构化结果与统计
 
@@ -93,6 +101,35 @@ Harness agent — 完整工具集: bash, fs, todo, web…
 ```
 
 闭环：客户端把记忆作为 `context` 喂进每次任务，结果（`changes`/`verification`/`leftovers`）再存回客户端记忆，供下一轮使用。
+
+## 权限三档与审批桥（v0.5.0）
+
+### 三档语义
+
+会话文件权限档与 Harness 原生 `SandboxMode` 一一对应，通过会话日志的 `sandbox/mode` 事件固化（重启靠 replay 保持）：
+
+| 档位 | 语义 |
+|------|------|
+| `read-only` | 只读（仅 `/dev/null` 等必要 sink 可写） |
+| `workspace-write` | 工作区 + 后端临时区可写（**默认**，`defaultSandbox` 可改） |
+| `danger-full-access` | **完全绕过文件围栏 + bash 解禁，全程无审批任意读写** —— 仅限可信环境 |
+
+- `agent_run` / `task_inbox` 的 `sandbox` 参数是**请求级覆盖**：仅影响新建/resume 的会话组合；已有会话保持原档位（显式切换用 `set_policy`）。请求档与会话固化档不一致时不会复用池会话、专用会话不入池——同 cwd 三档互不污染。
+- `session_list` 行在会话有 `sandbox/mode` 记录时带 `sandboxMode` 列。
+
+### 审批转接（approvals 桥）
+
+Agent 沙箱提档（escalation）等场景会向审批链提问。本插件把审批**转接到 MCP 侧**：
+
+```
+Harness agent 需要提权 → approval/request → [审批桥挂起]
+Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allowed-once'|'rejected')
+→ agent 继续（或收到拒绝）；Web UI 与 Hermes 双通道先答者胜
+```
+
+- `approvalsBridge: 'web'`（默认）：订阅 apiProxy 的 mux 流复用 Web 审批通道，回答经 `apiProxy.respond` 路由；apiProxy 缺失时自动降级 `'builtin'`（插件内建应答器）。设为 `'off'` 关闭桥（审批回到部署默认 fail-closed 行为）。
+- 审批未决期间 `agent_run` **同步阻塞**（长阻塞场景请用 `task_inbox` 异步路径）；`approvalTimeoutMs`（默认 120s）超时收尾为取消/拒绝——**绝不超时放行**。
+- ⚠️ `approval_respond` 等于远程提权按钮：MCP server 暴露非 loopback 时必须开 `authToken`（见 docs/SECURITY.md）。
 
 ## 安装
 
@@ -143,6 +180,9 @@ npm install && npm run build   # 产出 lib/index.js
         # authToken: '你的随机长token'     # 可选: Bearer token 认证
         # workspaceRoots: ['/workspace']  # 可选: cwd 白名单
         # enableFsWrite: true             # 可选: 开启 fs_write(默认关)
+        # defaultSandbox: workspace-write # 可选: 新建会话默认权限档(read-only|workspace-write|danger-full-access)
+        # approvalsBridge: web            # 可选: 审批桥(web|builtin|off, 默认 web)
+        # approvalTimeoutMs: 120000       # 可选: 审批等待超时(超时收尾为取消/拒绝, 绝不超时放行)
         # ⚠️ 必须显式声明 provider/model, 否则 agent 组装会因空 {{model}} 崩溃:
         provider: opencode-go
         model: deepseek-v4-flash
@@ -152,7 +192,7 @@ npm install && npm run build   # 产出 lib/index.js
 
 ```bash
 systemctl restart dsh.service        # 或你管理 Harness 的方式
-# 验证 19 个工具全在线:
+# 验证 25 个工具全在线:
 python3 examples/hermes_dsh_mcp.py list
 python3 examples/hermes_dsh_mcp.py call status_get '{}'
 ```
@@ -209,8 +249,8 @@ python3 examples/hermes_dsh_mcp.py list | grep -cE "agent_run|session_stats|pres
 ```
 
 **验收标准**
-- `dsh_mcp.py list` 输出 ≥ 19 个工具，其中必须包含 `agent_run`、`session_stats`、`preset_set`、`fs_read`。
-- `status_get` 返回的 `version` 为 `0.3.0`，`provider`/`model` 是你配置的值。
+- `dsh_mcp.py list` 输出 ≥ 25 个工具，其中必须包含 `agent_run`、`session_stats`、`preset_set`、`fs_read`。
+- `status_get` 返回的 `version` 为 `0.5.0`，`provider`/`model` 是你配置的值，`sandboxPolicy.bridge` 非空。
 - 跑一个冒烟任务 `python3 examples/hermes_dsh_mcp.py run '回复:安装成功'`，返回里含 `stats` 字段。
 
 **常见失败与对策（遇到再查）**
@@ -226,7 +266,7 @@ python3 examples/hermes_dsh_mcp.py list | grep -cE "agent_run|session_stats|pres
 
 ## 文档
 
-- [docs/TOOLS.md](docs/TOOLS.md) — 19 个工具的完整参考（入参/出参/限额/错误码）
+- [docs/TOOLS.md](docs/TOOLS.md) — 25 个工具的完整参考（入参/出参/限额/错误码）
 - [docs/CONFIG.md](docs/CONFIG.md) — 配置字段、安全默认值
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 已知坑（SSE 解析、8KB 截断、dual-package hazard…）
 - [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型

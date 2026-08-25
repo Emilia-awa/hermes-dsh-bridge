@@ -28,6 +28,15 @@
  *   - session_search              : 跨会话搜索(标题 + 尽力内容, 单会话 2s 超时)
  *   - agent_run/task_inbox 新增 preset?: 请求级 preset 覆盖(仅影响新建/resume 的会话组合)
  *
+ *   -- P3 批次新增 --
+ *   - set_policy                  : 切换 live 会话的文件权限档(追加 sandbox/mode 事件; 冷会话需先 resume)
+ *   - policy_get                  : 查询会话生效策略(sandboxMode/source/workspaceRoot/approvalPolicy)
+ *   - approval_list               : 列出挂起审批(权限提档等; 审批桥维护的内存表)
+ *   - approval_respond            : 回答挂起审批(allowed-once/rejected; 与 Web UI 先答者胜)
+ *   - agent_run/task_inbox 新增 sandbox?: 请求级权限三档覆盖(read-only/workspace-write/danger-full-access;
+ *     仅影响新建/resume 的会话组合; 池 key 纳入档位防同 cwd 三档互相污染)
+ *   - status_get/config_get 新增 sandboxPolicy/审批桥字段; session_list 行可选 sandboxMode
+ *
  * sessionId 续接: 指定 sessionId 时按 本进程池 → live 会话(UI 手开)→ 持久化 resume 三级接管,
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
  * 工作区分组: cwd 先 realpath 规范化再 `workspaceRegistry.resolveByPath ?? create` + attachSession;
@@ -41,6 +50,8 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
+// 加载 'approval/request' waterfall 事件与 ApprovalOutcome 的类型声明(dsh-user-approval 已是依赖)
+import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 
 import type { Context } from '@deepseek-ai/cordis'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
@@ -64,14 +75,30 @@ import { join as joinPath, resolve, dirname, basename } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(status_get 上报; 与 package.json 保持同步) */
-const PLUGIN_VERSION = '0.4.0'
+const PLUGIN_VERSION = '0.5.0'
+
+/**
+ * 会话文件权限三档(与 dsh-sandbox 的 SandboxMode 一一对应; 不直接 import 该包, 免新增运行时依赖):
+ *   - read-only         : 只读(仅 /dev/null 等必要 sink 可写)
+ *   - workspace-write   : 工作区 + 后端临时区可写(默认)
+ *   - danger-full-access: 完全绕过文件围栏 + bash 解禁, 全程无审批 —— 仅限可信环境
+ * 写入路径与 dsh-sandbox-policy 的 setSandboxMode 相同: session.append('sandbox/mode', {mode}),
+ * 下一次受限调用生效, 重启靠 replay 保持。
+ */
+export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
+
+/** 全部合法档位(schema 枚举与运行时校验共用) */
+const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
+
+/** 审批桥形态: web=订阅 apiProxy mux 复用 Web 审批通道(默认); builtin=插件内建应答器; off=关闭桥 */
+export type ApprovalsBridge = 'web' | 'builtin' | 'off'
 
 /**
  * 声明依赖的核心服务。
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——
  * 漏声明会在真实启动时拿不到服务(本插件曾经踩过, 务必与代码里的 ctx.get 对齐)。
  */
-export const inject = ['tools', 'llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'sessions']
+export const inject = ['tools', 'llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'sessions', 'apiProxy']
 
 /** 插件配置 */
 export interface Config {
@@ -96,6 +123,12 @@ export interface Config {
   workspaceRoots?: string[]
   /** 是否注册 fs_write 工具(P1, 默认关闭; 打开后也仅限 workspaceRoots 内) */
   enableFsWrite?: boolean
+  /** 新建/resume 会话的默认文件权限档(默认 'workspace-write'; danger-full-access=无审批任意读写, 仅限可信环境) */
+  defaultSandbox?: SandboxMode
+  /** 审批桥模式(P3, 默认 'web'): web=订阅 apiProxy mux 复用 Web 审批通道; builtin=插件内建应答器(apiProxy 缺失时自动降级); off=关闭桥(审批回到 fail-closed) */
+  approvalsBridge?: ApprovalsBridge
+  /** 审批等待超时毫秒(P3, 默认 120000)。超时 settle cancelled(builtin)/rejected(web 协议无 cancelled) —— 绝不超时放行 */
+  approvalTimeoutMs?: number
 }
 
 /** 运行时配置默认值(apply 时重置再叠加 config, 保证重复 apply 幂等不残留上一次的状态) */
@@ -110,6 +143,9 @@ const runtimeConfigDefaults = () => ({
   authToken: '',
   workspaceRoots: [] as string[],
   enableFsWrite: false,
+  defaultSandbox: 'workspace-write' as SandboxMode,
+  approvalsBridge: 'web' as ApprovalsBridge,
+  approvalTimeoutMs: 120 * 1000,
 })
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
@@ -343,8 +379,8 @@ async function attachSessionCwd(ctx: Context, sessionId: SessionId, cwd: string 
   await attachToWorkspace(ctx, await canonicalCwd(cwd), sessionId)
 }
 
-/** 常驻 agent 会话(按 cwd 复用, 省 token: 避免每次全量加载项目上下文); preset 记录组合时所用值 */
-const liveAgents = new Map<string, { sessionId: SessionId; handle: AgentHandle; preset: string }>()
+/** 常驻 agent 会话(按 cwd 复用, 省 token: 避免每次全量加载项目上下文); preset/sandbox 记录组合时所固化值 */
+const liveAgents = new Map<string, { sessionId: SessionId; handle: AgentHandle; preset: string; sandbox: SandboxMode }>()
 
 /** sessionId → cwd 索引(支持按 session 续接: 指定 sessionId 时定位到对应 cwd 的常驻会话) */
 const sessionToCwd = new Map<string, string>()
@@ -361,10 +397,13 @@ interface ResolvedAgent {
 }
 
 /** 获取(或创建)指定 cwd 的常驻 agent 会话; 传 sessionId 时接管指定会话; 传 title 时给新会话命名;
- *  传 requestPreset 时本次组装用该 preset(A: 请求级覆盖, 仅影响新建/resume, 已有会话组合固化不换) */
-async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string, requestPreset?: string): Promise<ResolvedAgent> {
-  // A: 生效 preset = 请求级覆盖 ?? 运行时默认(三级覆盖链里的 request 级)
+ *  传 requestPreset 时本次组装用该 preset(A: 请求级覆盖, 仅影响新建/resume, 已有会话组合固化不换);
+ *  传 requestSandbox 时本次组装用该文件权限档(P3: 同 preset 语义 —— 新建/resume 成功后种 sandbox/mode
+ *  事件, 池 key 纳入档位(请求档≠会话固化档不复用、非默认档不入池), 防同 cwd 三档互相污染) */
+async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: string, requestPreset?: string, requestSandbox?: SandboxMode): Promise<ResolvedAgent> {
+  // A/P3: 生效值 = 请求级覆盖 ?? 运行时默认(三级覆盖链里的 request 级)
   const effectivePreset = requestPreset ?? runtimeConfig.preset
+  const effectiveSandbox = requestSandbox ?? runtimeConfig.defaultSandbox
   // 指定 sessionId: 接管已有会话(长任务分多轮投喂 / 中断后恢复 / UI 手开的会话)
   if (sessionId) {
     // 先看本进程常驻池(指定 sessionId 时定位到对应 cwd 的常驻会话; 命中 LRU 移到末尾, 保留上游语义)
@@ -410,11 +449,19 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
       throw new Error(`session not found for resume: ${sessionId} (not live and not persisted; ${(e as Error)?.message ?? e})`)
     }
     await attachSessionCwd(ctx, sid, handle.agent.session.header.cwd)
+    // P3: resume 成功后种 sandbox/mode 事件(dsh setSandboxMode 同款), 本次组装档位固化
+    try {
+      appendSandboxMode(handle.agent.session as unknown as PolicySessionLike, effectiveSandbox)
+    } catch (e) {
+      console.warn('[harness-mcp-server] sandbox mode seed failed on resume:', String(e))
+    }
     return { sessionId: sid, handle, disposeAfter: true }
   }
   const existing = liveAgents.get(cwd)
-  // A: 池会话的 preset 在组合时已固化; 请求级覆盖与其不一致时不复用, 落到下方创建不入池的专用会话
-  if (existing && (requestPreset === undefined || existing.preset === requestPreset)) {
+  // A/P3: 池会话的 preset/sandbox 在组合时已固化; 请求级覆盖与其不一致时不复用, 落到下方创建不入池的专用会话
+  if (existing
+    && (requestPreset === undefined || existing.preset === requestPreset)
+    && (requestSandbox === undefined || existing.sandbox === requestSandbox)) {
     // LRU: 命中则移到末尾(最近使用)
     liveAgents.delete(cwd)
     liveAgents.set(cwd, existing)
@@ -459,9 +506,18 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
       await ctx.agentPresets.mount(agentCtx, effectivePreset)
     },
   })
-  const rec = { sessionId: newSessionId, handle, preset: effectivePreset }
-  // A: 只有默认 preset 的会话进 cwd 池; 请求级覆盖的专用会话不入池(避免污染后续默认调用的复用键)
-  if (requestPreset === undefined || requestPreset === runtimeConfig.preset) {
+  // P3: 新会话组合完成后立即种 sandbox/mode 事件(dsh setSandboxMode 同款: session.append('sandbox/mode',{mode}));
+  // 下一次受限调用生效, 重启靠 replay 保持。失败只告警不阻断(降级为部署默认档)。
+  try {
+    appendSandboxMode(handle.agent.session as unknown as PolicySessionLike, effectiveSandbox)
+  } catch (e) {
+    console.warn('[harness-mcp-server] sandbox mode seed failed on create:', String(e))
+  }
+  const rec = { sessionId: newSessionId, handle, preset: effectivePreset, sandbox: effectiveSandbox }
+  // A/P3: 只有默认 preset + 默认档位的会话进 cwd 池; 任一请求级覆盖的专用会话不入池
+  // (避免污染后续默认调用的复用键 —— 同 cwd 三档互不复用)
+  if ((requestPreset === undefined || requestPreset === runtimeConfig.preset)
+    && (requestSandbox === undefined || requestSandbox === runtimeConfig.defaultSandbox)) {
     liveAgents.set(cwd, rec)
     sessionToCwd.set(String(newSessionId), cwd)
   }
@@ -510,6 +566,8 @@ interface TaskResult {
   leftovers: string
   /** P1: 本次执行的增量会话统计(scope:'run'; 全会话累计用 session_stats 工具) */
   stats?: Record<string, unknown>
+  /** P3: 本次请求的权限三档(仅当显式传入时回显; 缺省 = 运行时 defaultSandbox) */
+  sandbox?: string
 }
 
 /** 从 agent 最终回答里解析 changes/verification/leftovers(从后往前找候选, 更可靠) */
@@ -553,7 +611,8 @@ function truncateResult(result: TaskResult): TaskResult {
 
 /** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
  *  P2 opts: preset=请求级覆盖; onSessionStart=拿到 agent 会话后回调(B 登记 taskRunSessions);
- *  isCancelled=协作取消探测(B: 锁内/followup 前两个检查点)。 */
+ *  isCancelled=协作取消探测(B: 锁内/followup 前两个检查点)。
+ *  P3 opts: sandbox=请求级权限三档覆盖(透传 getAgent; 仅影响新建/resume 组合)。 */
 async function executeTask(
   ctx: Context,
   task: string,
@@ -561,7 +620,7 @@ async function executeTask(
   cwd: string,
   resumeSessionId?: string,
   title?: string,
-  opts?: { preset?: string; onSessionStart?: (sid: string) => void; isCancelled?: () => boolean },
+  opts?: { preset?: string; sandbox?: SandboxMode; onSessionStart?: (sid: string) => void; isCancelled?: () => boolean },
 ): Promise<TaskResult> {
   // 规范化 cwd: realpath 解析符号链接与 .. 段, 避免 /a、/a/.、相对路径、符号链接成为不同 Map key
   // 导致重复创建会话/并发冲突; 同时也是与 workspace.path 精确比对的唯一 canon
@@ -581,7 +640,7 @@ async function executeTask(
   return withLock(lockKey, async () => {
     // B 协作取消点 1: 还在等锁/未起 agent 时被取消 → 直接放弃执行
     if (opts?.isCancelled?.()) throw new Error('task cancelled before execution')
-    const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title, opts?.preset)
+    const { sessionId, handle, disposeAfter } = await getAgent(ctx, workdir, resumeSessionId, title, opts?.preset, opts?.sandbox)
     opts?.onSessionStart?.(String(sessionId))
     lastAgentSessionId = String(sessionId) // 供 session_stats 无参调用返回"当前 Agent 会话"
     // B 协作取消点 2: 等锁期间被取消、刚拿到 agent → followup 前放弃(不发 LLM 请求)
@@ -644,6 +703,8 @@ async function executeTask(
     result.changes = summary.changes
     result.verification = summary.verification
     result.leftovers = summary.leftovers
+    // P3: 回显本次请求档位(仅显式传入时)
+    if (opts?.sandbox !== undefined) result.sandbox = opts.sandbox
 
     // P1: 本次执行的增量会话统计(对 baseline 之后的日志段做 sessionStats 折叠)
     try {
@@ -681,6 +742,8 @@ interface TaskItem {
   title?: string
   /** A: 请求级 preset 覆盖(缺省用运行时默认) */
   preset?: string
+  /** P3: 请求级权限三档覆盖(缺省用运行时 defaultSandbox) */
+  sandbox?: SandboxMode
   status: 'queued' | 'running' | 'done' | 'error' | 'cancelled'
   /** B: 已请求取消(running 中止 / 锁内协作取消), 收尾时置 status='cancelled' 并丢弃结果 */
   cancelled?: boolean
@@ -770,6 +833,280 @@ async function presetOverrideError(ctx: Context, presetId: string): Promise<stri
   }
 }
 
+// ═══════════════════════ P3: 权限三档(sandbox/mode) + 审批转接桥(approvals) ═══════════════════════
+//
+// 权限三档与 dsh-sandbox-policy 同款语义但不直接依赖该包(免新增运行时依赖):
+//   - 写入 = session.append('sandbox/mode', {mode})(dsh setSandboxMode 的一行实现);
+//   - 折叠 = 最后一条 sandbox/mode 事件(dsh effectiveSandboxMode); 无 override 时用部署默认。
+// 审批桥复用 dsh-host-apiproxy 的 Web 审批通道: 订阅 ctx.apiProxy.events.mux() 拿到每个待审帧的
+// rpcId, approval_respond 经 ctx.apiProxy.respond()(公开服务方法)以 client-response 回答 ——
+// 应答器仍是 apiproxy 本身(绕开 cordis waterfall 的注册顺序陷阱), 与 Web UI 双通道先答者胜。
+// apiProxy 缺失时降级为自注册 'approval/request' answerer(builtin, 照 apiproxy 先例扫 asked/decided)。
+
+/** 结构化视图: 只需要 session 的 id/header/事件流/append(dsh Session 的最小面) */
+interface PolicySessionLike {
+  id?: unknown
+  header?: SessionHeader
+  events?: readonly unknown[]
+  log?: readonly unknown[]
+  append?: (type: string, data: unknown) => unknown
+}
+
+/** dsh setSandboxMode 同款写入路径: 追加一条 sandbox/mode 事件(下一次受限调用生效, 重启靠 replay 保持) */
+function appendSandboxMode(session: PolicySessionLike, mode: SandboxMode): void {
+  session.append?.('sandbox/mode', { mode })
+}
+
+/** 折叠事件流里最后一条 sandbox/mode(dsh effectiveSandboxMode 同款); 无 override 返回 undefined */
+function sandboxModeFromEvents(events: readonly unknown[]): SandboxMode | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i] as { type?: string; data?: { mode?: unknown } } | undefined
+    if (e?.type === 'sandbox/mode' && typeof e.data?.mode === 'string') return e.data.mode as SandboxMode
+  }
+  return undefined
+}
+
+/** 折叠事件流里最后一条 approval/policy(dsh effectiveApprovalPolicy 同款); 无 override 返回 undefined */
+function approvalPolicyFromEvents(events: readonly unknown[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i] as { type?: string; data?: { policy?: unknown } } | undefined
+    if (e?.type === 'approval/policy' && typeof e.data?.policy === 'string') return e.data.policy
+  }
+  return undefined
+}
+
+/** 部署级审批策略默认(ctx.approval.config.policy ?? 'ask'; 服务缺失时按 dsh 默认 'ask') */
+function deploymentApprovalPolicy(ctx: Context): string {
+  try {
+    const p = (ctx.get('approval') as { config?: { policy?: string } } | undefined)?.config?.policy
+    if (p === 'ask' || p === 'never') return p
+  } catch { /* 服务缺失 */ }
+  return 'ask'
+}
+
+/** apiProxy 最小结构视图(内部契约: events.mux 广播 MuxFrame; respond 接收 client-response 返回 RpcReceipt) */
+interface ApiProxyView {
+  events?: {
+    mux?: (request: { rpcId: string; payload: Record<string, unknown> }, signal: AbortSignal) => AsyncIterable<{
+      rpcId: string
+      payload: {
+        type?: string
+        sessionId?: unknown
+        approvalId?: unknown
+        toolName?: unknown
+        callId?: unknown
+        reason?: unknown
+        outcome?: unknown
+      }
+    }>
+  }
+  respond?: (message: {
+    type: 'client-response'
+    rpcId: string
+    result: { ok: true; value: Record<string, unknown> }
+  }) => Promise<{ accepted: boolean; reason?: string }>
+}
+
+/** 取 apiProxy(强转结构视图; 纯 headless 组合没有该服务时返回 undefined) */
+function apiProxyOf(ctx: Context): ApiProxyView | undefined {
+  return (ctx as unknown as { apiProxy?: ApiProxyView }).apiProxy
+}
+
+/** 挂起审批条目(web 桥来自 mux 帧, 带 rpcId; builtin 桥来自 answerer 直收, 带 settle) */
+interface PendingApproval {
+  approvalId: string
+  sessionId: string
+  toolName: string
+  callId?: string
+  reason?: string
+  requestedAt: number
+  /** web 桥: 回答所需 rpcId(apiProxy.respond 按 rpcId 路由) */
+  rpcId?: string
+  /** builtin 桥: 直接 settle answerer promise(outcome 原样返回给审批链) */
+  settle?: (outcome: ApprovalOutcome) => void
+  /** 超时定时器(approvalTimeoutMs 后收尾, 绝不超时放行) */
+  timer?: ReturnType<typeof setTimeout>
+}
+
+/** 内存挂起审批表(approvalId 键 —— ApprovalRequestId 全局唯一) */
+const pendingApprovals = new Map<string, PendingApproval>()
+
+/** 当前生效的审批桥形态(status_get/approval_list 上报) */
+let activeBridgeKind: ApprovalsBridge = 'off'
+
+function clearApprovalTimer(entry: PendingApproval): void {
+  if (entry.timer !== undefined) {
+    clearTimeout(entry.timer)
+    entry.timer = undefined
+  }
+}
+
+/** 从挂起表摘除条目(清定时器; 幂等) */
+function removePendingApproval(entry: PendingApproval): void {
+  clearApprovalTimer(entry)
+  if (pendingApprovals.get(entry.approvalId) === entry) pendingApprovals.delete(entry.approvalId)
+}
+
+/**
+ * 登记挂起审批并武装超时定时器。超时语义(P3 铁律 —— 绝不超时放行):
+ *   - builtin 桥: settle 'cancelled'(host 侧撤回, 模型在原 turn 内收到取消继续收尾);
+ *   - web 桥: 客户端协议没有 cancelled, 以 'rejected' 回答(fail-closed, 同样让模型原 turn 收尾)。
+ */
+function armPendingApproval(ctx: Context, entry: PendingApproval): void {
+  pendingApprovals.set(entry.approvalId, entry)
+  const timer = setTimeout(() => {
+    // 已被回答/摘除 → 定时器作废(先答者胜)
+    if (pendingApprovals.get(entry.approvalId) !== entry) return
+    removePendingApproval(entry)
+    console.warn(`[harness-mcp-server] approval ${entry.approvalId} timed out after ${runtimeConfig.approvalTimeoutMs}ms -> ${entry.settle ? 'cancelled' : 'rejected'} (never allow on timeout)`)
+    if (entry.settle) {
+      entry.settle('cancelled')
+      return
+    }
+    const proxy = apiProxyOf(ctx)
+    if (proxy?.respond && entry.rpcId !== undefined) {
+      void proxy.respond({
+        type: 'client-response',
+        rpcId: entry.rpcId,
+        result: { ok: true, value: { sessionId: entry.sessionId, approvalId: entry.approvalId, outcome: 'rejected' } },
+      }).catch(() => { /* 超时兜底回答失败不影响主流程 */ })
+    }
+  }, Math.max(1, runtimeConfig.approvalTimeoutMs))
+  timer.unref?.()
+  entry.timer = timer
+}
+
+/**
+ * 审批回答主流程: web 桥走 apiProxy.respond(rpcId 路由), builtin 桥直接 settle。
+ * 返回 receipt 视图({accepted:true} | {accepted:false, reason:'not-pending'})——
+ * 双通道竞态先答者胜: 本表条目已摘除后第二路回答拿到 not-pending, 原样透传给调用方。
+ */
+async function respondToApproval(ctx: Context, entry: PendingApproval, outcome: 'allowed-once' | 'rejected'): Promise<{ accepted: boolean; reason?: string }> {
+  // 先摘除再回答: 保证同一 approvalId 只被 settle 一次(败者在入口处就被 not-pending 挡下)
+  removePendingApproval(entry)
+  clearApprovalTimer(entry)
+  if (entry.settle) {
+    entry.settle(outcome)
+    return { accepted: true }
+  }
+  const proxy = apiProxyOf(ctx)
+  if (!proxy?.respond || entry.rpcId === undefined) return { accepted: false, reason: 'not-pending' }
+  try {
+    const receipt = await proxy.respond({
+      type: 'client-response',
+      rpcId: entry.rpcId,
+      result: { ok: true, value: { sessionId: entry.sessionId, approvalId: entry.approvalId, outcome } },
+    })
+    return receipt.accepted ? { accepted: true } : { accepted: false, reason: receipt.reason ?? 'not-pending' }
+  } catch (e) {
+    console.warn('[harness-mcp-server] approval respond failed:', (e as Error)?.message ?? e)
+    return { accepted: false, reason: 'not-pending' }
+  }
+}
+
+/**
+ * 启动审批转接桥(P3)。apply() 末尾调用一次, 返回 dispose(卸载时清定时器/订阅/挂起表)。
+ * 形态选择:
+ *   - off            : 不做任何事(activeBridgeKind='off'; 审批回到部署默认行为 —— 无应答器即 fail-closed)。
+ *   - web + apiProxy : activeBridgeKind='web'。订阅 apiProxy mux 流维护内存挂起表(open 时 apiproxy
+ *                      会重放 still-pending 帧); 应答器是 apiproxy 自己, approval_respond 经它回答,
+ *                      与 Web UI 双通道先答者胜(mux 收到 approval/resolved 即同步摘除)。
+ *   - 其余(builtin)  : activeBridgeKind='builtin'。自注册 'approval/request' answerer(waterfall;
+ *                      照 apiproxy 先例扫 asked/decided 配对定位本次 ask 的 ApprovalRequestId),
+ *                      approval_respond 直接 settle。apiProxy 缺失时自动落到这里(降级保底)。
+ */
+function startApprovalsBridge(ctx: Context): () => void {
+  // 重复 apply 幂等: 清残留挂起表与定时器(上一实例未触发的超时不许跨实例触发)
+  for (const old of [...pendingApprovals.values()]) clearApprovalTimer(old)
+  pendingApprovals.clear()
+  activeBridgeKind = 'off'
+
+  const bridge = runtimeConfig.approvalsBridge
+  if (bridge === 'off') return () => {}
+
+  const proxy = apiProxyOf(ctx)
+  if (bridge === 'web' && proxy?.events?.mux && proxy.respond) {
+    activeBridgeKind = 'web'
+    const controller = new AbortController()
+    void (async () => {
+      try {
+        // mux 是全会话聚合流: 每帧包一层 RpcRequest{rpcId,payload}; requested 帧的 rpcId 即回答路由键
+        const stream = proxy.events!.mux!({ rpcId: `harness-mcp-${randomUUID()}`, payload: {} }, controller.signal)
+        for await (const msg of stream) {
+          const f = msg.payload
+          if (f.type === 'approval/requested' && typeof f.approvalId === 'string' && typeof f.sessionId === 'string') {
+            if (pendingApprovals.has(f.approvalId)) continue
+            armPendingApproval(ctx, {
+              approvalId: f.approvalId,
+              sessionId: f.sessionId,
+              toolName: typeof f.toolName === 'string' ? f.toolName : '?',
+              ...(typeof f.callId === 'string' ? { callId: f.callId } : {}),
+              ...(typeof f.reason === 'string' ? { reason: f.reason } : {}),
+              requestedAt: Date.now(),
+              rpcId: String(msg.rpcId),
+            })
+          } else if (f.type === 'approval/resolved' && typeof f.approvalId === 'string') {
+            // Web UI/Hermes 他路先答: 同步摘除(本桥再 respond 会拿 not-pending)
+            const entry = pendingApprovals.get(f.approvalId)
+            if (entry) removePendingApproval(entry)
+          }
+        }
+      } catch (e) {
+        if (!controller.signal.aborted) {
+          console.warn('[harness-mcp-server] approvals mux stream ended:', (e as Error)?.message ?? e)
+        }
+      }
+    })()
+    return () => {
+      controller.abort()
+      for (const entry of [...pendingApprovals.values()]) clearApprovalTimer(entry)
+      pendingApprovals.clear()
+      activeBridgeKind = 'off'
+    }
+  }
+
+  // builtin 降级/显式: 自注册 answerer(waterfall; 不调 next 即认领本次请求)
+  activeBridgeKind = 'builtin'
+  ctx.on('approval/request', (req, next) => {
+    if (req.signal?.aborted === true) return Promise.resolve<ApprovalOutcome>('cancelled')
+    // 定位本次 ask 的 ApprovalRequestId: 从会话事件流倒序扫 asked/decided 配对(apiproxy 同款),
+    // 跳过已 decided / 已在本表挂起的 id, callId 精确配对。
+    const sess = req.agent?.session as unknown as PolicySessionLike | undefined
+    const events = ((sess?.events ?? sess?.log) ?? []) as readonly unknown[]
+    const decided = new Set<string>()
+    let approvalId: string | undefined
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i] as { type?: string; data?: { id?: unknown; callId?: unknown } } | undefined
+      if (ev?.type === 'approval/decided') {
+        decided.add(String(ev.data?.id))
+      } else if (ev?.type === 'approval/asked') {
+        const id = String(ev.data?.id)
+        if (decided.has(id) || pendingApprovals.has(id)) continue
+        if ((req.callId ?? null) !== (ev.data?.callId ?? null)) continue
+        approvalId = id
+        break
+      }
+    }
+    if (approvalId === undefined) return next()
+    return new Promise<ApprovalOutcome>((resolve) => {
+      armPendingApproval(ctx, {
+        approvalId,
+        sessionId: String(sess?.id ?? ''),
+        toolName: typeof req.toolName === 'string' ? req.toolName : '?',
+        ...(req.callId !== undefined ? { callId: String(req.callId) } : {}),
+        ...(req.reason !== undefined ? { reason: String(req.reason) } : {}),
+        requestedAt: Date.now(),
+        settle: resolve,
+      })
+    })
+  })
+  return () => {
+    for (const entry of [...pendingApprovals.values()]) clearApprovalTimer(entry)
+    pendingApprovals.clear()
+    activeBridgeKind = 'off'
+  }
+}
+
 /** 会话粗粒度 updatedAt: live 取最后事件 time, persisted 取落盘文件 mtime, 都没有用 createdAt */
 async function roughUpdatedAt(ctx: Context, header: SessionHeader): Promise<number> {
   const store = ctx.get('sessions') as SessionsStoreView | undefined
@@ -789,13 +1126,14 @@ async function roughUpdatedAt(ctx: Context, header: SessionHeader): Promise<numb
   return header.createdAt ?? 0
 }
 
-/** 单个会话的轻量检视: 消息条数 + 标题 + 统计摘要(persisted inspect 失败时回退 live log) */
+/** 单个会话的轻量检视: 消息条数 + 标题 + 统计摘要 + 权限档(persisted inspect 失败时回退 live log) */
 async function inspectSessionRow(ctx: Context, header: SessionHeader): Promise<{
   messageCount: number
   title?: string
   inputTokens?: number
   outputTokens?: number
   llmTimeSec?: number
+  sandboxMode?: SandboxMode
 }> {
   const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
   try {
@@ -808,22 +1146,25 @@ async function inspectSessionRow(ctx: Context, header: SessionHeader): Promise<{
   return { messageCount: 0 }
 }
 
-/** 从事件流汇总行级统计摘要(messageCount/title + token/llm 摘要字段) */
+/** 从事件流汇总行级统计摘要(messageCount/title + token/llm 摘要字段 + P3 sandboxMode 折叠) */
 function summarizeRow(count: number, title: string | undefined, events: readonly unknown[]): {
   messageCount: number
   title?: string
   inputTokens?: number
   outputTokens?: number
   llmTimeSec?: number
+  sandboxMode?: SandboxMode
 } {
   try {
     const f = foldSessionStats(events)
+    const mode = sandboxModeFromEvents(events)
     return {
       messageCount: count,
       ...(title !== undefined ? { title } : {}),
       inputTokens: f.inputTokens,
       outputTokens: f.outputTokens,
       llmTimeSec: Math.round(f.llmMs / 100) / 10,
+      ...(mode !== undefined ? { sandboxMode: mode } : {}),
     }
   } catch {
     return { messageCount: count, ...(title !== undefined ? { title } : {}) }
@@ -1268,7 +1609,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     return out(JSON.stringify(names))
   })
 
-  mcp.tool('status_get', '查询 Harness/MCP 运行状态: 版本/运行时长/provider/model/preset/活动会话数。', {}, async () => {
+  mcp.tool('status_get', '查询 Harness/MCP 运行状态: 版本/运行时长/provider/model/preset/活动会话数/sandboxPolicy(默认权限档+审批桥形态+挂起审批数)。', {}, async () => {
     let queueActive = 0
     for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') queueActive++
     let agentsLive = 0
@@ -1287,6 +1628,12 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       activeSessionsCount: liveAgents.size,
       agentsLive,
       queueActive,
+      // P3: 权限三档与审批桥状态暴露
+      sandboxPolicy: {
+        defaultMode: runtimeConfig.defaultSandbox,
+        bridge: activeBridgeKind,
+        pendingApprovals: pendingApprovals.size,
+      },
       node: process.version,
       pid: process.pid,
     }, null, 2))
@@ -1307,6 +1654,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       authToken: runtimeConfig.authToken ? '***' : '',
       workspaceRoots: runtimeConfig.workspaceRoots,
       enableFsWrite: runtimeConfig.enableFsWrite,
+      // P3: 权限三档 + 审批桥配置摘要
+      defaultSandbox: runtimeConfig.defaultSandbox,
+      approvalsBridge: runtimeConfig.approvalsBridge,
+      approvalTimeoutMs: runtimeConfig.approvalTimeoutMs,
     }, null, 2))
   })
 
@@ -1504,6 +1855,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             inputTokens: detail.inputTokens ?? 0,
             outputTokens: detail.outputTokens ?? 0,
             llmTime: detail.llmTimeSec ?? 0,
+            // P3: 会话生效权限档(有 sandbox/mode 记录才带此字段)
+            ...(detail.sandboxMode !== undefined ? { sandboxMode: detail.sandboxMode } : {}),
           }
         }))
         sessions.sort((a, b) => b.updatedAt - a.updatedAt)
@@ -1861,10 +2214,134 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     },
   )
 
+  // ── P3: 权限三档(policy_get / set_policy) ──
+  mcp.tool(
+    'policy_get',
+    '查询会话生效策略: {sessionId,sandboxMode,source:override|default,workspaceRoot,approvalPolicy}。sandboxMode 取最后一条 sandbox/mode 事件(无则 defaultSandbox); approvalPolicy 取最后一条 approval/policy(无则部署默认)。无 sessionId 返回部署默认。',
+    { sessionId: z.string().optional().describe('会话 id(缺省返回部署默认档)') },
+    async ({ sessionId }) => {
+      try {
+        if (!sessionId) {
+          return out(JSON.stringify({
+            sandboxMode: runtimeConfig.defaultSandbox,
+            source: 'default',
+            workspaceRoot: process.cwd(),
+            approvalPolicy: deploymentApprovalPolicy(ctx),
+          }, null, 2))
+        }
+        const sid = SessionId(sessionId)
+        const found = await collectSessionEvents(ctx, sid)
+        if (found === undefined) {
+          return out(JSON.stringify({ error: `session not found: ${sessionId}` }))
+        }
+        const override = sandboxModeFromEvents(found.events)
+        const header = await findSessionHeader(ctx, sid)
+        return out(JSON.stringify({
+          sessionId,
+          sandboxMode: override ?? runtimeConfig.defaultSandbox,
+          source: override !== undefined ? 'override' : 'default',
+          workspaceRoot: header?.cwd !== undefined ? await canonicalCwd(header.cwd) : process.cwd(),
+          approvalPolicy: approvalPolicyFromEvents(found.events) ?? deploymentApprovalPolicy(ctx),
+        }, null, 2))
+      } catch (e) {
+        return out(JSON.stringify({ error: `policy_get failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+    },
+  )
+
+  mcp.tool(
+    'set_policy',
+    '切换已存在会话的文件权限档。mode: read-only(只读)|workspace-write(工作区可写)|danger-full-access(完全绕过围栏+bash 解禁, 无审批任意读写, 仅限可信环境)。仅 live 会话可切(追加 sandbox/mode 事件, 下一次受限调用生效, 重启靠 replay 保持); 冷会话需先 resume(agent_run/task_inbox 带该 sessionId 跑一轮)再切。',
+    {
+      sessionId: z.string().describe('目标会话 id'),
+      mode: z.enum(SANDBOX_MODES).describe('目标权限档'),
+    },
+    async ({ sessionId, mode }) => {
+      try {
+        const sid = SessionId(sessionId)
+        // live agent 优先(preset_set 的 live.session.append 先例), 其次 sessions store 里 attach 的会话
+        let target: PolicySessionLike | undefined
+        try {
+          target = (ctx.agents.get(sid) as { session?: PolicySessionLike } | undefined)?.session
+        } catch { target = undefined }
+        if (!target?.append) {
+          const store = ctx.get('sessions') as SessionsStoreView | undefined
+          const attached = store?.get?.(sid) as PolicySessionLike | undefined
+          if (attached?.append) target = attached
+        }
+        if (!target?.append) {
+          return out(JSON.stringify({
+            error: `session ${sessionId} is not live; cold/persisted sessions must be resumed first (run agent_run or task_inbox with this sessionId), then set_policy`,
+          }))
+        }
+        appendSandboxMode(target, mode)
+        return out(JSON.stringify({ ok: true, sessionId, sandboxMode: mode, source: 'live' }))
+      } catch (e) {
+        return out(JSON.stringify({ error: `set_policy failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+    },
+  )
+
+  // ── P3: 审批桥(approval_list / approval_respond) ──
+  mcp.tool(
+    'approval_list',
+    '列出当前挂起的审批(如沙箱提档 escalation): [{approvalId,sessionId,toolName,callId?,reason?,requestedAt,waitedMs}]。配合 approval_respond 回答; 审批未决期间 agent_run/task_inbox 会一直挂起(超时由 approvalTimeoutMs 兜底收尾, 绝不超时放行)。',
+    {},
+    async () => {
+      const now = Date.now()
+      const approvals = [...pendingApprovals.values()].map((e) => ({
+        approvalId: e.approvalId,
+        sessionId: e.sessionId,
+        toolName: e.toolName,
+        ...(e.callId !== undefined ? { callId: e.callId } : {}),
+        ...(e.reason !== undefined ? { reason: e.reason } : {}),
+        requestedAt: e.requestedAt,
+        waitedMs: now - e.requestedAt,
+      }))
+      return out(JSON.stringify({
+        bridge: activeBridgeKind,
+        count: approvals.length,
+        timeoutMs: runtimeConfig.approvalTimeoutMs,
+        approvals,
+      }, null, 2))
+    },
+  )
+
+  mcp.tool(
+    'approval_respond',
+    '回答挂起审批: outcome=allowed-once(仅本次调用放行)|rejected(拒绝)。与 Web UI 双通道先答者胜 —— 已被回答/超时/撤销的审批回 receipt=not-pending。⚠️ 这等于远程提权按钮: MCP server 暴露非 loopback 时必须开 authToken。',
+    {
+      approvalId: z.string().describe('approval_list 返回的审批 id'),
+      sessionId: z.string().describe('发起审批的会话 id(须与审批归属一致)'),
+      outcome: z.enum(['allowed-once', 'rejected']).describe('allowed-once=本次放行; rejected=拒绝'),
+    },
+    async ({ approvalId, sessionId, outcome }) => {
+      try {
+        const entry = pendingApprovals.get(approvalId)
+        if (!entry) {
+          return out(JSON.stringify({ ok: false, receipt: 'not-pending', approvalId, note: '不存在/已被回答/已超时(先答者胜)' }))
+        }
+        if (entry.sessionId !== sessionId) {
+          return out(JSON.stringify({ ok: false, error: `sessionId mismatch: approval ${approvalId} belongs to session ${entry.sessionId}` }))
+        }
+        const r = await respondToApproval(ctx, entry, outcome)
+        return out(JSON.stringify({
+          ok: r.accepted,
+          receipt: r.accepted ? 'accepted' : (r.reason ?? 'not-pending'),
+          approvalId,
+          sessionId,
+          outcome,
+        }))
+      } catch (e) {
+        return out(JSON.stringify({ error: `approval_respond failed: ${(e as Error)?.message ?? String(e)}` }))
+      }
+    },
+  )
+
   // 同步执行任务(简单场景: Hermes 下发 → 立即拿结果)
   mcp.tool(
     'agent_run',
-    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。',
+    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。需要提档审批(escalation)时会挂起等待审批 —— 审批未决期间本调用阻塞, 可用 approval_list/approval_respond 回答, 超时(approvalTimeoutMs)收尾为取消, 绝不超时放行; 长阻塞场景建议改用 task_inbox。',
     {
       task: z.string().describe('要 Harness 执行的自然语言任务'),
       context: z.string().optional().describe('Hermes 记忆/上下文, 注入给 agent 参考'),
@@ -1872,14 +2349,21 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
       title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
       preset: z.string().optional().describe('本次任务的 preset 覆盖(见 preset_list); 仅影响新建/resume 的会话组合, 已有会话保持原 preset'),
+      sandbox: z.enum(SANDBOX_MODES).optional().describe('本次任务的文件权限三档覆盖: read-only|workspace-write|danger-full-access; 仅影响新建/resume 的会话组合, 已有会话保持原档位(切换用 set_policy); danger-full-access=无审批任意读写, 仅限可信环境'),
     },
-    async ({ task, context, cwd, sessionId, title, preset }) => {
-      // A: 请求级 preset 预检(未知即拒, 带 available 名单)
+    async ({ task, context, cwd, sessionId, title, preset, sandbox }) => {
+      // A/P3: 请求级参数预检(preset 未知即拒带 available 名单; sandbox 由 schema 枚举兜底再校验一次)
       if (preset) {
         const bad = await presetOverrideError(ctx, preset)
         if (bad) return out(JSON.stringify({ error: bad }))
       }
-      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title, preset ? { preset } : undefined)
+      if (sandbox !== undefined && !(SANDBOX_MODES as readonly string[]).includes(sandbox)) {
+        return out(JSON.stringify({ error: `invalid sandbox "${sandbox}"; valid modes: ${SANDBOX_MODES.join('|')}` }))
+      }
+      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title, {
+        ...(preset ? { preset } : {}),
+        ...(sandbox !== undefined ? { sandbox } : {}),
+      })
       return out(JSON.stringify(truncateResult(result), null, 2))
     },
   )
@@ -1887,7 +2371,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 异步 push 任务到队列(Hermes → Harness 任务入口)
   mcp.tool(
     'task_inbox',
-    'Hermes 把结构化任务(任务+记忆上下文)推入 Harness 队列, 异步执行, 返回 taskId。记忆喂编码的入口。',
+    'Hermes 把结构化任务(任务+记忆上下文)推入 Harness 队列, 异步执行, 返回 taskId。记忆喂编码的入口。审批转接(P3)的主路径: 任务挂起等审期间轮询 approval_list → approval_respond 即可续跑。',
     {
       task: z.string().describe('任务内容'),
       context: z.string().optional().describe('Hermes 记忆/上下文, 随任务注入给 agent'),
@@ -1895,12 +2379,16 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果)'),
       title: z.string().optional().describe('新会话的标题(创建时命名)'),
       preset: z.string().optional().describe('本次任务的 preset 覆盖(见 preset_list); 仅影响新建/resume 的会话组合'),
+      sandbox: z.enum(SANDBOX_MODES).optional().describe('本次任务的文件权限三档覆盖: read-only|workspace-write|danger-full-access; 仅影响新建/resume 的会话组合, 已有会话保持原档位'),
     },
-    async ({ task, context, cwd, sessionId, title, preset }) => {
-      // A: 请求级 preset 预检(入队前即拒, 不占队列容量)
+    async ({ task, context, cwd, sessionId, title, preset, sandbox }) => {
+      // A/P3: 请求级参数预检(入队前即拒, 不占队列容量)
       if (preset) {
         const bad = await presetOverrideError(ctx, preset)
         if (bad) return out(JSON.stringify({ error: bad }))
+      }
+      if (sandbox !== undefined && !(SANDBOX_MODES as readonly string[]).includes(sandbox)) {
+        return out(JSON.stringify({ error: `invalid sandbox "${sandbox}"; valid modes: ${SANDBOX_MODES.join('|')}` }))
       }
       const now = Date.now()
       // TTL 清理: 删除已完成/失败/已取消且超时的任务
@@ -1921,6 +2409,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         ...(sessionId ? { sessionId } : {}),
         ...(title ? { title } : {}),
         ...(preset ? { preset } : {}),
+        ...(sandbox !== undefined ? { sandbox } : {}),
       }
       taskQueue.set(id, item)
       // 异步执行(不阻塞 Hermes)
@@ -1929,6 +2418,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         try {
           item.result = await executeTask(ctx, item.task, item.context, item.cwd, item.sessionId, item.title, {
             ...(item.preset ? { preset: item.preset } : {}),
+            ...(item.sandbox !== undefined ? { sandbox: item.sandbox } : {}),
             onSessionStart: (sid) => { taskRunSessions.set(id, sid) },
             isCancelled: () => item.cancelled === true,
           })
@@ -1985,6 +2475,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           ...(t.error !== undefined ? { error: t.error } : {}),
           ...(t.title ? { title: t.title } : {}),
           ...(t.preset ? { preset: t.preset } : {}),
+          // P3: 请求级权限档回显
+          ...(t.sandbox !== undefined ? { sandbox: t.sandbox } : {}),
           cwd: t.cwd,
           ...(t.sessionId ? { sessionId: t.sessionId } : {}),
           hasResult: Boolean(t.result),
@@ -2118,6 +2610,24 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.authToken) runtimeConfig.authToken = config.authToken
   if (config.workspaceRoots) runtimeConfig.workspaceRoots = config.workspaceRoots
   if (config.enableFsWrite !== undefined) runtimeConfig.enableFsWrite = config.enableFsWrite
+  // P3: 权限三档 + 审批桥配置(非法值告警回落默认, 不阻断启动)
+  if (config.defaultSandbox !== undefined) {
+    if ((SANDBOX_MODES as readonly string[]).includes(config.defaultSandbox)) {
+      runtimeConfig.defaultSandbox = config.defaultSandbox
+    } else {
+      console.warn(`[harness-mcp-server] invalid defaultSandbox "${config.defaultSandbox}", keep default "${runtimeConfig.defaultSandbox}" (valid: ${SANDBOX_MODES.join('|')})`)
+    }
+  }
+  if (config.approvalsBridge !== undefined) {
+    if (config.approvalsBridge === 'web' || config.approvalsBridge === 'builtin' || config.approvalsBridge === 'off') {
+      runtimeConfig.approvalsBridge = config.approvalsBridge
+    } else {
+      console.warn(`[harness-mcp-server] invalid approvalsBridge "${String(config.approvalsBridge)}", keep default "web" (valid: web|builtin|off)`)
+    }
+  }
+  if (config.approvalTimeoutMs !== undefined && Number.isFinite(config.approvalTimeoutMs) && config.approvalTimeoutMs > 0) {
+    runtimeConfig.approvalTimeoutMs = Math.trunc(config.approvalTimeoutMs)
+  }
 
   const port = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
@@ -2207,10 +2717,14 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     }
   })()
 
+  // P3: 审批转接桥(web 订阅 apiProxy mux / builtin 自注册 answerer / off 关闭), 返回 dispose
+  const stopApprovalsBridge = startApprovalsBridge(ctx)
+
   // 标准 cordis 生命周期: 用 ctx.effect 注册清理(卸载时关 server + 清空全部映射/会话/队列)
   ctx.effect(() => {
     return () => {
       server.close()
+      stopApprovalsBridge()
       transports.clear()
       servers.clear()
       liveAgents.clear()
@@ -2224,4 +2738,4 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
 }
 
 /** 测试专用内部通道(mock 测试直接操纵队列状态, 绕开异步时序; 非公开 API) */
-export const __internals = { taskQueue, taskRunSessions }
+export const __internals = { taskQueue, taskRunSessions, pendingApprovals, get activeBridgeKind() { return activeBridgeKind } }

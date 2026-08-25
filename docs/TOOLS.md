@@ -6,7 +6,7 @@ Output caps: `assistantText` ≤ 8000 chars, `toolCalls` ≤ 50 × 2000, `toolRe
 
 ## Task execution
 
-### `agent_run(task, context?, cwd?, sessionId?, title?, preset?)`
+### `agent_run(task, context?, cwd?, sessionId?, title?, preset?, sandbox?)`
 Synchronously run a task and return a structured result.
 
 | Field | Type | Notes |
@@ -17,8 +17,9 @@ Synchronously run a task and return a structured result.
 | `sessionId` | string | resume an existing session (3-level: live pool → live → persisted) |
 | `title` | string | session title (shown in `session_list`) |
 | `preset` | string | per-task preset override (single-use; does not touch global default). `standard` (default) / `code` (PTC) / `minimal` (bash+str_replace_editor only, cheapest, DeepSeek-friendly) / `cordis` (for authoring new presets). Unknown id → error with `available` list |
+| `sandbox` | string | per-task sandbox-mode override: `read-only` \| `workspace-write` \| `danger-full-access`. Only affects newly created/resumed compositions; existing sessions keep their fixed tier (switch explicitly via `set_policy`). A request whose tier differs from the pooled session's is not served from the pool; dedicated (non-default-tier) sessions never enter the pool — the three tiers never pollute each other on the same cwd. Echoed back as `result.sandbox` when set. ⚠️ `danger-full-access` = unrestricted read/write with no approvals |
 
-Result: `{ sessionId, assistantText, toolCalls, toolResults, changes, verification, leftovers, stats }`.
+Result: `{ sessionId, assistantText, toolCalls, toolResults, changes, verification, leftovers, stats, sandbox? }`.
 
 `stats` (run-scoped): `{ sessionId, scope: "run", rounds, steps, llmTime, llmTimeMs, toolTime, toolTimeMs, ttft, ttftSteps, tokensPerSec, cacheHitRate, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }`.
 
@@ -26,15 +27,16 @@ Notes:
 - HTTP timeout 120s; heavy reviews/refactors should be launched as background jobs by the client.
 - Reasoning/thinking blocks are stripped from `assistantText` (see ARCHITECTURE note in README).
 - If the stream dies mid-run (`TRANSPORT: terminated`), **resume with the same `sessionId`** — do not reopen a fresh session (a fresh session re-reads all code from scratch).
+- **Approvals**: if the agent hits a sandbox escalation, this call blocks while the approval is pending. Poll `approval_list` and answer via `approval_respond`; after `approvalTimeoutMs` (default 120s) it settles as cancelled/rejected — **never auto-allowed**. Prefer `task_inbox` for approval-prone workloads.
 
-### `task_inbox(task, context?, cwd?, sessionId?, title?)`
-Push a task to the async in-memory queue. Returns `{ taskId, status }`. Queue: max 100, TTL 10 min, **lost on restart** — do not queue long critical work through this path; prefer `agent_run` + `sessionId`.
+### `task_inbox(task, context?, cwd?, sessionId?, title?, preset?, sandbox?)`
+Push a task to the async in-memory queue. Returns `{ taskId, status }`. Queue: max 100, TTL 10 min, **lost on restart** — do not queue long critical work through this path; prefer `agent_run` + `sessionId`. `preset`/`sandbox` behave exactly like their `agent_run` counterparts. This is the **primary path for approval bridging**: while a task is suspended waiting for an approval, poll `approval_list` → `approval_respond` and the task resumes on its own.
 
 ### `task_result(taskId)`
 Poll a queued task's result: `{ taskId, status: queued|running|done|error, result?, error? }`.
 
 ### `task_list()`
-Queue snapshot: `{ total, active, count, truncated, tasks: [{ id, status, createdAt, error?, title?, cwd?, hasResult }] }`.
+Queue snapshot: `{ total, active, count, truncated, tasks: [{ id, status, createdAt, error?, title?, preset?, sandbox?, cwd?, hasResult }] }`.
 
 ### `task_cancel(taskId)`
 Cancel a queued/running task:
@@ -46,7 +48,7 @@ Cancel a queued/running task:
 ## Session inspection
 
 ### `session_list(cwd?, limit?)`
-`{ sessions: [{ id, title, cwd, updatedAt, messageCount, inputTokens, outputTokens, llmTime }] }` — live + persisted merged, deduped by id. Filter by `cwd` (workspace path).
+`{ sessions: [{ id, title, cwd, updatedAt, messageCount, inputTokens, outputTokens, llmTime, sandboxMode? }] }` — live + persisted merged, deduped by id. Filter by `cwd` (workspace path). `sandboxMode` (v0.5.0) appears when the session has at least one `sandbox/mode` event (the effective tier).
 
 ### `session_log(sessionId, tail?, types?, sinceIndex?)`
 Read a session's event log. Default types: `assistant/message`, `tool/call`, `tool/result`. `tail`: last N events. `sinceIndex`: incremental pull. Reasoning/thinking event types are stripped.
@@ -91,10 +93,10 @@ Registered only when `enableFsWrite: true`. `mode`: `overwrite` (default) | `app
 ## Status & config
 
 ### `status_get()`
-`{ version, uptimeSec, startedAt, provider, model, preset, activeSessionsCount, agentsLive, queueActive, node, pid }`.
+`{ version, uptimeSec, startedAt, provider, model, preset, activeSessionsCount, agentsLive, queueActive, sandboxPolicy: { defaultMode, bridge, pendingApprovals }, node, pid }`. `sandboxPolicy.defaultMode` is the configured tier for new sessions; `bridge` ∈ `web|builtin|off`; `pendingApprovals` is the live count of suspended approvals.
 
 ### `config_get()`
-Runtime config summary — `authToken` masked as `***` (never leaks secrets). Includes workspace registry list.
+Runtime config summary — `authToken` masked as `***` (never leaks secrets). Includes workspace registry list plus the v0.5.0 keys: `defaultSandbox`, `approvalsBridge`, `approvalTimeoutMs`.
 
 ## Presets
 
@@ -107,6 +109,31 @@ Effective preset of a session: `agent-preset/selected` event wins (latest), head
 ### `preset_set(presetId, scope?, sessionId?)`
 - `scope: "new-default"` (default): resolve-validate, then update runtime config (new sessions) + best-effort write to user-level settings. Returns `{ ok, scope, preset, runtimeDefault, globalDefaultUpdated }`.
 - `scope: "session"` (requires `sessionId`): only **blank** sessions (no `turn/start` in log) can switch — dsh semantics forbid changing presets on sessions with history (toolset inconsistency). Live sessions are recomposed and record an `agent-preset/selected` event; cold sessions resume with the target preset, record the event, flush and dispose. Non-blank ⇒ `{ error: "session not blank; preset can only be set at creation or while blank" }`.
+
+## Policy & approvals (v0.5.0)
+
+Sandbox tiers map 1:1 to Harness `SandboxMode`; the write path is a session-log `sandbox/mode` event (durable, replayed on restart), effective on the session's next confined call.
+
+### `policy_get(sessionId?)`
+Effective policy of a session: `{ sessionId, sandboxMode, source: "override"|"default", workspaceRoot, approvalPolicy }`.
+- `sandboxMode`: last `sandbox/mode` event; falls back to the configured `defaultSandbox` (`source: "default"`).
+- `approvalPolicy`: last `approval/policy` event, else the deployment default (`ctx.approval.config.policy ?? 'ask'`).
+- Without `sessionId`: the deployment defaults (`workspaceRoot` = process cwd).
+
+### `set_policy(sessionId, mode)`
+Switch an **existing live session's** sandbox tier. `mode`: `read-only` | `workspace-write` | `danger-full-access`. Returns `{ ok: true, sessionId, sandboxMode, source: "live" }`.
+- Appends one `sandbox/mode` event — takes effect on the session's next confined call and survives restarts via replay.
+- Cold (persisted-only) sessions error out: `"session <id> is not live; cold/persisted sessions must be resumed first (run agent_run or task_inbox with this sessionId), then set_policy"`.
+- ⚠️ `danger-full-access` bypasses file confinement AND unblocks bash — unrestricted reads/writes with no approvals. Trusted environments only.
+
+### `approval_list()`
+Currently pending approvals (e.g. sandbox escalations): `{ bridge, count, timeoutMs, approvals: [{ approvalId, sessionId, toolName, callId?, reason?, requestedAt, waitedMs }] }`. Poll this while tasks/agent runs are suspended on an approval.
+
+### `approval_respond(approvalId, sessionId, outcome)`
+Answer a pending approval. `outcome`: `allowed-once` (grant this single call) | `rejected`. Returns `{ ok, receipt: "accepted"|"not-pending", approvalId, sessionId, outcome }`.
+- The Web UI and Hermes answer over two channels — **first responder wins**; the loser gets `receipt=not-pending` and no side effect.
+- Timeout handling: after `approvalTimeoutMs` the bridge settles cancelled (builtin) / rejected (web protocol has no `cancelled`) — it never auto-allows.
+- ⚠️ This is a remote privilege-escalation button: always set `authToken` before any non-loopback exposure.
 
 ## Meta
 
@@ -125,3 +152,7 @@ Lists tool names registered inside Harness (the agent's own toolset).
 | `sensitive path` | fs_* tool hit `.ssh/.env/*token*/*.pem` |
 | `session not blank; …` | `preset_set` on a non-blank session |
 | `UnknownPresetError` | unknown preset id (response carries `available` list) |
+| `invalid sandbox "…"; valid modes: …` | `sandbox` value outside the three-tier enum (schema also rejects pre-call) |
+| `receipt=not-pending` | `approval_respond` lost the first-responder race, or the approval was answered/timed out/withdrawn already |
+| `sessionId mismatch: approval … belongs to …` | `approval_respond` called with a sessionId that doesn't own the approval |
+| `session <id> is not live; cold/persisted sessions must be resumed first` | `set_policy` on a non-live session |

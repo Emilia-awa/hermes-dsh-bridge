@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-08-26
+
+### Added
+- **Sandbox tiers (权限三档)**: `agent_run`/`task_inbox` accept `sandbox: read-only|workspace-write|danger-full-access` — a per-task override that seeds a session-log `sandbox/mode` event on newly created/resumed sessions (same write path as dsh `setSandboxMode`; effective on the next confined call, survives restarts via replay). Pool hygiene follows the preset precedent: requests whose tier differs from the pooled session's fixed tier skip the pool, and non-default-tier dedicated sessions never enter it — the three tiers never pollute each other on one cwd. New `defaultSandbox` config (default `workspace-write`).
+- `set_policy(sessionId, mode)` tool: switch an existing **live** session's tier (cold/persisted sessions error with a resume hint).
+- `policy_get(sessionId?)` tool: `{ sessionId, sandboxMode, source: "override"|"default", workspaceRoot, approvalPolicy }` (folds last `sandbox/mode` + `approval/policy` events; no-arg returns deployment defaults).
+- **Approval bridge (审批桥)**: new `approval_list()` and `approval_respond(approvalId, sessionId, outcome)` tools. Bridge mode `web` (default) subscribes `ctx.apiProxy.events.mux()`, tracks pending approvals in memory, syncs on `approval/resolved` frames (first responder wins across Web UI/Hermes; the loser gets `receipt=not-pending`) and answers through `apiProxy.respond({type:'client-response', …})`. Automatic degradation to a builtin `'approval/request'` answerer (asked/decided scan) when apiProxy is absent or `approvalsBridge: 'builtin'` is set; `'off'` disables bridging. `approvalTimeoutMs` (default 120000) settles timed-out approvals cancelled (builtin) / rejected (web) — **never auto-allows**. `task_inbox` is the primary async path; `agent_run` blocks while an approval is pending.
+- Status exposure: `status_get` now reports `sandboxPolicy { defaultMode, bridge, pendingApprovals }`; `config_get` reports `defaultSandbox/approvalsBridge/approvalTimeoutMs`; `session_list` rows carry `sandboxMode` when the session has a tier record; `task_list`/`task_result`/`agent_run` echo the requested tier.
+
+### Changed
+- Version 0.4.0 → 0.5.0; docs (README/TOOLS/CONFIG/SECURITY) updated for the 25-tool surface.
+- CI runs `tests/unit_mock_p3.mjs` (77 assertions: tier pass-through & pool isolation, set_policy live/cold, approval web/builtin flows incl. not-pending races and timeout cancellation, bridge off/explicit-builtin, status/config exposure).
+
 ## [0.4.0] - 2026-08-25
 
 ### Added

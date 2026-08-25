@@ -21,7 +21,8 @@ This plugin is an **agent-control channel**: `agent_run` gives the caller a full
 
 | Surface | Risk if exposed | Mitigation |
 |---|---|---|
-| `agent_run` / `task_inbox` | arbitrary code execution on the Harness host (sandbox is `workspace-write`, not a security boundary) | keep loopback; add Bearer token; TLS + reverse proxy before any non-loopback exposure; `workspaceRoots` whitelist |
+| `agent_run` / `task_inbox` | arbitrary code execution on the Harness host (sandbox is `workspace-write`, not a security boundary); the optional per-task `sandbox` parameter can widen a session to `danger-full-access` | keep loopback; add Bearer token; TLS + reverse proxy before any non-loopback exposure; `workspaceRoots` whitelist; keep `defaultSandbox: workspace-write`, reserve `danger-full-access` for trusted environments |
+| `approval_respond` (v0.5.0) | **remote privilege-escalation button**: an attacker who can reach the MCP endpoint can answer pending sandbox escalations with `allowed-once` | mandatory `authToken` on any non-loopback exposure (the 8090 listener must never be public without it); approvals time out to cancelled/rejected — never auto-allow; every grant is one-shot (`allowed-once`) and audit-logged as `approval/asked`+`approval/decided` in the session log |
 | `fs_write` (`enableFsWrite: true`) | write anywhere in allowed roots (overwrite/append/create-new) | **off by default**; limited to `workspaceRoots`; sensitive-name blacklist; 4MB cap; ancestor realpath traversal check |
 | `fs_read` / `fs_list` / `fs_stat` | read arbitrary files in allowed roots | path jail (workspaceRoots → registered workspaces + `~/.dsh`); `.ssh/**`, `*.pem`, `*token*`, `.env` blacklisted |
 | `config_get` | config leak | `authToken` masked as `***`; API keys are env vars, never part of config output |
@@ -30,11 +31,12 @@ This plugin is an **agent-control channel**: `agent_run` gives the caller a full
 
 ## Deployment requirements for non-loopback exposure
 
-1. `authToken` set to a long random value; client sends `Authorization: Bearer <token>`.
+1. `authToken` set to a long random value; client sends `Authorization: Bearer <token>`. **Non-negotiable once `approval_respond` is reachable from outside** — it grants sandbox escalations.
 2. Reverse proxy with TLS (e.g. cloudflared/nginx/caddy) — deny any plaintext path.
 3. Access control at the proxy (e.g. Cloudflare Access / IP allowlist) — this is the real auth wall.
 4. Keep `enableFsWrite: false` unless file-writing through the channel is actually required.
-5. Monitor agent sessions (`session_list` + `session_log`) for unexpected activity.
+5. Keep `defaultSandbox` at `workspace-write` (or lower). `danger-full-access` disables confinement AND approvals entirely.
+6. Monitor agent sessions (`session_list` + `session_log`) for unexpected activity; approval decisions are audit-logged per session (`approval/asked` / `approval/decided` events).
 
 ## Known non-goals
 
