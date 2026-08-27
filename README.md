@@ -6,6 +6,7 @@
 
 [![license](https://img.shields.io/badge/license-GPLv3-blue.svg)](./LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D22.18-orange)](https://nodejs.org)
+[![npm](https://img.shields.io/npm/v/hermes-dsh-bridge)](https://www.npmjs.com/package/hermes-dsh-bridge)
 [![CI](https://github.com/Emilia-awa/hermes-dsh-bridge/workflows/CI/badge.svg)](https://github.com/Emilia-awa/hermes-dsh-bridge/actions)
 
 ## 为什么存在
@@ -140,6 +141,7 @@ Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allo
 cd ~/.dsh/profiles/<你的profile>/node_modules
 npm install hermes-dsh-bridge
 ```
+> 包主页: https://www.npmjs.com/package/hermes-dsh-bridge
 
 ### 方式 B — 源码构建
 
