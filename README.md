@@ -133,9 +133,7 @@ Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allo
 
 ## 安装
 
-### 方式 A — 从 npm 安装到 Harness profile(包发布后可用)
-
-> ⚠️ 尚未发布到 npm registry,当前请用**方式 B(源码构建)**。以下步骤在包发布后适用:
+### 方式 A — 从 npm 安装到 Harness profile
 
 ```bash
 # 在 Harness profile 的 node_modules 下
@@ -213,7 +211,7 @@ python3 examples/hermes_dsh_mcp.py call status_get '{}'
 ```bash
 # ① 安装插件到 profile
 cd ~/.dsh/profiles/<PROFILE>/node_modules
-npm install hermes-dsh-bridge        # 未发布到 npm 前用方式 B（源码）
+npm install hermes-dsh-bridge        # 安装自 npm registry
 
 # ② 修复 dual-package hazard: 把所有 @deepseek-ai/* 和 cordis-plugin-* symlink 到全局树
 GLOBAL_TREE=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
