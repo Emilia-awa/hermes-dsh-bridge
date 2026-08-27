@@ -133,7 +133,9 @@ Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allo
 
 ## 安装
 
-### 方式 A — 从 npm 安装到 Harness profile
+### 方式 A — 从 npm 安装到 Harness profile(包发布后可用)
+
+> ⚠️ 尚未发布到 npm registry,当前请用**方式 B(源码构建)**。以下步骤在包发布后适用:
 
 ```bash
 # 在 Harness profile 的 node_modules 下
@@ -183,9 +185,10 @@ npm install && npm run build   # 产出 lib/index.js
         # defaultSandbox: workspace-write # 可选: 新建会话默认权限档(read-only|workspace-write|danger-full-access)
         # approvalsBridge: web            # 可选: 审批桥(web|builtin|off, 默认 web)
         # approvalTimeoutMs: 120000       # 可选: 审批等待超时(超时收尾为取消/拒绝, 绝不超时放行)
-        # ⚠️ 必须显式声明 provider/model, 否则 agent 组装会因空 {{model}} 崩溃:
-        provider: opencode-go
-        model: deepseek-v4-flash
+        # ⚠️ 必须显式声明 provider/model(你的 Harness 里已配置好的),
+        #    否则 agent 组装会因空 {{model}} 崩溃。改成你自己的, 例如:
+        #    provider: <your-provider-id>
+        #    model: <your-model-id>
 ```
 
 ### 重启并验证
@@ -224,6 +227,7 @@ for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
 done
 
 # ③ 在 profile 的 cordis patch 文件(cordis.patch.yml)末尾追加配置
+#    ⚠️ provider/model 必须填你这个 Harness 已配置好的, 否则 agent 组装会崩
 cat >> ~/.dsh/profiles/<PROFILE>/cordis.patch.yml <<'EOF'
 - insert:
     - id: hermes-dsh-bridge
@@ -232,8 +236,8 @@ cat >> ~/.dsh/profiles/<PROFILE>/cordis.patch.yml <<'EOF'
         http: true
         port: 8090
         host: 127.0.0.1
-        provider: opencode-go      # ← 换成你自己的 provider id
-        model: deepseek-v4-flash   # ← 换成你自己的 model id
+        provider: <your-provider-id>   # ← 你的 Harness 里已配置的 provider
+        model: <your-model-id>         # ← 你的 Harness 里已配置的 model
 EOF
 
 # ④ 重启 Harness(注意: 若你正跑在 Harness 里, 用 systemd-run 脱离进程树重启)

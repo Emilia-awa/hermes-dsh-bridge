@@ -107,7 +107,7 @@ export interface Config {
   host?: string
   /** 后端 provider(默认 deepseek-official) */
   provider?: string
-  /** 执行任务的模型(默认 deepseek-v4-flash) */
+  /** 执行任务的模型(默认空 = 跟随 dsh 的用户/默认设置; 配置了才覆盖) */
   model?: string
   /** 挂载的 agent preset(默认 standard) */
   preset?: string

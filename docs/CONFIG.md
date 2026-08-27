@@ -15,8 +15,8 @@ The plugin is configured through the cordis patch entry in your Harness profile 
 | `defaultSandbox` | string | `workspace-write` | default file-sandbox tier for newly created/resumed sessions: `read-only` \| `workspace-write` \| `danger-full-access`. Invalid values warn and keep the default. ⚠️ `danger-full-access` = unrestricted read/write, no approvals |
 | `approvalsBridge` | string | `web` | approval bridge mode: `web` (subscribe the apiProxy mux stream; answers route through `apiProxy.respond`) / `builtin` (plugin-internal answerer; also the automatic fallback when apiProxy is absent) / `off` (no bridge — approvals fall back to deployment defaults, fail-closed) |
 | `approvalTimeoutMs` | number | `120000` | how long a pending approval is waited for. On expiry it settles cancelled (builtin) or rejected (web) — **never auto-allows**. `agent_run` blocks while an approval is pending; prefer `task_inbox` for approval-prone workloads |
-| `provider` | string | — | **required**: LLM provider id for agent assembly (e.g. `opencode-go`) |
-| `model` | string | — | **required**: model id (e.g. `deepseek-v4-flash`) |
+| `provider` | string | — | **required**: your Harness's LLM provider id for agent assembly (a provider you already configured, e.g. under `llm-*` in your patch) |
+| `model` | string | — | **required**: a model id offered by that provider |
 
 ## Security defaults (why they are what they are)
 
@@ -46,8 +46,11 @@ The plugin is configured through the cordis patch entry in your Harness profile 
         defaultSandbox: workspace-write   # read-only | workspace-write | danger-full-access
         approvalsBridge: web              # web | builtin | off
         approvalTimeoutMs: 120000
-        provider: opencode-go
-        model: deepseek-v4-flash
+        # ⚠️ provider/model must be a provider+model your Harness already
+        #    has configured (see the llm-* section of your cordis patch);
+        #    the plugin does not bring its own LLM provider.
+        provider: <your-provider-id>
+        model: <your-model-id>
 ```
 
 If you only ever talk to it from the same host over loopback and trust all local processes, `authToken` may be omitted — but then any local user/process can drive the agent.

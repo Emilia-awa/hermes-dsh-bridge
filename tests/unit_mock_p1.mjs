@@ -173,7 +173,7 @@ mkdirSync('/tmp/a2a-ws-mock', { recursive: true })
 
 // ═══ 实例 A: enableFsWrite=true + workspaceRoots ═══
 console.log('── 实例A: fs_write 开启 + preset 切换 + stats 折叠 ──')
-await apply(makeCtx(), { port: 8093, host: '127.0.0.1', provider: 'opencode-go', model: '', workspaceRoots: ['/tmp/a2a-ws-mock'], enableFsWrite: true })
+await apply(makeCtx(), { port: 8093, host: '127.0.0.1', provider: 'mock-provider', model: '', workspaceRoots: ['/tmp/a2a-ws-mock'], enableFsWrite: true })
 await new Promise((r) => setTimeout(r, 200))
 
 {
