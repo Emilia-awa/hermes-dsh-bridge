@@ -65,7 +65,7 @@ import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
-import { readdir, readFile, realpath, stat, writeFile, appendFile, mkdir } from 'node:fs/promises'
+import { readdir, readFile, realpath, stat, writeFile, appendFile, mkdir, unlink } from 'node:fs/promises'
 import http from 'node:http'
 import { zstdDecompressSync } from 'node:zlib'
 import { homedir } from 'node:os'
@@ -91,7 +91,7 @@ export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
 
 /** 审批桥形态: web=订阅 apiProxy mux 复用 Web 审批通道(默认); builtin=插件内建应答器; off=关闭桥 */
-export type ApprovalsBridge = 'web' | 'builtin' | 'off'
+export type ApprovalsBridge = 'web' | 'builtin' | 'off' | 'file-push'
 
 /**
  * 声明依赖的核心服务。
@@ -127,8 +127,10 @@ export interface Config {
   defaultSandbox?: SandboxMode
   /** 审批桥模式(P3, 默认 'web'): web=订阅 apiProxy mux 复用 Web 审批通道; builtin=插件内建应答器(apiProxy 缺失时自动降级); off=关闭桥(审批回到 fail-closed) */
   approvalsBridge?: ApprovalsBridge
-  /** 审批等待超时毫秒(P3, 默认 120000)。超时 settle cancelled(builtin)/rejected(web 协议无 cancelled) —— 绝不超时放行 */
+  /** 审批等待超时毫秒(P3, 默认 300000)。超时 settle cancelled(builtin)/rejected(web 协议无 cancelled) —— 绝不超时放行 */
   approvalTimeoutMs?: number
+  /** 审批文件推送目录(P3 file-push 桥, 默认 ~/.dsh/approvals/)。Hermes 将在该目录下发现 pending_<id>.json 并写 response_<id>.json 回答 */
+  approvalFileDir?: string
 }
 
 /** 运行时配置默认值(apply 时重置再叠加 config, 保证重复 apply 幂等不残留上一次的状态) */
@@ -145,7 +147,8 @@ const runtimeConfigDefaults = () => ({
   enableFsWrite: false,
   defaultSandbox: 'workspace-write' as SandboxMode,
   approvalsBridge: 'web' as ApprovalsBridge,
-  approvalTimeoutMs: 120 * 1000,
+  approvalTimeoutMs: 300 * 1000,
+  approvalFileDir: joinPath(homedir(), '.dsh', 'approvals'),
 })
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
@@ -934,6 +937,12 @@ const pendingApprovals = new Map<string, PendingApproval>()
 /** 当前生效的审批桥形态(status_get/approval_list 上报) */
 let activeBridgeKind: ApprovalsBridge = 'off'
 
+/** file-push 桥活动状态({dir: 审批文件目录}); 非 file-push 形态为 null(全部文件操作 no-op) */
+let approvalBridgeFiles: { dir: string } | null = null
+
+/** file-push 响应文件轮询间隔(ms; 协议要求 ≥500) */
+const APPROVAL_FILE_POLL_MS = 500
+
 function clearApprovalTimer(entry: PendingApproval): void {
   if (entry.timer !== undefined) {
     clearTimeout(entry.timer)
@@ -958,6 +967,7 @@ function armPendingApproval(ctx: Context, entry: PendingApproval): void {
     // 已被回答/摘除 → 定时器作废(先答者胜)
     if (pendingApprovals.get(entry.approvalId) !== entry) return
     removePendingApproval(entry)
+    removePendingApprovalFile(entry.approvalId)
     console.warn(`[harness-mcp-server] approval ${entry.approvalId} timed out after ${runtimeConfig.approvalTimeoutMs}ms -> ${entry.settle ? 'cancelled' : 'rejected'} (never allow on timeout)`)
     if (entry.settle) {
       entry.settle('cancelled')
@@ -985,6 +995,7 @@ async function respondToApproval(ctx: Context, entry: PendingApproval, outcome: 
   // 先摘除再回答: 保证同一 approvalId 只被 settle 一次(败者在入口处就被 not-pending 挡下)
   removePendingApproval(entry)
   clearApprovalTimer(entry)
+  removePendingApprovalFile(entry.approvalId)
   if (entry.settle) {
     entry.settle(outcome)
     return { accepted: true }
@@ -1004,6 +1015,109 @@ async function respondToApproval(ctx: Context, entry: PendingApproval, outcome: 
   }
 }
 
+/** 写 pending_<approvalId>.json(文件推送协议: 通知 Hermes 有审批待答)。仅 file-push 形态生效; 失败有 warn。 */
+async function writePendingApprovalFile(entry: { approvalId: string; sessionId: string; toolName: string; callId?: string; reason?: string; requestedAt: number; rpcId?: string }): Promise<void> {
+  const bridge = approvalBridgeFiles
+  if (bridge === null) return
+  try {
+    await mkdir(bridge.dir, { recursive: true })
+    await writeFile(joinPath(bridge.dir, `pending_${entry.approvalId}.json`), `${JSON.stringify({
+      approvalId: entry.approvalId,
+      sessionId: entry.sessionId,
+      toolName: entry.toolName,
+      reason: entry.reason ?? null,
+      requestedAt: entry.requestedAt,
+      rpcId: entry.rpcId ?? null,
+      callbackDir: bridge.dir,
+      outcome: null,
+    }, null, 2)}\n`, 'utf8')
+  } catch (e) {
+    console.warn(`[harness-mcp-server] pending approval file write failed (${entry.approvalId}): ${(e as Error)?.message ?? e}`)
+  }
+}
+/** 删除 pending_<approvalId>.json(已应答/超时/卸载清理)。仅 file-push 形态生效; 不存在或失败静默。 */
+async function removePendingApprovalFile(approvalId: string): Promise<void> {
+  const bridge = approvalBridgeFiles
+  if (bridge === null) return
+  try {
+    await unlink(joinPath(bridge.dir, `pending_${approvalId}.json`))
+  } catch { /* 文件不存在或无法删除, 静默 */ }
+}
+/** 扫描会话事件流定位本次 ask 的 ApprovalRequestId(builtin/file-push answerer 共用; 返回 undefined 表示交给 next)。
+ *  照 apiproxy 先例: 倒序扫 asked/decided 配对, 跳过已挂起/已决, callId 必须与本次请求一致。 */
+function findApprovalFromEvents(req: { callId?: string }, events: readonly unknown[]): string | undefined {
+  const decided = new Set<string>()
+  let approvalId: string | undefined
+  for (let i = events.length - 1; i >= 0; i--) {
+    const ev = events[i] as { type?: string; data?: { id?: unknown; callId?: unknown } } | undefined
+    if (ev?.type === 'approval/decided') decided.add(String(ev.data?.id))
+    else if (ev?.type === 'approval/asked') {
+      const id = String(ev.data?.id)
+      if (decided.has(id) || pendingApprovals.has(id)) continue
+      if ((req.callId ?? null) !== (ev.data?.callId ?? null)) continue
+      approvalId = id
+      break
+    }
+  }
+  return approvalId
+}
+/** 构造 builtin 式 'approval/request' answerer: 定位 approvalId → armPendingApproval(settle 实际应答)。
+ *  filePush=true(file-push 桥)时先写 pending_<approvalId>.json 通知 Hermes; 其余行为与 builtin 完全一致。 */
+function makeApprovalRequestAnswerer(ctx: Context, filePush: boolean) {
+  return async (req: { signal?: { aborted: boolean }; agent?: { session?: unknown }; callId?: string; toolName?: string; reason?: string }, next: () => Promise<ApprovalOutcome>): Promise<ApprovalOutcome> => {
+    if (req.signal?.aborted === true) return 'cancelled'
+    const sess = req.agent?.session as unknown as PolicySessionLike | undefined
+    const events = ((sess?.events ?? sess?.log) ?? []) as readonly unknown[]
+    const approvalId = findApprovalFromEvents(req, events)
+    if (approvalId === undefined) return next()
+    const base = {
+      approvalId,
+      sessionId: String(sess?.id ?? ''),
+      toolName: typeof req.toolName === 'string' ? req.toolName : '?',
+      ...(req.callId !== undefined ? { callId: String(req.callId) } : {}),
+      ...(req.reason !== undefined ? { reason: String(req.reason) } : {}),
+      requestedAt: Date.now(),
+    }
+    if (filePush) await writePendingApprovalFile(base)
+    return new Promise<ApprovalOutcome>((resolve) => {
+      armPendingApproval(ctx, { ...base, settle: resolve } as PendingApproval)
+    })
+  }
+}
+/** 处理单个 response_<approvalId>.json: 内容有效且审批仍挂起 → respondToApproval; 其余(not-pending/非法/名实不符)仅删文件。
+ *  无论结果如何都消费该响应文件, 防堆积; 半写文件(JSON 解析失败)留待下一轮轮询。 */
+async function handleApprovalResponseFile(ctx: Context, filePath: string, approvalId: string): Promise<void> {
+  let payload: { approvalId?: string; outcome?: string }
+  try {
+    payload = JSON.parse(await readFile(filePath, 'utf8'))
+  } catch { return }
+  const mismatch = payload?.approvalId !== approvalId
+  const outcome = payload?.outcome
+  const entry = pendingApprovals.get(approvalId)
+  if (!mismatch && (outcome === 'allowed-once' || outcome === 'rejected') && entry !== undefined) {
+    const receipt = await respondToApproval(ctx, entry, outcome)
+    if (receipt.accepted) console.log(`[harness-mcp-server] approval ${approvalId} answered via file-push: ${outcome}`)
+    else console.warn(`[harness-mcp-server] approval ${approvalId} file answer not accepted (${receipt.reason ?? '?'}); response file removed`)
+  } else {
+    console.warn(`[harness-mcp-server] approval response file ignored (${approvalId} -> ${String(outcome)}${mismatch ? `; payload approvalId=${String(payload?.approvalId)} mismatch` : ''}): not-pending or invalid; response file removed`)
+  }
+  try { await unlink(filePath) } catch { /* 删除失败静默, 防残留 */ }
+}
+/** file-push 轮询: 扫描 approvalFileDir 下所有 response_*.json(定期检测, 间隔 ≥500ms) */
+async function scanApprovalResponseFiles(ctx: Context): Promise<void> {
+  const bridge = approvalBridgeFiles
+  if (bridge === null) return
+  let names: string[]
+  try {
+    names = await readdir(bridge.dir)
+  } catch { return } // 目录未创建/不可读 → 下一轮
+  for (const name of names) {
+    if (!name.startsWith('response_') || !name.endsWith('.json')) continue
+    await handleApprovalResponseFile(ctx, joinPath(bridge.dir, name), name.slice('response_'.length, -'.json'.length))
+  }
+}
+
+
 /**
  * 启动审批转接桥(P3)。apply() 末尾调用一次, 返回 dispose(卸载时清定时器/订阅/挂起表)。
  * 形态选择:
@@ -1011,6 +1125,9 @@ async function respondToApproval(ctx: Context, entry: PendingApproval, outcome: 
  *   - web + apiProxy : activeBridgeKind='web'。订阅 apiProxy mux 流维护内存挂起表(open 时 apiproxy
  *                      会重放 still-pending 帧); 应答器是 apiproxy 自己, approval_respond 经它回答,
  *                      与 Web UI 双通道先答者胜(mux 收到 approval/resolved 即同步摘除)。
+ *   - file-push       : activeBridgeKind='file-push'。builtin answerer(settle 实际应答)+ 文件通知:
+ *                       approval/request 时写 pending_<approvalId>.json, 轮询(≥500ms)检测 Hermes 的
+ *                       response_<approvalId>.json → respondToApproval → 删响应文件; resolved/超时清理 pending 文件。
  *   - 其余(builtin)  : activeBridgeKind='builtin'。自注册 'approval/request' answerer(waterfall;
  *                      照 apiproxy 先例扫 asked/decided 配对定位本次 ask 的 ApprovalRequestId),
  *                      approval_respond 直接 settle。apiProxy 缺失时自动落到这里(降级保底)。
@@ -1061,55 +1178,49 @@ function startApprovalsBridge(ctx: Context): () => void {
       controller.abort()
       for (const entry of [...pendingApprovals.values()]) clearApprovalTimer(entry)
       pendingApprovals.clear()
+      approvalBridgeFiles = null
       activeBridgeKind = 'off'
     }
   }
 
-  // builtin 降级/显式: 自注册 answerer(waterfall; 不调 next 即认领本次请求)
+  // builtin/file-push 降级/显式: 自注册 answerer(waterfall; 不调 next 即认领本次请求)
   if (typeof (ctx as { on?: unknown }).on !== 'function') {
     // 无事件能力的宿主(如部分 mock/headless 组合)无法注册 waterfall answerer → 关闭桥,
     // 避免 ctx.on is not a function 崩溃; 审批请求按 fail-closed 无 answerer 处理。
     activeBridgeKind = 'off'
-    console.warn('[approvals] host 无 ctx.on 事件能力, builtin 桥关闭(approvalsBridge=off)')
+    approvalBridgeFiles = null
+    console.warn('[approvals] host 无 ctx.on 事件能力, builtin/file-push 桥关闭(approvalsBridge=off)')
     return () => {}
   }
-  activeBridgeKind = 'builtin'
-  ctx.on('approval/request', (req, next) => {
-    if (req.signal?.aborted === true) return Promise.resolve<ApprovalOutcome>('cancelled')
-    // 定位本次 ask 的 ApprovalRequestId: 从会话事件流倒序扫 asked/decided 配对(apiproxy 同款),
-    // 跳过已 decided / 已在本表挂起的 id, callId 精确配对。
-    const sess = req.agent?.session as unknown as PolicySessionLike | undefined
-    const events = ((sess?.events ?? sess?.log) ?? []) as readonly unknown[]
-    const decided = new Set<string>()
-    let approvalId: string | undefined
-    for (let i = events.length - 1; i >= 0; i--) {
-      const ev = events[i] as { type?: string; data?: { id?: unknown; callId?: unknown } } | undefined
-      if (ev?.type === 'approval/decided') {
-        decided.add(String(ev.data?.id))
-      } else if (ev?.type === 'approval/asked') {
-        const id = String(ev.data?.id)
-        if (decided.has(id) || pendingApprovals.has(id)) continue
-        if ((req.callId ?? null) !== (ev.data?.callId ?? null)) continue
-        approvalId = id
-        break
-      }
-    }
-    if (approvalId === undefined) return next()
-    return new Promise<ApprovalOutcome>((resolve) => {
-      armPendingApproval(ctx, {
-        approvalId,
-        sessionId: String(sess?.id ?? ''),
-        toolName: typeof req.toolName === 'string' ? req.toolName : '?',
-        ...(req.callId !== undefined ? { callId: String(req.callId) } : {}),
-        ...(req.reason !== undefined ? { reason: String(req.reason) } : {}),
-        requestedAt: Date.now(),
-        settle: resolve,
+  const filePush = bridge === 'file-push'
+  activeBridgeKind = filePush ? 'file-push' : 'builtin'
+  if (filePush) {
+    approvalBridgeFiles = { dir: runtimeConfig.approvalFileDir }
+    try { void mkdir(runtimeConfig.approvalFileDir, { recursive: true }).catch(() => {}) } catch { /* ignore */ }
+  }
+  ctx.on('approval/request', makeApprovalRequestAnswerer(ctx, filePush))
+  /** 启动响应文件轮询(仅 file-push; 兜底即使没有 fs.watch 也能工作, 间隔 ≥500ms) */
+  let pollTimer: ReturnType<typeof setTimeout> | undefined
+  if (filePush) {
+    const tick = () => {
+      const b = approvalBridgeFiles
+      if (b === null) return
+      scanApprovalResponseFiles(ctx).catch((e) => {
+        console.warn('[harness-mcp-server] approval response scan failed:', (e as Error)?.message ?? e)
+      }).finally(() => {
+        if (approvalBridgeFiles !== null) pollTimer = setTimeout(tick, APPROVAL_FILE_POLL_MS)
       })
-    })
-  })
+    }
+    pollTimer = setTimeout(tick, APPROVAL_FILE_POLL_MS)
+  }
   return () => {
-    for (const entry of [...pendingApprovals.values()]) clearApprovalTimer(entry)
+    if (pollTimer !== undefined) clearTimeout(pollTimer)
+    for (const entry of [...pendingApprovals.values()]) {
+      clearApprovalTimer(entry)
+      removePendingApprovalFile(entry.approvalId)
+    }
     pendingApprovals.clear()
+    approvalBridgeFiles = null
     activeBridgeKind = 'off'
   }
 }
@@ -1665,6 +1776,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       defaultSandbox: runtimeConfig.defaultSandbox,
       approvalsBridge: runtimeConfig.approvalsBridge,
       approvalTimeoutMs: runtimeConfig.approvalTimeoutMs,
+      approvalFileDir: runtimeConfig.approvalFileDir,
     }, null, 2))
   })
 
@@ -2626,14 +2738,17 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
     }
   }
   if (config.approvalsBridge !== undefined) {
-    if (config.approvalsBridge === 'web' || config.approvalsBridge === 'builtin' || config.approvalsBridge === 'off') {
+    if (config.approvalsBridge === 'web' || config.approvalsBridge === 'builtin' || config.approvalsBridge === 'off' || config.approvalsBridge === 'file-push') {
       runtimeConfig.approvalsBridge = config.approvalsBridge
     } else {
-      console.warn(`[harness-mcp-server] invalid approvalsBridge "${String(config.approvalsBridge)}", keep default "web" (valid: web|builtin|off)`)
+      console.warn(`[harness-mcp-server] invalid approvalsBridge "${String(config.approvalsBridge)}", keep default "web" (valid: web|builtin|file-push|off)`)
     }
   }
   if (config.approvalTimeoutMs !== undefined && Number.isFinite(config.approvalTimeoutMs) && config.approvalTimeoutMs > 0) {
     runtimeConfig.approvalTimeoutMs = Math.trunc(config.approvalTimeoutMs)
+  }
+  if (config.approvalFileDir !== undefined && typeof config.approvalFileDir === 'string' && config.approvalFileDir.trim()) {
+    runtimeConfig.approvalFileDir = config.approvalFileDir
   }
 
   const port = config.port ?? 8090
