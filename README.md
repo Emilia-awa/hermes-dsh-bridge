@@ -9,6 +9,8 @@
 [![npm](https://img.shields.io/npm/v/hermes-dsh-bridge)](https://www.npmjs.com/package/hermes-dsh-bridge)
 [![CI](https://github.com/Emilia-awa/hermes-dsh-bridge/workflows/CI/badge.svg)](https://github.com/Emilia-awa/hermes-dsh-bridge/actions)
 
+**版本兼容性**：v0.6.0 支持 **dsh ≥ 0.1.2-rc.1**（含 0.1.2 破坏性变更适配：dsh-llm 移除 `isTokenDelta`、dsh-agent-presets 移除 `resolveSessionPreset`、dsh 移除 `apiProxy` 服务）。v0.5.0 及更早版本仅兼容 dsh ≤ 0.1.1-rc.2（旧 API）。
+
 ## 为什么存在
 
 Harness 自带强大的 Agent 运行时（工具、LLM、Agent、会话），但它是 **Cordis 应用**，别的 Agent 调不动它。这个插件把 Harness 翻了个面：在 Harness **内部**启动一个真正的 **MCP server**（StreamableHTTP），桥接 Harness 核心服务（`ctx.agents` / `ctx.agentPresets` / `ctx.tools`），让外部"大脑"把真正的活派给 Harness 的"双手"。
