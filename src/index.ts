@@ -57,11 +57,11 @@ import type { Context } from '@deepseek-ai/cordis'
 import type { AgentHandle } from '@deepseek-ai/dsh-agent'
 import { z } from 'zod'
 import { createUserMessage } from '@deepseek-ai/dsh-llm'
-import { isTokenDelta } from '@deepseek-ai/dsh-llm/message'
+// dsh-llm 0.1.2 移除了 '@deepseek-ai/dsh-llm/message' 的 isTokenDelta 导出, 改为下方内联判断(语义不变)
 import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
-import { resolveSessionPreset } from '@deepseek-ai/dsh-agent-presets'
+// dsh-agent-presets 0.1.2 移除了 resolveSessionPreset 导出, presetFromEvents 改为本地实现(语义不变)
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
@@ -75,7 +75,7 @@ import { join as joinPath, resolve, dirname, basename } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(status_get 上报; 与 package.json 保持同步) */
-const PLUGIN_VERSION = '0.5.0'
+const PLUGIN_VERSION = '0.6.0'
 
 /**
  * 会话文件权限三档(与 dsh-sandbox 的 SandboxMode 一一对应; 不直接 import 该包, 免新增运行时依赖):
@@ -90,7 +90,7 @@ export type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access'
 /** 全部合法档位(schema 枚举与运行时校验共用) */
 const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const
 
-/** 审批桥形态: web=订阅 apiProxy mux 复用 Web 审批通道(默认); builtin=插件内建应答器; off=关闭桥 */
+/** 审批桥形态: web=订阅 apiProxy mux 复用 Web 审批通道(默认; dsh 0.1.2 起 headless 组合无 apiProxy 服务, 该模式自动降级 builtin); builtin=插件内建应答器; off=关闭桥 */
 export type ApprovalsBridge = 'web' | 'builtin' | 'off' | 'file-push'
 
 /**
@@ -98,7 +98,7 @@ export type ApprovalsBridge = 'web' | 'builtin' | 'off' | 'file-push'
  * workspaceRegistry/sessionPersistence/sessions 是续接/归组三个增量用到的服务——
  * 漏声明会在真实启动时拿不到服务(本插件曾经踩过, 务必与代码里的 ctx.get 对齐)。
  */
-export const inject = ['tools', 'llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'sessions', 'apiProxy']
+export const inject = ['tools', 'llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'sessions']
 
 /** 插件配置 */
 export interface Config {
@@ -125,7 +125,7 @@ export interface Config {
   enableFsWrite?: boolean
   /** 新建/resume 会话的默认文件权限档(默认 'workspace-write'; danger-full-access=无审批任意读写, 仅限可信环境) */
   defaultSandbox?: SandboxMode
-  /** 审批桥模式(P3, 默认 'web'): web=订阅 apiProxy mux 复用 Web 审批通道; builtin=插件内建应答器(apiProxy 缺失时自动降级); off=关闭桥(审批回到 fail-closed) */
+  /** 审批桥模式(P3, 默认 'web'; deprecated: dsh 0.1.2 起不 inject apiProxy, headless 组合下 web 自动降级 builtin): web=订阅 apiProxy mux 复用 Web 审批通道; builtin=插件内建应答器(apiProxy 缺失时自动降级); off=关闭桥(审批回到 fail-closed) */
   approvalsBridge?: ApprovalsBridge
   /** 审批等待超时毫秒(P3, 默认 300000)。超时 settle cancelled(builtin)/rejected(web 协议无 cancelled) —— 绝不超时放行 */
   approvalTimeoutMs?: number
@@ -804,11 +804,17 @@ function titleFromEvents(events: readonly unknown[]): string | undefined {
   return undefined
 }
 
-/** 从事件流解析会话实际运行的 preset: 最后一条 agent-preset/selected 优先, 其次 header.agentPreset(resolveSessionPreset 同款语义) */
+/** 从事件流解析会话实际运行的 preset: 最后一条 agent-preset/selected 优先, 其次 header.agentPreset(dsh-agent-presets 0.1.2 移除 resolveSessionPreset 后的本地实现, 语义同旧版) */
 function presetFromEvents(header: SessionHeader | undefined, events: readonly unknown[]): string | undefined {
   if (header === undefined) return undefined
   try {
-    return resolveSessionPreset({ header, events: events as Parameters<typeof resolveSessionPreset>[0]['events'] })
+    for (let i = events.length - 1; i >= 0; i--) {
+      const e = events[i] as { type?: string; data?: { preset?: unknown } } | undefined
+      if (e?.type === 'agent-preset/selected' && typeof e.data?.preset === 'string' && e.data.preset) {
+        return e.data.preset
+      }
+    }
+    return header.agentPreset
   } catch {
     return header.agentPreset
   }
@@ -910,9 +916,9 @@ interface ApiProxyView {
   }) => Promise<{ accepted: boolean; reason?: string }>
 }
 
-/** 取 apiProxy(强转结构视图; 纯 headless 组合没有该服务时返回 undefined) */
+/** 取 apiProxy(强转结构视图; 纯 headless 组合没有该服务时返回 undefined。dsh 0.1.2 起不 inject 的服务禁止直接读 ctx.apiProxy, 必须 ctx.get(key, false) 宽松读取) */
 function apiProxyOf(ctx: Context): ApiProxyView | undefined {
-  return (ctx as unknown as { apiProxy?: ApiProxyView }).apiProxy
+  return ctx.get('apiProxy', false) as ApiProxyView | undefined
 }
 
 /** 挂起审批条目(web 桥来自 mux 帧, 带 rpcId; builtin 桥来自 answerer 直收, 带 settle) */
@@ -1345,9 +1351,18 @@ function foldSessionStats(events: readonly unknown[]): SessionStatsFold {
         openStep = { turn: Number(d.turn), step: Number(d.step), startTime: t, firstTokenTime: null }
         break
       case 'assistant/chunk': {
-        const cd = d.chunk as { type?: string } | undefined
+        const cd = d.chunk as { type?: string; text?: string; argumentsDelta?: string; name?: string } | undefined
         if (openStep === null || openStep.turn !== Number(d.turn) || openStep.step !== Number(d.step)) break
-        if (openStep.firstTokenTime === null && cd !== undefined && isTokenDelta(cd as Parameters<typeof isTokenDelta>[0])) openStep.firstTokenTime = t
+        // 内联 token-delta 判断(dsh-llm 0.1.2 移除 isTokenDelta; 语义与旧版一致:
+        // text/reasoning-delta 看非空 text, tool-call-delta 看非空 argumentsDelta 或带 name)
+        if (openStep.firstTokenTime === null && cd !== undefined) {
+          const isTok =
+            cd.type === 'text-delta' ? (cd.text ?? '') !== ''
+            : cd.type === 'reasoning-delta' ? (cd.text ?? '') !== ''
+            : cd.type === 'tool-call-delta' ? (cd.argumentsDelta ?? '') !== '' || cd.name !== undefined
+            : false
+          if (isTok) openStep.firstTokenTime = t
+        }
         break
       }
       case 'assistant/message': {

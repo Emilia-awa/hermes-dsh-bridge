@@ -4,6 +4,19 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-09-04
+
+### Added
+- `approvalsBridge: 'file-push'` mode: pending approvals are mirrored to a file (default `~/.dsh/approvals/`, `approvalFileDir` config) so an out-of-band MCP client (e.g. Hermes) can detect and answer them while `agent_run` is blocked; first-responder-wins semantics unchanged. Approval timeout default raised 120000 → 300000 to match.
+
+### Changed
+- **dsh 0.1.2-rc.1 adaptation** (previous src failed to start under dsh 0.1.2):
+  - `isTokenDelta` (removed from `@deepseek-ai/dsh-llm/message` in 0.1.2) replaced with an inline check preserving the old semantics: `text-delta`/`reasoning-delta` → non-empty `text`; `tool-call-delta` → non-empty `argumentsDelta` or `name !== undefined`.
+  - `resolveSessionPreset` (removed from `@deepseek-ai/dsh-agent-presets` in 0.1.2) replaced with a local `presetFromEvents` scanning `agent-preset/selected` events newest-first for the last non-empty `data.preset`, falling back to `header.agentPreset`.
+  - `apiProxy` removed from the `inject` array (the service no longer exists in dsh 0.1.2 headless compositions; injecting it crashed startup); `apiProxyOf` now reads it leniently via `ctx.get('apiProxy', false)` (returns `undefined`, never throws) — the `web` bridge auto-degrades to `builtin` there as before.
+  - `@deepseek-ai/*` dsh dependencies loosened from pinned `0.1.0-rc.6` to `^0.1.2-rc.1`; `peerDependencies.@deepseek-ai/cordis` ^4.0.1 → ^4.0.2.
+- Version 0.5.0 → 0.6.0; `tests/unit_mock_p3.mjs` mock ctx now serves `apiProxy` through `ctx.get('apiProxy', false)` (matching the cordis hard rule that non-injected services must not be read as properties) and asserts the new defaults (79 assertions).
+
 ## [0.5.0] - 2026-08-26
 
 ### Added

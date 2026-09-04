@@ -1,4 +1,4 @@
-// P3 单元级集成测试(v0.5.0): 用 mock ctx 直接驱动插件的 apply(),
+// P3 单元级集成测试(v0.6.0): 用 mock ctx 直接驱动插件的 apply(),
 // 覆盖权限三档 + 审批桥 + 状态暴露:
 //   A: 三档参数透传(create/resume 种 sandbox/mode)、invalid 拒绝、池防污染
 //      (请求档≠会话固化档不复用 / 非默认档不入池 / 默认调用不受污染)、set_policy live/冷会话
@@ -71,7 +71,9 @@ function makeRecorderSession(cwd) {
 
 /**
  * 构造 P3 mock ctx:
- * - opts.apiProxy: 注入假 apiProxy(web 桥路径); 缺省不注入(builtin/off 降级路径)
+ * - opts.apiProxy: 注入假 apiProxy(web 桥路径); 缺省不注入(builtin/off 降级路径)。
+ *   dsh 0.1.2 起插件改用 ctx.get('apiProxy', false) 宽松读取(不再允许直接读 ctx.apiProxy 属性),
+ *   所以 mock 把服务放进 services 表、由 get() 按名分发 —— 与真实 cordis 宿主同构。
  * - opts.hangWhenIdle: agent whenIdle 挂起(未用, 预留)
  * - ctx.on 收集器: 记录插件注册的事件应答器('approval/request' 等), 测试手工触发
  */
@@ -84,12 +86,14 @@ function makeCtxP3(opts = {}) {
   const liveSessions = new Map() // sessions store: id -> {header, log}
   const persisted = new Map()  // id -> {meta, events}
   const resumed = new Map()    // resume 出来的 recorder 会话(断言 resume 种档用)
+  const services = new Map()   // cordis 服务表(get('apiProxy', false) 等按名读取)
+  if (opts.apiProxy) services.set('apiProxy', opts.apiProxy)
 
   const ctx = {
     effect(fn) { void fn },
     on(event, handler) { calls.on.push([event, handler]) },
-    ...(opts.apiProxy ? { apiProxy: opts.apiProxy } : {}),
     get(name) {
+      if (name === 'apiProxy') return services.get('apiProxy')
       if (name === 'sessions') {
         return {
           // 真实 dsh 里 agent 会话就是 attached session: store.get/list 兜底并入 registry 的会话
@@ -158,7 +162,7 @@ function makeCtxP3(opts = {}) {
       recompose: async (_c, id) => ({ id }),
     },
   }
-  return { ctx, calls, registry, liveSessions, persisted, resumed }
+  return { ctx, calls, registry, liveSessions, persisted, resumed, services }
 }
 
 /** 假 apiProxy: events.mux 异步生成器(测试用 push/broadcast 投帧) + respond(rpcId 挂起表校验, 照真实实现语义) */
@@ -263,9 +267,9 @@ const WS_REAL = realpathSync(WS)
 
 // ═══════════════ 实例 W: web 桥(fake apiProxy) ═══════════════
 console.log('── 实例W: web 桥 + 三档参数 + 池防污染 + set_policy/policy_get ──')
-const envW = makeCtxP3({}) // 先建 ctx(拿到 calls 记录器), 再把假 apiProxy 挂上去
+const envW = makeCtxP3({}) // 先建 ctx(拿到 calls 记录器), 再把假 apiProxy 挂进服务表
 const fakeW = makeFakeApiProxy(envW.calls)
-envW.ctx.apiProxy = fakeW // apply 前挂载即可: 桥在 apply 时读取 ctx.apiProxy
+envW.services.set('apiProxy', fakeW) // apply 前挂载即可: 桥在 apply 时 ctx.get('apiProxy', false) 读取
 await apply(envW.ctx, { port: 8110, host: '127.0.0.1' })
 await sleep(150)
 const PW = 8110
@@ -291,9 +295,9 @@ check('W initialize', await initMcp(PW, 'mock-p3w'))
   check('W status_get.sandboxPolicy.defaultMode=workspace-write', st.sandboxPolicy?.defaultMode === 'workspace-write', st.sandboxPolicy)
   check('W status_get.sandboxPolicy.bridge=web', st.sandboxPolicy?.bridge === 'web', st.sandboxPolicy)
   check('W status_get.sandboxPolicy.pendingApprovals=0', st.sandboxPolicy?.pendingApprovals === 0, st.sandboxPolicy)
-  check('W status_get.version=0.5.0', st.version === '0.5.0', st.version)
+  check('W status_get.version=0.6.0', st.version === '0.6.0', st.version)
   const cg = await callTool(PW, 'config_get', {})
-  check('W config_get 含 defaultSandbox/approvalsBridge/approvalTimeoutMs', cg.defaultSandbox === 'workspace-write' && cg.approvalsBridge === 'web' && cg.approvalTimeoutMs === 120000, { d: cg.defaultSandbox, b: cg.approvalsBridge, t: cg.approvalTimeoutMs })
+  check('W config_get 含 defaultSandbox/approvalsBridge/approvalTimeoutMs', cg.defaultSandbox === 'workspace-write' && cg.approvalsBridge === 'web' && cg.approvalTimeoutMs === 300000, { d: cg.defaultSandbox, b: cg.approvalsBridge, t: cg.approvalTimeoutMs })
 }
 
 // ── A: 三档透传 + 池防污染 ──
@@ -338,7 +342,7 @@ let S1
   })
   check('B mux requested 帧 → approval_list 可见', listed?.approvals?.[0]?.approvalId === 'apr-1' && listed.approvals[0].toolName === 'bash' && listed.approvals[0].reason === 'write outside workspace', listed)
   check('B 挂起条目带 sessionId 与 waitedMs', listed?.approvals?.[0]?.sessionId === 'sess-web' && typeof listed.approvals[0].waitedMs === 'number', listed?.approvals?.[0])
-  check('B approval_list 上报 bridge=web/timeoutMs', listed?.bridge === 'web' && listed.timeoutMs === 120000, { b: listed?.bridge, t: listed?.timeoutMs })
+  check('B approval_list 上报 bridge=web/timeoutMs', listed?.bridge === 'web' && listed.timeoutMs === 300000, { b: listed?.bridge, t: listed?.timeoutMs })
 
   const resp = await callTool(PW, 'approval_respond', { approvalId: 'apr-1', sessionId: 'sess-web', outcome: 'allowed-once' })
   check('B approval_respond 回 accepted', resp.ok === true && resp.receipt === 'accepted', resp)
