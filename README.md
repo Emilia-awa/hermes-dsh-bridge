@@ -9,7 +9,7 @@
 [![npm](https://img.shields.io/npm/v/hermes-dsh-bridge)](https://www.npmjs.com/package/hermes-dsh-bridge)
 [![CI](https://github.com/Emilia-awa/hermes-dsh-bridge/workflows/CI/badge.svg)](https://github.com/Emilia-awa/hermes-dsh-bridge/actions)
 
-**版本兼容性**：v0.6.0 支持 **dsh ≥ 0.1.2-rc.1**（含 0.1.2 破坏性变更适配：dsh-llm 移除 `isTokenDelta`、dsh-agent-presets 移除 `resolveSessionPreset`、dsh 移除 `apiProxy` 服务）。v0.5.0 及更早版本仅兼容 dsh ≤ 0.1.1-rc.2（旧 API）。
+**版本兼容性**：v0.7.0 支持 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 上实测通过；含 0.1.2 破坏性变更适配：dsh-llm 移除 `isTokenDelta`、dsh-agent-presets 移除 `resolveSessionPreset`、dsh 移除 `apiProxy` 服务；以及 0.1.5 的会话存储契约变更适配：`sessionPersistence.list()` 改返回 snapshot、`inspect()` 移除改为 `open()`+`read()`、会话文件升级为 `session.v3.jsonl.zstd`）。v0.5.0 及更早版本仅兼容 dsh ≤ 0.1.1-rc.2（旧 API）。
 
 ## 为什么存在
 

@@ -1,4 +1,4 @@
-// P3 单元级集成测试(v0.6.0): 用 mock ctx 直接驱动插件的 apply(),
+// P3 单元级集成测试: 用 mock ctx 直接驱动插件的 apply(),
 // 覆盖权限三档 + 审批桥 + 状态暴露:
 //   A: 三档参数透传(create/resume 种 sandbox/mode)、invalid 拒绝、池防污染
 //      (请求档≠会话固化档不复用 / 非默认档不入池 / 默认调用不受污染)、set_policy live/冷会话
@@ -295,7 +295,7 @@ check('W initialize', await initMcp(PW, 'mock-p3w'))
   check('W status_get.sandboxPolicy.defaultMode=workspace-write', st.sandboxPolicy?.defaultMode === 'workspace-write', st.sandboxPolicy)
   check('W status_get.sandboxPolicy.bridge=web', st.sandboxPolicy?.bridge === 'web', st.sandboxPolicy)
   check('W status_get.sandboxPolicy.pendingApprovals=0', st.sandboxPolicy?.pendingApprovals === 0, st.sandboxPolicy)
-  check('W status_get.version=0.6.0', st.version === '0.6.0', st.version)
+  check('W status_get.version 与 package.json 一致', st.version === readVer('../package.json')?.replace(/.*"version"\s*:\s*"([^"]+)".*/, '$1') || st.version === readVer('../src/index.ts'), st.version)
   const cg = await callTool(PW, 'config_get', {})
   check('W config_get 含 defaultSandbox/approvalsBridge/approvalTimeoutMs', cg.defaultSandbox === 'workspace-write' && cg.approvalsBridge === 'web' && cg.approvalTimeoutMs === 300000, { d: cg.defaultSandbox, b: cg.approvalsBridge, t: cg.approvalTimeoutMs })
 }
@@ -584,6 +584,197 @@ check('C实例 initialize', await initMcp(PC, 'mock-p3c'))
     console.warn = origWarn
   }
   check('C部署 非法配置告警并回落默认(defaultSandbox 保持 read-only)', warn.some((w) => w.includes('invalid defaultSandbox')) && warn.some((w) => w.includes('invalid approvalsBridge')), warn)
+}
+
+// ═══ [r2] D: dsh 0.1.5 会话 v3 格式适配 + session_list 逐行容错 ═══
+// 复现 R1 实测崩溃: 0.1.5 的 sessionPersistence.list() 返回 SessionPersistenceSnapshot[]
+// ({header, revision, sizeBytes}) 而非裸 SessionHeader[]; 旧代码直接 h.id/h.cwd 得到 undefined,
+// → 无参 session_list 抛 "Cannot read properties of undefined (reading 'length')"。
+// 同时 0.1.5 移除了 inspect(), 改为 open(id,'read')+handle.read()。
+{
+  console.log('\n── D: [r2] 0.1.5 v3 快照契约 + 逐行容错 ──')
+  const D = 8118
+  const V3 = 'v3sud-' + '1111-4111-8111-111111111111'
+  const V3_B = 'v3sub-' + '2222-4222-8222-222222222222'
+  const V3_EMPTY = 'v3emp-' + '3333-4333-8333-333333333333'
+
+  // v3 事件流: 最后一条 sandbox/mode 用于 sandboxMode 折叠断言
+  const v3Events = [
+    { type: 'permission/preset', seq: 0, time: 100, data: { preset: 'workspace-write' } },
+    { type: 'session/title', seq: 1, time: 200, data: { title: 'v3 冒烟会话' } },
+    { type: 'user/message', seq: 2, time: 300, data: { content: [{ type: 'text', text: 'v3 hello' }] } },
+    { type: 'sandbox/mode', seq: 3, time: 400, data: { mode: 'read-only' } },
+    { type: 'assistant/message', seq: 4, time: 500, data: { message: { content: [{ type: 'text', text: 'ok' }] }, usage: { inputTokens: 10, outputTokens: 5 } } },
+  ]
+  const v3EventsB = [
+    { type: 'session/title', seq: 0, time: 150, data: { title: 'v3 乙会话' } },
+  ]
+
+  // 真实 0.1.5 形态: list() → snapshot[]; stat(id) → snapshot; locate(meta) → {kind,path}
+  const metaOf = (id, cwd) => ({ id, cwd, createdAt: 1000, version: 3, isSeeded: true, delegationDepth: 0 })
+  const snapOf = (id, cwd, sizeBytes) => ({ header: metaOf(id, cwd), revision: `rev-${id}`, sizeBytes })
+  const v3Files = new Map() // id -> {events, path}
+  v3Files.set(V3, { events: v3Events, path: '/tmp/a2a-ws-mock-p3-d/d--tmp--/' + V3 + '/session.v3.jsonl.zstd' })
+  v3Files.set(V3_B, { events: v3EventsB, path: '/tmp/a2a-ws-mock-p3-d/d--tmp--/' + V3_B + '/session.v3.jsonl.zstd' })
+  v3Files.set(V3_EMPTY, { events: [], path: '/tmp/a2a-ws-mock-p3-d/d--tmp--/' + V3_EMPTY + '/session.v3.jsonl.zstd' })
+
+  const opened = []   // 断言确实走了 0.1.5 的 open/read 路径
+  const closed = []
+  // 0.1.5 持久化服务 mock: 无 inspect, 有 list(snapshot)/stat/open/locate
+  const persistence015 = {
+    list: async () => [snapOf(V3, '/tmp', 14110), snapOf(V3_B, '/tmp', 900), snapOf(V3_EMPTY, undefined, 60)],
+    stat: async (sid) => v3Files.has(String(sid)) ? snapOf(String(sid), '/tmp', 14110) : undefined,
+    locate: (meta) => v3Files.has(String(meta.id)) ? { kind: 'jsonl', path: v3Files.get(String(meta.id)).path } : undefined,
+    open: async (sid) => {
+      const key = String(sid)
+      if (!v3Files.has(key)) throw new Error('SessionPersistenceNotFoundError: ' + key)
+      opened.push(key)
+      let cursor = 0
+      return {
+        id: key,
+        header: metaOf(key, '/tmp'),
+        read: async () => ({ events: v3Files.get(key).events, eventState: 'owned' }),
+        close: async () => { closed.push(key) },
+      }
+    },
+  }
+
+  const envD = {
+    ctx: {
+      effect(fn) { void fn },
+      on() {},
+      get(name) {
+        if (name === 'sessions') return { list: () => [], get: () => undefined }
+        if (name === 'sessionPersistence') return persistence015
+        if (name === 'workspaceRegistry') return { list: () => [] }
+        return undefined
+      },
+      agents: {
+        list: () => [],
+        get: () => undefined,
+        resume: async () => { throw new Error('n/a') },
+        create: async (o) => {
+          await o.setup?.(scopeProxy())
+          const sid = String(o.sessionId)
+          const session = {
+            log: [],
+            header: { id: sid, cwd: o?.meta?.cwd ?? '/tmp', createdAt: Date.now(), agentPreset: o?.meta?.agentPreset },
+            append(type, data) { this.log.push({ type, seq: this.log.length + 1, time: Date.now(), data }); return { type, data } },
+          }
+          return { agent: { id: sid, session, followup() {}, whenIdle: async () => {} }, dispose: async () => {} }
+        },
+      },
+      agentPresets: { defaultId: 'standard', resolve: async (id) => ({ id }), list: async () => [], mount: async () => {}, recompose: async (_c, id) => ({ id }) },
+    },
+  }
+  await apply(envD.ctx, { port: D, host: '127.0.0.1', approvalsBridge: 'off' })
+  await new Promise((r) => setTimeout(r, 150))
+  const rpcD = async (method, params) => {
+    const headers = { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }
+    if (rpcD.sid) headers['Mcp-Session-Id'] = rpcD.sid
+    const res = await fetch(`http://127.0.0.1:${D}/mcp`, { method: 'POST', headers, body: JSON.stringify({ jsonrpc: '2.0', id: 'x', method, params }) })
+    const s = res.headers.get('mcp-session-id'); if (s) rpcD.sid = s
+    const text = await res.text()
+    let parsed = null
+    for (const line of text.split('\n')) if (line.startsWith('data: ')) { try { parsed = JSON.parse(line.slice(6)) } catch {} }
+    if (!parsed) { try { parsed = JSON.parse(text) } catch {} }
+    return parsed
+  }
+  const callD = async (name, args = {}) => {
+    const r = await rpcD('tools/call', { name, arguments: args })
+    const txt = (r?.result?.content ?? []).map((c) => c.text ?? '').join('')
+    try { return JSON.parse(txt) } catch { return { _raw: txt, _rpcError: r?.error } }
+  }
+  await rpcD('initialize', { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'p3-d', version: '1' } })
+  await rpcD('notifications/initialized', {})
+
+  // D1: 无参 session_list —— R1 崩溃路径, 必须不崩且解出 v3 会话
+  const dl = await callD('session_list', {})
+  check('[r2] 无参 session_list 对 0.1.5 snapshot 不崩(无 error)', dl.error === undefined, dl)
+  check('[r2] session_list 返回 skipped 计数字段', typeof dl.skipped === 'number', dl)
+  const v3Row = (dl.sessions ?? []).find((s) => s.id === V3)
+  check('[r2] v3 会话 id 从 snapshot.header 正确解包(非 undefined)', Boolean(v3Row), dl.sessions)
+  check('[r2] v3 会话 title 由 open/read 读出的事件折叠', v3Row?.title === 'v3 冒烟会话', v3Row)
+  check('[r2] v3 会话 cwd 来自 snapshot.header', v3Row?.cwd === '/tmp', v3Row)
+  check('[r2] v3 会话 messageCount 来自 open/read(非 0 空壳)', v3Row?.messageCount === 5, v3Row)
+  check('[r2] v3 会话 sandboxMode 折叠自事件流', v3Row?.sandboxMode === 'read-only', v3Row)
+  check('[r2] v3 会话 token 统计折叠', v3Row?.inputTokens === 10 && v3Row?.outputTokens === 5, v3Row)
+  check('[r2] 0.1.5 无 inspect 时确实走了 open("read") 契约', opened.length > 0, opened)
+  check('[r2] 读句柄被 close(无泄漏)', closed.length === opened.length, { opened: opened.length, closed: closed.length })
+  check('[r2] 无 cwd 的会话不崩(cwd undefined 行仍可列出)', (dl.sessions ?? []).some((s) => s.id === V3_EMPTY), dl.sessions)
+
+  // D2: 畸形条目 → 计入 skipped, 不炸整表
+  const bad = persistence015.list
+  persistence015.list = async () => [
+    { header: {}, revision: 'r', sizeBytes: 1 },      // header 无 id → skipped
+    null,                                             // 非对象 → skipped
+    { revision: 'r2' },                               // 既无 header 也无 id → skipped
+    snapOf(V3, '/tmp', 14110),                        // 正常行
+  ]
+  const dl2 = await callD('session_list', {})
+  check('[r2] 畸形持久化条目整体不崩', dl2.error === undefined, dl2)
+  check('[r2] 畸形条目计入 skipped=3', dl2.skipped === 3, dl2)
+  check('[r2] 正常行仍被列出(逐行容错)', (dl2.sessions ?? []).some((s) => s.id === V3), dl2.sessions)
+  persistence015.list = bad
+
+  // D3: 单行 inspect 失败只跳过该行(skipped+1), 其余行照常返回
+  const goodOpen = persistence015.open
+  persistence015.open = async (sid) => {
+    if (String(sid) === V3_B) throw new Error('simulated per-row read failure')
+    return goodOpen(sid)
+  }
+  const dl3 = await callD('session_list', {})
+  check('[r2] 单行读取失败不外抛(整体仍成功)', dl3.error === undefined, dl3)
+  check('[r2] 失败行未进入结果', !(dl3.sessions ?? []).some((s) => s.id === V3_B), dl3.sessions)
+  check('[r2] 其余行正常返回(证明是逐行容错而非整表放弃)', (dl3.sessions ?? []).some((s) => s.id === V3), dl3.sessions)
+  persistence015.open = goodOpen
+
+  // D4: session_log / session_search 也走通 v3 路径
+  const logD = await callD('session_log', { sessionId: V3 })
+  check('[r2] session_log 经 open/read 读到 v3 事件', logD.error === undefined && logD.shown > 0, logD)
+  const searchD = await callD('session_search', { query: 'v3 乙会话' })
+  check('[r2] session_search 标题命中 v3 会话', (searchD.results ?? []).some((r) => r.sessionId === V3_B), searchD)
+  const searchD2 = await callD('session_search', { query: 'v3 hello' })
+  check('[r2] session_search 内容命中 v3 会话(open/read 生效)', (searchD2.results ?? []).some((r) => r.sessionId === V3), searchD2)
+
+  // D5: A/B 项 —— 26 个工具描述面向 agent 调用者优化 + 自解释字段
+  const tl = await rpcD('tools/list', {})
+  const tools = tl?.result?.tools ?? []
+  // 本实例未开 enableFsWrite, 故 fs_write(opt-in)不在列表; 其余 25 个常驻工具必须都在。
+  const EXPECT_TOOLS = ['echo', 'harness_list_tools', 'status_get', 'config_get', 'fs_read', 'fs_list', 'fs_stat',
+    'session_list', 'session_log', 'session_stats', 'session_search', 'preset_list', 'preset_get', 'preset_set',
+    'policy_get', 'set_policy', 'approval_list', 'approval_respond', 'agent_run', 'task_inbox', 'task_result',
+    'task_list', 'task_cancel', 'rename_session', 'attach_session']
+  const gotNames = tools.map((t) => t.name)
+  const missing = EXPECT_TOOLS.filter((n) => !gotNames.includes(n))
+  check('[r2] 25 个常驻工具齐全(fs_write 为 opt-in 未开故不在)', missing.length === 0 && gotNames.length === 25, { missing, gotNames })
+  const byName = new Map(tools.map((t) => [t.name, t]))
+  check('[r2] agent_run 描述点明"同步"+时长建议', /同步/.test(byName.get('agent_run')?.description ?? '') && /5\s*分钟|< ?5/.test(byName.get('agent_run')?.description ?? ''), byName.get('agent_run')?.description?.slice(0, 120))
+  check('[r2] agent_run 描述互相引用 task_inbox', /task_inbox/.test(byName.get('agent_run')?.description ?? ''), byName.get('agent_run')?.description?.slice(0, 200))
+  check('[r2] task_inbox 描述点明"异步"+立即返回 taskId', /异步/.test(byName.get('task_inbox')?.description ?? '') && /taskId/.test(byName.get('task_inbox')?.description ?? ''), byName.get('task_inbox')?.description?.slice(0, 120))
+  check('[r2] task_inbox 描述互相引用 task_result', /task_result/.test(byName.get('task_inbox')?.description ?? ''), byName.get('task_inbox')?.description?.slice(0, 200))
+  check('[r2] task_result 描述引用 task_inbox(双向互引)', /task_inbox/.test(byName.get('task_result')?.description ?? ''), byName.get('task_result')?.description?.slice(0, 120))
+  check('[r2] 会话工具描述引用 session_list(链路口径统一)', /session_list/.test(byName.get('session_log')?.description ?? ''), byName.get('session_log')?.description?.slice(0, 120))
+  check('[r2] 26 个工具描述全部非空且普遍变长(≥20 字符)', tools.every((t) => (t.description ?? '').length >= 20), tools.filter((t) => (t.description ?? '').length < 20).map((t) => t.name))
+  // agent_run 成功结果带 next 字段(只在有会话可续时给出)
+  const ar = await callD('agent_run', { task: 'ux probe', cwd: '/tmp/a2a-ws-mock-p3-d' })
+  check('[r2] agent_run 结果含 next 自解释字段', typeof ar.next === 'string' && ar.next.length > 0, ar.next)
+  check('[r2] agent_run 的 next 指引用 sessionId 续接', /sessionId/.test(String(ar.next)), ar.next)
+  // task_inbox 返回 taskId + 取结果提示
+  const ti = await callD('task_inbox', { task: 'ux probe async', cwd: '/tmp/a2a-ws-mock-p3-d' })
+  check('[r2] task_inbox 返回 taskId', typeof ti.taskId === 'string', ti)
+  check('[r2] task_inbox 的 next 指向 task_result(taskId=...)', /task_result/.test(String(ti.next)) && String(ti.next).includes(ti.taskId), ti.next)
+  // 错误信息带下一步动作
+  const badTask = await callD('task_result', { taskId: 'no-such-task-id' })
+  check('[r2] task_result 未命中错误带下一步(task_list 提示)', /task not found/.test(String(badTask.error)) && /task_list/.test(String(badTask.error)), badTask.error)
+  const badSession = await callD('session_log', { sessionId: 'no-such-session-id' })
+  check('[r2] session_log 未命中错误带下一步(session_list 提示)', /session not found/.test(String(badSession.error)) && /session_list/.test(String(badSession.error)), badSession.error)
+  // session_log 的 preset 快捷值
+  const dialogLog = await callD('session_log', { sessionId: V3, preset: 'dialog' })
+  check('[r2] session_log preset=dialog 只返回人机对话类型', (dialogLog.events ?? []).every((e) => e.type === 'user/message' || e.type === 'assistant/message'), dialogLog.events?.map((e) => e.type))
+  check('[r2] session_log 回显生效 preset', dialogLog.preset === 'dialog', dialogLog.preset)
+  const toolsLog = await callD('session_log', { sessionId: V3, preset: 'tools' })
+  check('[r2] session_log preset=tools 只返回工具事件', (toolsLog.events ?? []).every((e) => e.type === 'tool/call' || e.type === 'tool/result'), toolsLog.events?.map((e) => e.type))
 }
 
 console.log(`\n══ P3 单元级结果: PASS=${passCount} FAIL=${failCount} ══`)

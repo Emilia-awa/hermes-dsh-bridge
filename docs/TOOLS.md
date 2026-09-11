@@ -7,13 +7,13 @@ Output caps: `assistantText` ≤ 8000 chars, `toolCalls` ≤ 50 × 2000, `toolRe
 ## Task execution
 
 ### `agent_run(task, context?, cwd?, sessionId?, title?, preset?, sandbox?)`
-Synchronously run a task and return a structured result.
+Synchronously run a task and return a structured result. Use this for tasks expected to finish in under ~5 minutes; for long-running or cancellable work use `task_inbox` + `task_result` instead. The result starts with a `next` field (v0.7.0) telling the caller how to resume the session.
 
 | Field | Type | Notes |
 |---|---|---|
 | `task` | string | required; the instruction |
 | `context` | string | memory/context injected into the prompt |
-| `cwd` | string | working directory; agent sessions are keyed/reused by cwd |
+| `cwd` | string | working directory; agent sessions are keyed/reused by cwd. **v0.7.0**: defaults to `workspaceRoots[0]` when configured, otherwise `process.cwd()` — the effective default is stated in the parameter description |
 | `sessionId` | string | resume an existing session (3-level: live pool → live → persisted) |
 | `title` | string | session title (shown in `session_list`) |
 | `preset` | string | per-task preset override (single-use; does not touch global default). `standard` (default) / `code` (PTC) / `minimal` (bash+str_replace_editor only, cheapest, DeepSeek-friendly) / `cordis` (for authoring new presets). Unknown id → error with `available` list |
@@ -30,10 +30,10 @@ Notes:
 - **Approvals**: if the agent hits a sandbox escalation, this call blocks while the approval is pending. Poll `approval_list` and answer via `approval_respond`; after `approvalTimeoutMs` (default 120s) it settles as cancelled/rejected — **never auto-allowed**. Prefer `task_inbox` for approval-prone workloads.
 
 ### `task_inbox(task, context?, cwd?, sessionId?, title?, preset?, sandbox?)`
-Push a task to the async in-memory queue. Returns `{ taskId, status }`. Queue: max 100, TTL 10 min, **lost on restart** — do not queue long critical work through this path; prefer `agent_run` + `sessionId`. `preset`/`sandbox` behave exactly like their `agent_run` counterparts. This is the **primary path for approval bridging**: while a task is suspended waiting for an approval, poll `approval_list` → `approval_respond` and the task resumes on its own.
+Push a task to the async in-memory queue. Returns `{ taskId, status, next }` — `next` (v0.7.0) shows the exact `task_result(taskId=...)` call to poll with. Queue: max 100, TTL 10 min, **lost on restart** — do not queue long critical work through this path; prefer `agent_run` + `sessionId`. `preset`/`sandbox` behave exactly like their `agent_run` counterparts. This is the **primary path for approval bridging**: while a task is suspended waiting for an approval, poll `approval_list` → `approval_respond` and the task resumes on its own.
 
 ### `task_result(taskId)`
-Poll a queued task's result: `{ taskId, status: queued|running|done|error, result?, error? }`.
+Poll a queued task's result: `{ taskId, status: queued|running|done|error|cancelled, result?, error?, next }`. `next` (v0.7.0) explains what to do for the current status (keep polling / read the error / task expired). A missing id returns `task not found` with a pointer to `task_list`.
 
 ### `task_list()`
 Queue snapshot: `{ total, active, count, truncated, tasks: [{ id, status, createdAt, error?, title?, preset?, sandbox?, cwd?, hasResult }] }`.
@@ -48,15 +48,26 @@ Cancel a queued/running task:
 ## Session inspection
 
 ### `session_list(cwd?, limit?)`
-`{ sessions: [{ id, title, cwd, updatedAt, messageCount, inputTokens, outputTokens, llmTime, sandboxMode? }] }` — live + persisted merged, deduped by id. Filter by `cwd` (workspace path). `sandboxMode` (v0.5.0) appears when the session has at least one `sandbox/mode` event (the effective tier).
+`{ total, count, truncated, skipped, sessions: [{ id, title, cwd, createdAt, updatedAt, messageCount, inputTokens, outputTokens, llmTime, sandboxMode? }] }` — live + persisted merged, deduped by id, newest first. Filter by `cwd` (workspace path); omit it to list everything. `sandboxMode` (v0.5.0) appears when the session has at least one `sandbox/mode` event (the effective tier).
 
-### `session_log(sessionId, tail?, types?, sinceIndex?)`
+`skipped` (v0.7.0): number of sessions dropped by per-row fault isolation — one unreadable or malformed entry no longer fails the whole listing. `0` means every row was read; `total`/`count`/`truncated` keep their previous meaning.
+
+**v0.7.0 — dsh 0.1.5 storage contract.** `sessionPersistence.list()` now returns snapshots (`{ header, revision, sizeBytes }`) rather than bare headers, and `inspect(id)` was replaced by `open(id, 'read')` + `handle.read()`. The plugin supports both contracts transparently, and reads v3 session files (`session.v3.jsonl.zstd`, session directories without the `session-` prefix).
+
+### `session_log(sessionId, tail?, preset?, types?, sinceIndex?)`
 Read a session's event log. Default types: `assistant/message`, `tool/call`, `tool/result`. `tail`: last N events. `sinceIndex`: incremental pull. Reasoning/thinking event types are stripped.
+
+`preset` (v0.7.0) is a shortcut for common filters — no need to hand-assemble a `types` array:
+- `"dialog"` — `user/message` + `assistant/message` (the human/agent conversation)
+- `"tools"` — `tool/call` + `tool/result`
+- `"all"` — no type filter
+
+An explicit `types` array still wins over `preset`; omitting both keeps the default. The response echoes the effective `preset`, and sets `next` when output was truncated.
 
 ### `session_stats(sessionId?)`
 `{ sessionId, scope: "session"|"run", rounds, steps, llmTime, llmTimeMs, toolTime, toolTimeMs, ttft, ttftSteps, tokensPerSec, cacheHitRate, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens, source: "live"|"persisted" }`.
 
-Without `sessionId`, returns stats for the most recent agent session (error if none yet: `no active agent session yet`).
+Without `sessionId`, returns stats for the most recent agent session (error if none yet, with the suggested next action).
 
 Aggregation: `rounds` = count of `turn/end` events; `ttft` = avg time-to-first-token per step; `cacheHitRate` = hit/(hit+input) with a denominator heuristic covering DeepSeek and Anthropic token accounting.
 
@@ -66,7 +77,7 @@ Cross-session search:
 - Matches session **titles** first, then **content** (persisted events via `persistence.inspect`; falls back to live log / zstd multi-frame decompress of `session.jsonl.zstd` when inspect is unavailable). Content search result reports `content_search: true/false`.
 - Per-session 2s timeout (skipped and counted in `total`); concurrency 8; `limit` default 50 (clamp 1..200 sessions scanned); results capped at 20 with ±60-char `snippet`.
 
-Result: `{ query, regex, total, count, content_search, results: [{ sessionId, title, cwd, updatedAt, matched: "title"|"content", snippet? }] }`.
+Result: `{ query, regex, total, count, truncated, content_search, results: [{ sessionId, title, cwd, updatedAt, matched: "title"|"content", snippet? }], next }` — `next` (v0.7.0) tells the caller how to use the hits, or what to try when nothing matched.
 
 ### `rename_session(sessionId, title)`
 Rename a session (goes through the session-title service).
@@ -118,7 +129,7 @@ Sandbox tiers map 1:1 to Harness `SandboxMode`; the write path is a session-log 
 Effective policy of a session: `{ sessionId, sandboxMode, source: "override"|"default", workspaceRoot, approvalPolicy }`.
 - `sandboxMode`: last `sandbox/mode` event; falls back to the configured `defaultSandbox` (`source: "default"`).
 - `approvalPolicy`: last `approval/policy` event, else the deployment default (`ctx.approval.config.policy ?? 'ask'`).
-- Without `sessionId`: the deployment defaults (`workspaceRoot` = process cwd).
+- Without `sessionId`: the deployment defaults (`workspaceRoot` = `workspaceRoots[0]` if configured, else `process.cwd()`).
 
 ### `set_policy(sessionId, mode)`
 Switch an **existing live session's** sandbox tier. `mode`: `read-only` | `workspace-write` | `danger-full-access`. Returns `{ ok: true, sessionId, sandboxMode, source: "live" }`.

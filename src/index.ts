@@ -75,7 +75,7 @@ import { join as joinPath, resolve, dirname, basename } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(status_get 上报; 与 package.json 保持同步) */
-const PLUGIN_VERSION = '0.6.0'
+const PLUGIN_VERSION = '0.7.0'
 
 /**
  * 会话文件权限三档(与 dsh-sandbox 的 SandboxMode 一一对应; 不直接 import 该包, 免新增运行时依赖):
@@ -99,6 +99,18 @@ export type ApprovalsBridge = 'web' | 'builtin' | 'off' | 'file-push'
  * 漏声明会在真实启动时拿不到服务(本插件曾经踩过, 务必与代码里的 ctx.get 对齐)。
  */
 export const inject = ['tools', 'llm', 'agents', 'agentPresets', 'workspaceRegistry', 'sessionPersistence', 'sessions']
+
+// [r2] C 项适配核查结论(dsh 0.1.2-rc.1 → 0.1.5-rc.2, 只查不重构):
+//   1) ctx.agent(单数)移除: 全文件 grep `ctx.agent` 精确匹配 0 处直接访问 —— 本插件只用
+//      ctx.agents(11 处, 0.1.5 仍在, dsh-agent 声明合并 `agents: AgentRegistry`)与
+//      ctx.agentPresets(10 处, 仍在)。无 0.1.5 移除后崩溃的风险。
+//   2) P3 面板/sidebar slot('conversation' → 'main')变化: 本插件是纯 MCP server + HTTP transport,
+//      不注册任何 web 面板/UI slot(grep slot|sidebar|conversation|panel 无命中), 不受影响。
+//      唯一与 web 通道相关的是可选审批桥的 apiProxy 订阅, 已按 undefined 安全降级(见 apiProxyOf)。
+//   3) 会话 v3 格式(session.v3.jsonl.zstd + 无 session- 前缀目录): 已在
+//      unwrapPersistedEntry / persistedInspect / persistedRowMeta 里适配, 并用真实会话文件
+//      /root/.dsh/sessions/--tmp--/f9a31258-.../session.v3.jsonl.zstd 验证通过
+//      (见 tests/probe_v3_real.mjs: 20/20, 含原崩溃的根因复现)。
 
 /** 插件配置 */
 export interface Config {
@@ -324,6 +336,50 @@ async function gateFsPathSoft(ctx: Context, rawPath: string): Promise<{ canonica
   const allowed = roots.some((r) => resolved === r || resolved.startsWith(r + '/'))
   if (!allowed) return { error: `path outside allowed roots (~/.dsh + workspaces): ${resolved}` }
   return { canonical: resolved, missing: true }
+}
+
+// ═══════════════════════ [r2] B: 调用路径简化(默认值 + 自解释提示) ═══════════════════════
+
+/**
+ * [r2] B: 任务类工具的默认工作目录。
+ * 远程 agent 调用时 process.cwd() 通常是 dsh 进程的启动目录(对 Hermes 无意义),
+ * 因此优先用插件配置的 workspaceRoots[0](部署方显式声明的工作区), 没配才回落 process.cwd()。
+ * 该默认值在 agent_run/task_inbox 的 cwd 参数描述里明写, 让 agent 不用猜。
+ */
+function defaultTaskCwd(): string {
+  return runtimeConfig.workspaceRoots[0] ?? process.cwd()
+}
+
+/** [r2] B: 默认工作目录的人类可读描述(拼进工具描述与参数描述) */
+function defaultCwdHint(): string {
+  return runtimeConfig.workspaceRoots.length > 0
+    ? `默认工作区 ${runtimeConfig.workspaceRoots[0]} (来自插件配置 workspaceRoots[0])`
+    : `默认进程当前目录 ${process.cwd()} (未配置 workspaceRoots)`
+}
+
+/**
+ * [r2] A/B: 统一的"下一步怎么办"提示片段 —— 让每个错误/结果都能自解释, agent 不用猜链路。
+ * 抽成常量便于 26 个工具的描述与错误文案保持措辞一致。
+ */
+const HINT = {
+  /** 拿到 taskId 之后干什么 */
+  pollTask: '用 task_result(taskId=...) 取结果; 想看队列全貌用 task_list; 想中途放弃用 task_cancel(taskId=...)',
+  /** 拿到 sessionId 之后干什么 */
+  resumeSession: '续接此会话时把 sessionId 传给 agent_run 或 task_inbox; 看对话历史用 session_log(sessionId=...)',
+  /** 会话找不到 */
+  sessionMissing: 'session not found',
+  /** 长任务建议 */
+  longTask: '预计耗时 > 5 分钟或需要中途取消的任务, 请改用 task_inbox(异步队列)',
+} as const
+
+/** [r2] A: 会话类错误的统一后缀(下一步动作) */
+function sessionNotFoundError(sessionId: string): string {
+  return `session not found: ${sessionId} (可能已过期或 id 有误; 用 session_list 查看当前会话列表, 或先用 agent_run 建一个)`
+}
+
+/** [r2] A: 任务类错误的统一后缀(下一步动作) */
+function taskNotFoundError(taskId: string): string {
+  return `task not found: ${taskId} (已过期或从未存在; 用 task_list 查看当前队列; 任务默认保留 ${Math.round(runtimeConfig.taskTtlMs / 60000)} 分钟)`
 }
 
 // fs_write 专用路径 jail(P1): 只允许 workspaceRoots 内的路径(比 fs_read 的 ~/.dsh+工作区 更严),
@@ -759,28 +815,159 @@ const taskQueue = new Map<string, TaskItem>()
 /** B: 执行中任务 → agent 会话 id(task_cancel 用它定位要中止的 Agent; executeTask onSessionStart 登记) */
 const taskRunSessions = new Map<string, string>()
 
-/** 找会话 header: live 优先, 其次持久化 list(轻量元数据扫描, 不加载整日志) */
+/** 找会话 header: live 优先, 其次持久化 list(轻量元数据扫描, 不加载整日志; [r2] 兼容 0.1.5 snapshot) */
 async function findSessionHeader(ctx: Context, sessionId: SessionId): Promise<SessionHeader | undefined> {
   const sessions = ctx.get('sessions') as { get?: (id: SessionId) => { header: SessionHeader } | undefined } | undefined
   const live = sessions?.get?.(sessionId)
   if (live !== undefined) return live.header
-  const persistence = ctx.get('sessionPersistence') as { list?: () => Promise<SessionHeader[]> } | undefined
-  for (const header of (await persistence?.list?.()) ?? []) {
-    if (header.id === sessionId) return header
+  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+  let listed: readonly unknown[] | undefined
+  try {
+    listed = await persistence?.list?.()
+  } catch { return undefined }
+  for (const entry of listed ?? []) {
+    // [r2] 逐行容错 + snapshot 解包: 单条畸形不影响后续条目
+    const row = unwrapPersistedEntry(entry)
+    if (row !== undefined && String(row.header.id) === String(sessionId)) return row.header
   }
   return undefined
 }
 
-/** live + 持久化 header 合并(live 优先), 按 id 去重(session_list / 存量捞回 / session_search 共用) */
-async function listMergedHeaders(ctx: Context): Promise<Map<string, SessionHeader>> {
+// ── [r2] dsh 0.1.5 会话存储适配层 ──
+//
+// 0.1.2 → 0.1.5 变更(sessionPersistence 服务):
+//   1) `list()` 返回的是 SessionPersistenceSnapshot[] ({header, revision, sizeBytes?}), 不再是裸 SessionHeader[]。
+//      旧代码直接 `h.id`/`h.cwd` → undefined, 再被 SessionId(undefined) 喂进 inspect/locate, 触发
+//      `Cannot read properties of undefined (reading 'length')`, 无参 session_list 整体炸掉。
+//   2) `inspect(id)` 已从服务契约移除(改为 `open(id,'read')` + `handle.read()`); 旧代码 `persistence.inspect?.()`
+//      恒为 undefined → 回退 live store, 于是冷会话(session_list/session_log/session_search)全部查不到内容。
+//   3) `locate(meta)` 仍在, 且 0.1.5 会自己解析 v3 目录名(session.v3.jsonl.zstd + 无 session- 前缀目录), 适配后即可复用。
+//   4) `stat(id)` 是 0.1.5 新增的轻量元数据入口(含 sizeBytes), 用于 updatedAt 的 mtime 语义替代。
+//
+// 适配策略: 全部读写走下面的 helper, 同时兼容 0.1.2(裸 header + inspect)与 0.1.5(snapshot + open/read),
+// 单一会话的行级失败一律不外抛(由调用方决定跳过还是回退)。
+
+/** 持久化 list() 的原始元素: 0.1.5 snapshot 或 0.1.2 裸 header(两者靠 `.header` 是否存在区分) */
+type PersistedListEntry = unknown
+
+/**
+ * [r2] 把持久化 list() 的元素归一成 { header, sizeBytes? }。
+ * 0.1.5: { header, revision, sizeBytes? }; 0.1.2: header 本身。无法识别的元素返回 undefined(调用方计入 skipped)。
+ */
+function unwrapPersistedEntry(entry: PersistedListEntry): { header: SessionHeader; sizeBytes?: number } | undefined {
+  if (!entry || typeof entry !== 'object') return undefined
+  const rec = entry as { header?: unknown; sizeBytes?: unknown; id?: unknown }
+  // 0.1.5 snapshot 形态: 内层 header 必须自带 id
+  if (rec.header && typeof rec.header === 'object' && (rec.header as { id?: unknown }).id !== undefined) {
+    return {
+      header: rec.header as SessionHeader,
+      ...(typeof rec.sizeBytes === 'number' ? { sizeBytes: rec.sizeBytes } : {}),
+    }
+  }
+  // 0.1.2 裸 header 形态
+  if (rec.id !== undefined) return { header: entry as SessionHeader }
+  return undefined
+}
+
+/** [r2] 事件数组安全取值: 0.1.5/0.1.2 的 inspect/read 结果里 events 缺失或非数组时返回 undefined(不抛) */
+function asEvents(v: unknown): unknown[] | undefined {
+  if (Array.isArray(v)) return v
+  if (v && typeof v === 'object' && Array.isArray((v as { events?: unknown }).events)) {
+    return (v as { events: unknown[] }).events
+  }
+  return undefined
+}
+
+/**
+ * [r2] 读一个持久化会话: 0.1.2 inspect(meta+events) → 0.1.5 open('read')+handle.read(0,∞)。
+ * handle 无论成败都会 close(释放读句柄)。都不可得返回 undefined。
+ */
+async function persistedInspect(
+  ctx: Context,
+  sid: SessionId,
+): Promise<{ meta: SessionHeader; events: unknown[] } | undefined> {
+  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+  if (persistence?.inspect) {
+    try {
+      const insp = await persistence.inspect(sid)
+      const events = asEvents(insp?.events)
+      if (insp?.meta && events) return { meta: insp.meta, events }
+    } catch { /* 0.1.5 无 inspect 或有 inspect 但读取失败 → 走 open/read */ }
+  }
+  if (persistence?.open) {
+    let handle: PersistenceHandleView | undefined
+    try {
+      handle = await persistence.open(sid, 'read')
+      const header = handle?.header as SessionHeader | undefined
+      if (!header?.id) return undefined
+      const read = await handle?.read?.(0)
+      const events = asEvents(read)
+      if (!events) return undefined
+      return { meta: header, events }
+    } catch {
+      return undefined
+    } finally {
+      try { await handle?.close?.() } catch { /* 释放失败不阻断 */ }
+    }
+  }
+  return undefined
+}
+
+/**
+ * [r2] live + 持久化 header 合并(live 优先), 按 id 去重(session_list / 存量捞回 / session_search 共用)。
+ * 逐行容错: 单个持久化条目失败只计入 skipped, 绝不让整表炸掉。
+ */
+async function listMergedHeaders(ctx: Context): Promise<{ headers: Map<string, SessionHeader>; skipped: number }> {
   const headers = new Map<string, SessionHeader>()
   const store = ctx.get('sessions') as SessionsStoreView | undefined
-  for (const s of store?.list?.() ?? []) headers.set(s.header.id, s.header)
+  try {
+    for (const s of store?.list?.() ?? []) {
+      try {
+        if (s?.header?.id !== undefined) headers.set(String(s.header.id), s.header)
+      } catch { /* 单个 live 条目异常 → 跳过 */ }
+    }
+  } catch { /* live store 不可用 → 只用持久化 */ }
+  let skipped = 0
   const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
-  for (const h of (await persistence?.list?.()) ?? []) {
-    if (!headers.has(h.id)) headers.set(h.id, h)
+  let listed: readonly PersistedListEntry[] | undefined
+  try {
+    listed = await persistence?.list?.()
+  } catch { /* 列表整体失败 → 只有 live 部分 */ }
+  for (const entry of listed ?? []) {
+    const row = unwrapPersistedEntry(entry)
+    if (row === undefined || row.header.id === undefined) { skipped++; continue }
+    if (!headers.has(String(row.header.id))) headers.set(String(row.header.id), row.header)
   }
-  return headers
+  return { headers, skipped }
+}
+
+/**
+ * [r2] 持久化侧的轻量元数据(updatedAt 用): 0.1.5 优先 stat(id)(含 sizeBytes/mtime 语义),
+ * 退回 locate(header) + stat(path) 落盘 mtime; 都不可得返回 undefined(调用方回退 createdAt/最后事件时间)。
+ * 单会话任何失败都不外抛。
+ */
+async function persistedRowMeta(
+  ctx: Context,
+  header: SessionHeader,
+): Promise<{ updatedAt?: number; sizeBytes?: number }> {
+  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+  if (persistence?.stat) {
+    try {
+      const snap = await persistence.stat(SessionId(String(header.id)))
+      const snapRec = snap as { header?: SessionHeader; sizeBytes?: unknown } | undefined
+      const path = snapRec?.header ? persistence.locate?.(snapRec.header)?.path : undefined
+      const mtime = path ? await stat(path).then((s) => s.mtimeMs, () => undefined) : undefined
+      return {
+        ...(mtime !== undefined ? { updatedAt: mtime } : {}),
+        ...(typeof snapRec?.sizeBytes === 'number' ? { sizeBytes: snapRec.sizeBytes } : {}),
+      }
+    } catch { /* → locate 兜底 */ }
+  }
+  try {
+    const loc = persistence?.locate?.(header)
+    if (loc?.path) return { updatedAt: (await stat(loc.path)).mtimeMs }
+  } catch { /* 未落盘 */ }
+  return {}
 }
 
 // ═══════════════════════ 会话查看(session_list / session_log)辅助 ═══════════════════════
@@ -789,9 +976,28 @@ interface SessionsStoreView {
   list?: () => { header: SessionHeader }[]
   get?: (id: SessionId) => (unknown & { header?: SessionHeader; log?: unknown[] }) | undefined
 }
+/** [r2] 0.1.5 的持久化句柄最小面(open('read') 返回; read 读事件切片, close 释放) */
+interface PersistenceHandleView {
+  id?: unknown
+  header?: SessionHeader
+  read?: (offset?: number, length?: number, options?: { signal?: AbortSignal }) => Promise<unknown>
+  close?: () => Promise<void>
+}
+/**
+ * 持久化服务视图(同时兼容 0.1.2 与 0.1.5):
+ *   - 0.1.2: list() → SessionHeader[](裸 header), inspect(id) → { meta, events }
+ *   - 0.1.5: list() → SessionPersistenceSnapshot[]({ header, revision, sizeBytes? }), stat(id) → snapshot,
+ *            open(id,'read') → handle; inspect 已移除(用 open+read 顶替)
+ * 字段全部 optional: 版本差异靠运行时探测, 不做版本号硬判断。
+ */
 interface PersistenceView {
-  list?: (signal?: AbortSignal) => Promise<SessionHeader[]>
-  inspect?: (id: SessionId, signal?: AbortSignal) => Promise<{ meta: SessionHeader; events: readonly unknown[] }>
+  list?: (signal?: AbortSignal) => Promise<readonly unknown[]>
+  /** 0.1.2 旧契约(0.1.5 已移除, 探测不到就走 open/read) */
+  inspect?: (id: SessionId, signal?: AbortSignal) => Promise<{ meta: SessionHeader; events: readonly unknown[] } | undefined>
+  /** 0.1.5 新增: 轻量元数据(不存在返回 undefined) */
+  stat?: (id: SessionId, options?: { signal?: AbortSignal }) => Promise<unknown>
+  /** 0.1.5 新增: 打开读句柄(v3 格式兼容的关键路径) */
+  open?: (id: SessionId, access: 'read' | 'write', options?: { signal?: AbortSignal }) => Promise<PersistenceHandleView>
   locate?: (meta: SessionHeader) => { kind: string; path: string } | undefined
 }
 
@@ -918,6 +1124,9 @@ interface ApiProxyView {
 
 /** 取 apiProxy(强转结构视图; 纯 headless 组合没有该服务时返回 undefined。dsh 0.1.2 起不 inject 的服务禁止直接读 ctx.apiProxy, 必须 ctx.get(key, false) 宽松读取) */
 function apiProxyOf(ctx: Context): ApiProxyView | undefined {
+  // [r2] C 项适配核查: dsh 0.1.5 已不再随包发布 dsh-host-apiproxy(实测 node_modules 里无该包),
+  // 本插件也未把它写进 inject, 因此这里用 ctx.get('apiProxy', false) 宽松探测: 服务缺失返回 undefined,
+  // 绝不抛错。startApprovalsBridge 据此自动降级 builtin/file-push —— 0.1.5 下审批桥仍可用(已跑通 p3)。
   return ctx.get('apiProxy', false) as ApiProxyView | undefined
 }
 
@@ -1231,7 +1440,7 @@ function startApprovalsBridge(ctx: Context): () => void {
   }
 }
 
-/** 会话粗粒度 updatedAt: live 取最后事件 time, persisted 取落盘文件 mtime, 都没有用 createdAt */
+/** 会话粗粒度 updatedAt: live 取最后事件 time, persisted 取 stat/locate 的落盘 mtime, 都没有用 createdAt(单会话失败不外抛) */
 async function roughUpdatedAt(ctx: Context, header: SessionHeader): Promise<number> {
   const store = ctx.get('sessions') as SessionsStoreView | undefined
   const live = store?.get?.(header.id) as { log?: { time?: number }[] } | undefined
@@ -1240,17 +1449,19 @@ async function roughUpdatedAt(ctx: Context, header: SessionHeader): Promise<numb
     const t = Number(log[log.length - 1]?.time)
     if (Number.isFinite(t) && t > 0) return t
   }
-  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
-  const loc = persistence?.locate?.(header)
-  if (loc?.path) {
-    try {
-      return (await stat(loc.path)).mtimeMs
-    } catch { /* 未落盘回退 createdAt */ }
-  }
+  // [r2] 0.1.5: stat(id)(+locate 取路径算 mtime) / 0.1.2: locate(header) → 落盘 mtime
+  try {
+    const meta = await persistedRowMeta(ctx, header)
+    if (meta.updatedAt !== undefined) return meta.updatedAt
+  } catch { /* 未落盘回退 createdAt */ }
   return header.createdAt ?? 0
 }
 
-/** 单个会话的轻量检视: 消息条数 + 标题 + 统计摘要 + 权限档(persisted inspect 失败时回退 live log) */
+/**
+ * 单个会话的轻量检视: 消息条数 + 标题 + 统计摘要 + 权限档。
+ * [r2] persistedInspect 兼容 0.1.2 inspect 与 0.1.5 open/read; 失败回退 live log。
+ * 返回 undefined = 两路都读不到(调用方应计入 skipped, 而不是伪造一行 messageCount:0 的假数据)。
+ */
 async function inspectSessionRow(ctx: Context, header: SessionHeader): Promise<{
   messageCount: number
   title?: string
@@ -1258,16 +1469,21 @@ async function inspectSessionRow(ctx: Context, header: SessionHeader): Promise<{
   outputTokens?: number
   llmTimeSec?: number
   sandboxMode?: SandboxMode
-}> {
-  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+} | undefined> {
+  // [r2] header.id 缺失(畸形持久化条目)直接判为不可读, 不再喂 SessionId(undefined)
+  if (header.id === undefined) return undefined
   try {
-    const insp = await persistence?.inspect?.(SessionId(header.id))
-    if (insp) return summarizeRow(insp.events.length, titleFromEvents(insp.events), insp.events)
+    const insp = await persistedInspect(ctx, SessionId(String(header.id)))
+    if (insp) {
+      const events = insp.events
+      return summarizeRow(events.length, titleFromEvents(events), events)
+    }
   } catch { /* 回退 live */ }
   const store = ctx.get('sessions') as SessionsStoreView | undefined
-  const live = store?.get?.(SessionId(header.id)) as { log?: unknown[] } | undefined
+  const live = store?.get?.(SessionId(String(header.id))) as { log?: unknown[] } | undefined
   if (live?.log) return summarizeRow(live.log.length, titleFromEvents(live.log), live.log)
-  return { messageCount: 0 }
+  // [r2] 两路都读不到: 返回 undefined 交由调用方跳过并计数(旧行为是返回 messageCount:0, 会污染列表)
+  return undefined
 }
 
 /** 从事件流汇总行级统计摘要(messageCount/title + token/llm 摘要字段 + P3 sandboxMode 折叠) */
@@ -1366,18 +1582,27 @@ function foldSessionStats(events: readonly unknown[]): SessionStatsFold {
         break
       }
       case 'assistant/message': {
-        if (openStep === null || openStep.turn !== Number(d.turn) || openStep.step !== Number(d.step)) break
-        s.llmMs += Math.max(0, t - openStep.startTime)
-        if (openStep.firstTokenTime !== null) {
-          s.ttftMs += Math.max(0, openStep.firstTokenTime - openStep.startTime)
-          s.ttftSteps += 1
-          const out1 = usageNum((d.usage as Record<string, unknown> | undefined)?.outputTokens)
-          if (out1 > 0) {
-            s.decodeMs += Math.max(0, t - openStep.firstTokenTime)
-            s.decodeTokens += out1
+        // [r2] 0.1.5 v3 事件流的 assistant/message 可能不带 turn/step(真实会话文件实证:
+        // {"type":"assistant/message","turn":1,"step":1,...} 有, 但折叠出的历史/迁移事件可能缺)。
+        // 旧代码 `openStep===null || turn/step 不匹配 → break` 会把这类消息的 usage 整条丢掉,
+        // 导致 session_list 的 input/outputTokens 恒为 0。改为: 时间口径仍要求 step 匹配,
+        // usage 累加不再受 step 绑定(与官方 session-stats"有 usage 就计账"一致)。
+        const stepMatches = openStep !== null && openStep.turn === Number(d.turn) && openStep.step === Number(d.step)
+        if (stepMatches) {
+          const open = openStep as { startTime: number; firstTokenTime: number | null }
+          s.llmMs += Math.max(0, t - open.startTime)
+          if (open.firstTokenTime !== null) {
+            s.ttftMs += Math.max(0, open.firstTokenTime - open.startTime)
+            s.ttftSteps += 1
+            const out1 = usageNum((d.usage as Record<string, unknown> | undefined)?.outputTokens)
+            if (out1 > 0) {
+              s.decodeMs += Math.max(0, t - open.firstTokenTime)
+              s.decodeTokens += out1
+            }
           }
+          openStep = null
         }
-        // token 用量累加(所有上报 usage 的消息)
+        // token 用量累加(所有上报 usage 的消息; [r2] 不再要求 step 匹配)
         const u = d.usage as Record<string, unknown> | undefined
         if (u && typeof u === 'object') {
           s.inputTokens += usageNum(u.inputTokens)
@@ -1386,7 +1611,6 @@ function foldSessionStats(events: readonly unknown[]): SessionStatsFold {
           s.cacheWriteTokens += usageNum(u.cacheWriteTokens)
           s.reasoningTokens += usageNum(u.reasoningTokens)
         }
-        openStep = null
         break
       }
       case 'tool/call': {
@@ -1516,18 +1740,16 @@ async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined>
 }
 
 /**
- * 读单会话事件流(session_search 用): persistence.inspect(带 AbortSignal+限时, 已解压事件)
+ * 读单会话事件流(session_search 用): [r2] persistedInspect(0.1.2 inspect / 0.1.5 open+read, 带限时)
  * → live log → locate(path) 落盘文件多帧 zstd 兜底。都不可得返回 undefined。
  */
 async function readSessionEventsSearch(ctx: Context, header: SessionHeader): Promise<{ events: unknown[]; source: 'persisted' | 'live' | 'file' } | undefined> {
-  const sid = SessionId(header.id)
+  const sid = SessionId(String(header.id))
   const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
-  if (persistence?.inspect) {
-    try {
-      const insp = await withTimeout(persistence.inspect(sid, AbortSignal.timeout(SESSION_SEARCH_TIMEOUT_MS)), SESSION_SEARCH_TIMEOUT_MS + 500)
-      if (insp) return { events: [...insp.events], source: 'persisted' }
-    } catch { /* 未持久化/超时/中止 → 回退 */ }
-  }
+  try {
+    const insp = await withTimeout(persistedInspect(ctx, sid), SESSION_SEARCH_TIMEOUT_MS + 500)
+    if (insp) return { events: insp.events, source: 'persisted' }
+  } catch { /* 未持久化/超时/中止 → 回退 */ }
   const store = ctx.get('sessions') as SessionsStoreView | undefined
   const live = store?.get?.(sid) as { log?: unknown[] } | undefined
   if (live?.log && live.log.length > 0) return { events: [...live.log], source: 'live' }
@@ -1635,21 +1857,20 @@ async function searchOneSession(
 let lastAgentSessionId: string | undefined
 
 /**
- * 收集一个会话的完整事件流(persisted inspect 优先, 回退 live store 日志)。
+ * 收集一个会话的完整事件流([r2] persistedInspect 优先: 0.1.2 inspect / 0.1.5 open+read, 回退 live store 日志)。
  * 返回 undefined 表示 live 与持久化里都没有该会话。
  */
 async function collectSessionEvents(ctx: Context, sid: SessionId): Promise<{ events: unknown[]; source: 'persisted' | 'live' } | undefined> {
-  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
   try {
-    const insp = await persistence?.inspect?.(sid)
-    if (insp && insp.events.length > 0) return { events: [...insp.events], source: 'persisted' }
+    const insp = await persistedInspect(ctx, sid)
+    if (insp && insp.events.length > 0) return { events: insp.events, source: 'persisted' }
   } catch { /* 未持久化 → 回退 live */ }
   const store = ctx.get('sessions') as SessionsStoreView | undefined
   const live = store?.get?.(sid) as { log?: unknown[] } | undefined
   if (live?.log && live.log.length > 0) return { events: [...live.log], source: 'live' }
-  // 两路都空: 若持久化 inspect 成功返回过 meta(空日志会话), 也算找到
+  // 两路都空: 若持久化读取成功返回过 meta(空日志会话), 也算找到
   try {
-    const insp = await persistence?.inspect?.(sid)
+    const insp = await persistedInspect(ctx, sid)
     if (insp) return { events: [], source: 'persisted' }
   } catch { /* ignore */ }
   return undefined
@@ -1708,7 +1929,7 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
   if (byPath.size === 0) return { attached: 0, failed: 0 }
 
   // live + 持久化 header 合并(live 优先), 按 id 去重(共用实现)
-  const headers = await listMergedHeaders(ctx)
+  const { headers } = await listMergedHeaders(ctx)
 
   let attached = 0
   let failed = 0
@@ -1732,17 +1953,17 @@ async function reattachOrphanSessions(ctx: Context): Promise<{ attached: number;
 
 /** 在给定 McpServer 上注册工具 */
 function registerTools(mcp: McpServer, ctx: Context): void {
-  mcp.tool('echo', '回显输入, 验证 MCP server 连通', { text: z.string() }, async ({ text }) => {
+  mcp.tool('echo', '连通性自检: 原样回显 text 并附服务器时间戳。什么时候用: 第一次接上本 server、或怀疑网络/认证断了的时候, 先 ping 一下确认通道活着(比直接调 agent_run 便宜得多)。返回 {收到: "<text> @ <毫秒时间戳>"}。', { text: z.string() }, async ({ text }) => {
     return out(`收到: ${text} @ ${Date.now()}`)
   })
 
-  mcp.tool('harness_list_tools', '列出 Harness 当前注册的所有工具名', {}, async () => {
+  mcp.tool('harness_list_tools', '列出 Harness(宿主)自己注册的工具名清单。什么时候用: 想确认某个能力(如 bash/fs/web)在当前部署里是否可用, 或 agent_run 跑的 agent 抱怨没有某个工具时排查用的。返回一个字符串数组(纯名字, 无描述)。注意这是 Harness 内部工具, 与本插件的 26 个 MCP 工具是两回事。', {}, async () => {
     const tools = ctx.tools as unknown as { keys?: () => Iterable<string> } | null
     const names = tools && typeof tools.keys === 'function' ? Array.from(tools.keys()) : []
     return out(JSON.stringify(names))
   })
 
-  mcp.tool('status_get', '查询 Harness/MCP 运行状态: 版本/运行时长/provider/model/preset/活动会话数/sandboxPolicy(默认权限档+审批桥形态+挂起审批数)。', {}, async () => {
+  mcp.tool('status_get', '看服务器现在活着吗、在用什么模型、有没有卡住的活。什么时候用: ① 调工具前先确认 server 健康 ② agent_run 长时间没返回时查 queueActive/activeSessionsCount 看是不是真在忙 ③ 想知道有没有待审的权限申请(pendingApprovals>0 就去 approval_list)。返回 {version,uptimeSec,startedAt,provider,model,preset,activeSessionsCount,agentsLive,queueActive,sandboxPolicy:{defaultMode,bridge,pendingApprovals},node,pid}。', {}, async () => {
     let queueActive = 0
     for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') queueActive++
     let agentsLive = 0
@@ -1772,7 +1993,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     }, null, 2))
   })
 
-  mcp.tool('config_get', '查询插件运行时配置摘要(authToken 打码为 ***, 不泄露密钥)。', {}, async () => {
+  mcp.tool('config_get', '看这个插件是怎么被配置的(排查"为什么默认落到某个目录/为什么没权限"用)。什么时候用: ① agent_run 不传 cwd 时想知道默认工作目录是什么(看 workspaceRoots) ② 想知道默认权限档(defaultSandbox)或审批桥形态(approvalsBridge) ③ 确认 authToken 是否已开启(只回显是否设置, 不泄露值)。返回 {version,http,server:{port,host},provider,model,preset,maxQueue,taskTtlMs,maxAgents,authTokenSet,authToken(已打码为 *** 或空串),workspaceRoots,enableFsWrite,defaultSandbox,approvalsBridge,approvalTimeoutMs,approvalFileDir}。与 status_get 的区别: 这里看"配置", status_get 看"运行态"。', {}, async () => {
     return out(JSON.stringify({
       version: PLUGIN_VERSION,
       http: true,
@@ -1798,21 +2019,21 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P0: 文件查看(fs_read / fs_list / fs_stat) — 路径安全: ~/.dsh + 工作区白名单, 拒绝敏感名 ──
   mcp.tool(
     'fs_read',
-    '读文本文件(仅限 ~/.dsh 与工作区白名单内; 拒绝 .ssh/.env/*token*/*.pem)。返回 {path,totalLines,content,truncated}。',
+    '直接读服务器上的文本文件(不用起 agent, 快且免费)。什么时候用: 想确认某个文件现在的内容/某行代码在不在, 又不想为一个只读操作付一次 agent_run 的代价。适合看配置、日志尾部、源码片段。限制: 只能读 ~/.dsh 与已注册工作区白名单内的路径, 且 .ssh/.env/*token*/*.pem 一律拒绝; 单文件 >8MB 拒绝。返回 {path,totalLines,offset,limit,truncated,content}; 文件大就配合 offset/limit 分段读。要看目录列表用 fs_list, 要只看元数据用 fs_stat, 要改文件用 fs_write(需部署开启)。',
     {
-      path: z.string().describe('绝对路径(会 realpath 规范化)'),
-      offset: z.number().int().min(1).optional().describe('起始行(1-based, 默认 1)'),
-      limit: z.number().int().min(1).max(2000).optional().describe('最多返回行数(默认 400)'),
+      path: z.string().describe('文件绝对路径(会 realpath 规范化)'),
+      offset: z.number().int().min(1).optional().describe('起始行(1-based, 默认 1); 接着上次读完的位置继续读就靠它'),
+      limit: z.number().int().min(1).max(2000).optional().describe('最多返回行数(默认 400, 最大 2000); content 另有 48KB 上限'),
     },
     async ({ path, offset, limit }) => {
       try {
         const gate = await gateFsPath(ctx, path)
-        if (gate.error) return out(JSON.stringify({ error: gate.error }))
+        if (gate.error) return out(JSON.stringify({ error: `${gate.error} (改用工作区内的路径, 或先用 fs_list 确认可访问的目录)` }))
         const canonical = gate.canonical as string
         const st = await stat(canonical).catch(() => undefined)
-        if (!st) return out(JSON.stringify({ error: `path not found: ${path}` }))
+        if (!st) return out(JSON.stringify({ error: `path not found: ${path} (确认路径拼写; 用 fs_list 看父目录里有什么)` }))
         if (st.isDirectory()) return out(JSON.stringify({ error: `is a directory, use fs_list: ${canonical}` }))
-        if (st.size > FS_READ_MAX_FILE_BYTES) return out(JSON.stringify({ error: `file too large (${st.size} bytes > ${FS_READ_MAX_FILE_BYTES})` }))
+        if (st.size > FS_READ_MAX_FILE_BYTES) return out(JSON.stringify({ error: `file too large (${st.size} bytes > ${FS_READ_MAX_FILE_BYTES}); 用 offset/limit 分段读, 或改用 session_log/bash 侧手段` }))
         const rawAll = await readFile(canonical, 'utf8')
         const lines = rawAll.split('\n')
         if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop() // 结尾换行不算一行
@@ -1825,24 +2046,28 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           content = content.slice(0, FS_READ_MAX_CHARS)
           truncated = true
         }
-        return out(JSON.stringify({ path: canonical, totalLines, offset: off, limit: lim, truncated, content }))
+        return out(JSON.stringify({
+          path: canonical, totalLines, offset: off, limit: lim, truncated, content,
+          // [r2] A: 被截断时直接告诉 agent 下一次该传什么
+          ...(truncated ? { next: `文件共 ${totalLines} 行, 本次返回第 ${off}~${Math.min(off + lim - 1, totalLines)} 行; 继续读请传 offset=${off + lim}` } : {}),
+        }))
       } catch (e) {
-        return out(JSON.stringify({ error: `fs_read failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `fs_read failed: ${(e as Error)?.message ?? String(e)} (确认路径在工作区内且不是二进制文件)` }))
       }
     },
   )
 
   mcp.tool(
     'fs_list',
-    '列目录(递归 depth 层, 默认 1)。敏感项(.ssh/.env/*token*/*.pem)从结果隐藏。返回 {path,entries:[{name,type,size,mtime}],truncated}。',
+    '列服务器上的目录内容(不用起 agent)。什么时候用: ① 不知道项目文件都在哪, 先看一眼 ② fs_read 报 path not found 时确认父目录里到底有什么 ③ 找某个文件的全路径。depth 可递归(默认 1 层, 最大 5)。敏感项(.ssh/.env/*token*/*.pem)会从结果里隐藏。返回 {path,depth,count,truncated,entries:[{name,type,size,mtime}]}(type=dir|file|symlink|other, 上限 1000 条)。拿到文件路径后用 fs_read 读内容。',
     {
-      path: z.string().describe('目录绝对路径'),
-      depth: z.number().int().min(1).max(5).optional().describe('递归层数(默认 1, 最大 5)'),
+      path: z.string().describe('目录绝对路径(必须是目录; 传文件会报错)'),
+      depth: z.number().int().min(1).max(5).optional().describe('递归层数(默认 1 只看本层, 最大 5)'),
     },
     async ({ path, depth }) => {
       try {
         const gate = await gateFsPath(ctx, path)
-        if (gate.error) return out(JSON.stringify({ error: gate.error }))
+        if (gate.error) return out(JSON.stringify({ error: `${gate.error} (改用工作区内的目录; 不知道工作区在哪可以看 config_get 的 workspaceRoots)` }))
         const root = gate.canonical as string
         const maxDepth = Math.min(Math.max(1, Math.trunc(depth ?? 1)), 5)
         const entries: { name: string; type: string; size?: number; mtime?: number }[] = []
@@ -1886,12 +2111,12 @@ function registerTools(mcp: McpServer, ctx: Context): void {
 
   mcp.tool(
     'fs_stat',
-    '查文件/目录元数据(同受路径安全策略约束)。返回 {exists,size,mtime,isDir,...}。',
-    { path: z.string().describe('绝对路径') },
+    '只查文件/目录的元数据, 不读内容(判断"这个文件存在吗/多大/什么时候改的")。什么时候用: ① fs_read 之前先探一下文件在不在、多大, 避免浪费一次大读取 ② 比较两个文件的 mtime 看谁更新 ③ 确认某个路径是文件还是目录。与 fs_read 的区别: 这个几乎零成本, 且不存在的路径也返回 exists:false 而不是报错。返回 {exists,path,size,mtime,isDir,isFile}(不存在时只有 exists:false 和 path)。',
+    { path: z.string().describe('绝对路径(可以不存在 —— 不存在返回 exists:false 而非报错)') },
     async ({ path }) => {
       try {
         const gate = await gateFsPathSoft(ctx, path)
-        if (gate.error) return out(JSON.stringify({ error: gate.error }))
+        if (gate.error) return out(JSON.stringify({ error: `${gate.error} (该路径被安全策略拒绝; 换到工作区内的路径再试)` }))
         if (gate.missing) return out(JSON.stringify({ exists: false, path: gate.canonical }))
         const canonical = gate.canonical as string
         const st = await stat(canonical).catch(() => undefined)
@@ -1905,7 +2130,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           isFile: st.isFile(),
         }))
       } catch (e) {
-        return out(JSON.stringify({ error: `fs_stat failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `fs_stat failed: ${(e as Error)?.message ?? String(e)} (路径可能在白名单外; 用 config_get 查 workspaceRoots)` }))
       }
     },
   )
@@ -1914,25 +2139,25 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   if (runtimeConfig.enableFsWrite) {
     mcp.tool(
       'fs_write',
-      '写文本文件(P1, opt-in)。仅限 workspaceRoots 白名单内(路径 jail), 拒绝 .ssh/.env/*token*/*.pem。mode: overwrite(默认)|append|create-new。',
+      '直接写文本文件(需部署方开启 enableFsWrite; 未开启时本工具不可见)。什么时候用: 确定要落一个已知内容的文件, 且不想为一次简单写入付 agent_run 的代价(如写临时脚本、落配置、追加日志)。若需要 agent 自己判断该改什么, 请用 agent_run/task_inbox。限制: 只能在 workspaceRoots 白名单内(路径 jail), .ssh/.env/*token*/*.pem 一律拒绝, 单次内容 ≤4MB, 父目录会自动创建。返回 {ok,path,bytes,mode}。改完想核对用 fs_read 读回。',
       {
-        path: z.string().describe('文件绝对路径(可不存在, 父目录自动创建)'),
+        path: z.string().describe('文件绝对路径(可以不存在, 父目录自动创建; 必须在 workspaceRoots 内)'),
         content: z.string().describe('要写入的 UTF-8 文本(上限 4MB)'),
-        mode: z.enum(['overwrite', 'append', 'create-new']).optional().describe('写入模式(默认 overwrite; create-new 在已存在时报错)'),
+        mode: z.enum(['overwrite', 'append', 'create-new']).optional().describe('写入模式(默认 overwrite 全量覆盖; append 追加到末尾; create-new 在文件已存在时报错, 用于防误覆盖)'),
       },
       async ({ path, content, mode }) => {
         try {
           const m = mode ?? 'overwrite'
           const bytes = Buffer.byteLength(content, 'utf8')
           if (bytes > FS_WRITE_MAX_BYTES) {
-            return out(JSON.stringify({ error: `content too large (${bytes} bytes > ${FS_WRITE_MAX_BYTES})` }))
+            return out(JSON.stringify({ error: `content too large (${bytes} bytes > ${FS_WRITE_MAX_BYTES}); 拆成多次 append 写入` }))
           }
           const gate = await gateFsWritePath(path)
-          if (gate.error) return out(JSON.stringify({ error: gate.error }))
+          if (gate.error) return out(JSON.stringify({ error: `${gate.error} (fs_write 只能写 workspaceRoots 内的路径; 用 config_get 查看允许的目录)` }))
           const canonical = gate.canonical as string
           if (m === 'create-new') {
             const exists = await stat(canonical).then(() => true, () => false)
-            if (exists) return out(JSON.stringify({ error: `file already exists (mode=create-new): ${canonical}` }))
+            if (exists) return out(JSON.stringify({ error: `file already exists (mode=create-new): ${canonical} (改用 mode=overwrite 覆盖, 或 mode=append 追加, 或换个新路径)` }))
           }
           await mkdir(dirname(canonical), { recursive: true })
           if (m === 'append') {
@@ -1940,9 +2165,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           } else {
             await writeFile(canonical, content, 'utf8')
           }
-          return out(JSON.stringify({ ok: true, path: canonical, bytes, mode: m }))
+          return out(JSON.stringify({ ok: true, path: canonical, bytes, mode: m, next: `用 fs_read(path="${canonical}") 读回核对` }))
         } catch (e) {
-          return out(JSON.stringify({ error: `fs_write failed: ${(e as Error)?.message ?? String(e)}` }))
+          return out(JSON.stringify({ error: `fs_write failed: ${(e as Error)?.message ?? String(e)} (确认父目录可写、路径在白名单内)` }))
         }
       },
     )
@@ -1951,16 +2176,17 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P0: 会话管理(session_list / session_log) ──
   mcp.tool(
     'session_list',
-    '列出会话(live+持久化合并): [{id,title,cwd,updatedAt,messageCount,inputTokens,outputTokens,llmTime}]。cwd 可按工作区过滤。',
+    '【最先调用】列出所有会话(live+已持久化合并), 用来找会话 id / 标题 / 工作目录 / token 用量。什么时候用: 不知道 sessionId、想续接某个历史会话(拿到 id 后传给 agent_run/task_inbox 的 sessionId)、或想知道最近在哪些目录干过活。不传 cwd = 列出全部(默认); 传 cwd = 只看该工作区。返回 {total,count,truncated,skipped,sessions:[{id,title,cwd,createdAt,updatedAt,messageCount,inputTokens,outputTokens,llmTime,...}]}(默认最多 20 条, 按 updatedAt 倒序)。skipped=读取失败被跳过的会话数(单行失败不影响整表)。拿到 id 后: 看对话用 session_log(sessionId=...), 续接干活用 agent_run(sessionId=...)。',
     {
-      cwd: z.string().optional().describe('按工作目录过滤(realpath 规范化后精确匹配)'),
-      limit: z.number().int().min(1).max(SESSION_LIST_MAX_ROWS).optional().describe('返回条数上限(默认 20)'),
+      cwd: z.string().optional().describe('按工作目录过滤(realpath 规范化后精确匹配); 不传=全部会话'),
+      limit: z.number().int().min(1).max(SESSION_LIST_MAX_ROWS).optional().describe('返回条数上限(默认 20, 最大 50)'),
     },
     async ({ cwd, limit }) => {
       try {
         const max = Math.min(Math.max(1, Math.trunc(limit ?? 20)), SESSION_LIST_MAX_ROWS)
         // live + 持久化合并(live 优先), 按 id 去重(与存量捞回/session_search 共用)
-        const headers = await listMergedHeaders(ctx)
+        // [r2] 合并结果带 skipped 计数(0.1.5 snapshot/畸形条目逐行跳过, 不再整表崩塌)
+        const { headers, skipped: mergeSkipped } = await listMergedHeaders(ctx)
         let rows = [...headers.values()]
         // cwd 过滤: 双侧 realpath 规范化后精确比对
         if (cwd) {
@@ -1972,55 +2198,78 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           }
           rows = filtered
         }
-        // 粗排(updatedAt desc) → 截断 → 细检视(messageCount/title/统计是重操作, 只对返回行做)
-        const withRough = await Promise.all(rows.map(async (h) => ({ h, at: await roughUpdatedAt(ctx, h) })))
+        // [r2] 逐行容错: roughUpdatedAt/inspectSessionRow 单行失败 → 跳过该行并计入 skipped
+        let skipped = mergeSkipped
+        const withRough: { h: SessionHeader; at: number }[] = []
+        for (const h of rows) {
+          try {
+            withRough.push({ h, at: await roughUpdatedAt(ctx, h) })
+          } catch {
+            skipped++
+          }
+        }
         withRough.sort((a, b) => b.at - a.at)
         const selected = withRough.slice(0, max)
-        const sessions = await Promise.all(selected.map(async ({ h, at }) => {
-          const detail = await inspectSessionRow(ctx, h)
-          return {
-            id: h.id,
-            title: detail.title ?? `(untitled ${String(h.id).slice(0, 8)})`,
-            cwd: h.cwd,
-            createdAt: h.createdAt,
-            updatedAt: Math.round(at),
-            messageCount: detail.messageCount,
-            // P1: 统计摘要(全会话累计)
-            inputTokens: detail.inputTokens ?? 0,
-            outputTokens: detail.outputTokens ?? 0,
-            llmTime: detail.llmTimeSec ?? 0,
-            // P3: 会话生效权限档(有 sandbox/mode 记录才带此字段)
-            ...(detail.sandboxMode !== undefined ? { sandboxMode: detail.sandboxMode } : {}),
+        const sessions: Record<string, unknown>[] = []
+        for (const { h, at } of selected) {
+          try {
+            const detail = await inspectSessionRow(ctx, h)
+            // [r2] 单行读不到(persisted+live 都失败) → 不计入结果, 只计入 skipped
+            if (detail === undefined) { skipped++; continue }
+            sessions.push({
+              id: h.id,
+              title: detail.title ?? `(untitled ${String(h.id).slice(0, 8)})`,
+              cwd: h.cwd,
+              createdAt: h.createdAt,
+              updatedAt: Math.round(at),
+              messageCount: detail.messageCount,
+              // P1: 统计摘要(全会话累计)
+              inputTokens: detail.inputTokens ?? 0,
+              outputTokens: detail.outputTokens ?? 0,
+              llmTime: detail.llmTimeSec ?? 0,
+              // P3: 会话生效权限档(有 sandbox/mode 记录才带此字段)
+              ...(detail.sandboxMode !== undefined ? { sandboxMode: detail.sandboxMode } : {}),
+            })
+          } catch {
+            skipped++
           }
+        }
+        sessions.sort((a, b) => Number(b.updatedAt) - Number(a.updatedAt))
+        return out(JSON.stringify({
+          total: rows.length,
+          count: sessions.length,
+          truncated: rows.length > sessions.length,
+          // [r2] 自解释字段: 有多少会话因单行容错被跳过(0 = 全部正常)
+          skipped,
+          sessions,
         }))
-        sessions.sort((a, b) => b.updatedAt - a.updatedAt)
-        return out(JSON.stringify({ total: rows.length, count: sessions.length, truncated: rows.length > sessions.length, sessions }))
       } catch (e) {
-        return out(JSON.stringify({ error: `session_list failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `session_list failed: ${(e as Error)?.message ?? String(e)} (若持续失败, 先用 cwd 过滤缩小范围, 或改用 session_search 按关键词找会话)` }))
       }
     },
   )
 
   mcp.tool(
     'session_log',
-    '读会话日志(stripReasoning 已剥离 thinking/reasoning 块)。tail 取最后 N 条; types 过滤事件类型。',
+    '读某个会话的对话/工具调用记录(已剥离 thinking/reasoning 推理块)。什么时候用: 拿到了 sessionId(session_list 或 agent_run 返回)想复盘这次到底说了什么/调了什么工具/为什么失败, 或者 agent_run 结果里的 changes/verification 不够、要看原始过程。返回 {sessionId,header:{cwd,createdAt,preset},types,totalMatched,shown,truncated,events:[{seq,type,time,...}]}——events 按时间正序, 只含最后 tail 条。不想挑类型就用 preset=「dialog」(只看人机对话)或「tools」(只看工具调用); 要精确控制再用 types。',
     {
-      sessionId: z.string().describe('会话 id(live 或已持久化)'),
-      tail: z.number().int().min(1).max(500).optional().describe('取最后 N 条匹配事件(默认 50)'),
-      types: z.array(z.string()).optional().describe('事件类型过滤(默认 user/message,assistant/message,tool/call,tool/result)'),
+      sessionId: z.string().describe('会话 id(session_list 的 sessions[].id 或 agent_run 结果里的 sessionId)'),
+      tail: z.number().int().min(1).max(500).optional().describe('只取最后 N 条匹配事件(默认 50, 最大 500); 想看更早的调大这个值'),
+      // [r2] B: 常用预设, 免去让 agent 自己拼 types 数组
+      preset: z.enum(['dialog', 'tools', 'all']).optional().describe('常用预设(免拼 types): dialog=只看人机对话(user/message+assistant/message, 最常用); tools=只看工具调用与结果(tool/call+tool/result); all=全部事件类型。不传=默认 dialog+tools 混合'),
+      types: z.array(z.string()).optional().describe('精确事件类型过滤(优先级高于 preset); 默认 [user/message, assistant/message, tool/call, tool/result]'),
     },
-    async ({ sessionId, tail, types }) => {
+    async ({ sessionId, tail, preset, types }) => {
       try {
         const sid = SessionId(sessionId)
         let meta: SessionHeader | undefined
         let events: unknown[] = []
-        // persisted 优先(inspect 对 live 会话也会给出当前不可变快照)
-        const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+        // persisted 优先([r2] 0.1.2 inspect / 0.1.5 open+read; 对 live 会话也会给出当前不可变快照)
         try {
-          const insp = await persistence?.inspect?.(sid)
+          const insp = await persistedInspect(ctx, sid)
           if (insp) {
             meta = insp.meta
-            events = [...insp.events]
+            events = insp.events
           }
         } catch { /* 未持久化 → 回退 live */ }
         if (events.length === 0) {
@@ -2032,10 +2281,19 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           }
         }
         if (meta === undefined && events.length === 0) {
-          return out(JSON.stringify({ error: `session not found: ${sessionId}` }))
+          return out(JSON.stringify({ error: sessionNotFoundError(sessionId) }))
         }
-        const wanted = types && types.length > 0 ? types : DEFAULT_LOG_TYPES
-        const filtered = events.filter((e) => wanted.includes((e as { type?: string })?.type ?? ''))
+        // [r2] B: preset 快捷值 → types 预设(显式 types 优先, 再 preset, 最后默认)
+        const PRESET_TYPES: Record<string, string[]> = {
+          dialog: ['user/message', 'assistant/message'],
+          tools: ['tool/call', 'tool/result'],
+        }
+        const wanted = types && types.length > 0
+          ? types
+          : preset === 'all'
+            ? [] // 空数组 = 不过滤(见下方 filtered 分支)
+            : (preset ? PRESET_TYPES[preset] : undefined) ?? DEFAULT_LOG_TYPES
+        const filtered = wanted.length === 0 ? events : events.filter((e) => wanted.includes((e as { type?: string })?.type ?? ''))
         const totalMatched = filtered.length
         const n = Math.min(Math.max(1, Math.trunc(tail ?? 50)), 500)
         const sliced = filtered.slice(-n)
@@ -2054,14 +2312,18 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         return out(JSON.stringify({
           sessionId,
           header: meta ? { cwd: meta.cwd, createdAt: meta.createdAt, preset: presetFromEvents(meta, events) } : undefined,
+          // [r2] B: 回显生效的过滤口径(preset 生效时 types 是展开后的结果), 便于 agent 确认拿到的是哪一档
+          ...(preset !== undefined ? { preset } : {}),
           types: wanted,
           totalMatched,
           shown,
           truncated,
+          // [r2] A: 自解释下一步(只在结果被截断时提示怎么拿更多)
+          ...(truncated ? { next: `只显示了最后 ${shown} 条; 想看更多请调大 tail(最大 500)或缩小 preset/types 范围` } : {}),
           events: records,
         }))
       } catch (e) {
-        return out(JSON.stringify({ error: `session_log failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `session_log failed: ${(e as Error)?.message ?? String(e)} (确认 sessionId 是否正确: 用 session_list 查看; 该会话可能已被清理)` }))
       }
     },
   )
@@ -2069,25 +2331,25 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P1: 会话统计(session_stats) ──
   mcp.tool(
     'session_stats',
-    '会话统计(rounds/steps/llmTime/toolTime/ttft/tokensPerSec/cacheHitRate/inputTokens/outputTokens)。无 sessionId 返回当前 Agent 会话(最近一次 agent_run/task 的会话); 有 sessionId 返回指定会话的全会话累计。',
-    { sessionId: z.string().optional().describe('会话 id(缺省 = 当前 Agent 会话)') },
+    '看一个会话的用量与性能统计(不读内容, 只看数)。什么时候用: ① 想知道刚才那次 agent_run 花了多少 token / 多久 ② 对比不同 preset 或不同任务的效率 ③ 排查"怎么这么慢"(看 ttft/toolTime/cacheHitRate 哪块占大头)。不传 sessionId = 最近一次 agent_run/task_inbox 的会话(最常用); 传 sessionId = 指定会话的全会话累计。返回 {rounds,steps,llmTime,toolTime,ttft,tokensPerSec,cacheHitRate,inputTokens,outputTokens,cacheReadTokens,cacheWriteTokens,reasoningTokens,source}(时间是秒)。想看具体发生了什么用 session_log。',
+    { sessionId: z.string().optional().describe('会话 id(缺省 = 最近一次 agent_run/task_inbox 的会话; 也可传 session_list 里的任意 id)') },
     async ({ sessionId }) => {
       try {
         let target = sessionId
         let source: string | undefined
         if (!target) {
           if (lastAgentSessionId === undefined) {
-            return out(JSON.stringify({ error: 'no active agent session yet (run agent_run first, or pass sessionId)' }))
+            return out(JSON.stringify({ error: 'no active agent session yet (本进程还没有跑过任何任务; 先调 agent_run 或 task_inbox, 或显式传 sessionId —— 会话 id 可从 session_list 拿)' }))
           }
           target = lastAgentSessionId
         }
         const found = await collectSessionEvents(ctx, SessionId(target))
         if (found === undefined) {
-          return out(JSON.stringify({ error: `session not found: ${target}` }))
+          return out(JSON.stringify({ error: sessionNotFoundError(target) }))
         }
         source = found.source
         const stats = presentSessionStats(foldSessionStats(found.events), { scope: 'session', sessionId: target })
-        return out(JSON.stringify({ ...stats, source }, null, 2))
+        return out(JSON.stringify({ ...stats, source, next: HINT.resumeSession }, null, 2))
       } catch (e) {
         return out(JSON.stringify({ error: `session_stats failed: ${(e as Error)?.message ?? String(e)}` }))
       }
@@ -2097,27 +2359,27 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P2: 跨会话搜索(session_search) ──
   mcp.tool(
     'session_search',
-    '跨会话搜索: 标题匹配 + 尽力内容搜索(持久化事件, 单会话 2s 超时跳过)。返回 {query,regex,total,count,content_search,results:[{sessionId,title,cwd,updatedAt,matched,snippet?}]}(≤20 条)。',
+    '不记得 sessionId, 只记得聊过什么 —— 按关键词跨会话找。什么时候用: ① 想找回"上次讨论 X 的那个会话" ② 确认某个决定/方案在历史会话里出现过没有 ③ session_list 条目太多翻不过来。先匹配标题, 未命中再尽力扫内容(每会话 2s 超时, 跳过慢的)。返回 {query,regex,total,count,truncated,content_search,results:[{sessionId,title,cwd,updatedAt,matched 为 title 或 content,snippet?}]}(最多 20 条, 按 updatedAt 倒序)。找到 sessionId 后用 session_log 看细节、或 agent_run(sessionId=...) 续接。注意: 内容匹配是"尽力而为", content_search=false 说明本次只搜了标题。',
     {
-      query: z.string().min(1).describe('搜索词(regex=false 时为大小写不敏感子串)'),
-      cwd: z.string().optional().describe('按工作目录过滤(realpath 规范化后精确匹配)'),
-      regex: z.boolean().optional().describe('把 query 当正则(默认 false)'),
-      limit: z.number().int().min(1).max(200).optional().describe('最多扫描最近 N 个会话(默认 50)'),
+      query: z.string().min(1).describe('搜索词(默认大小写不敏感子串; regex=true 时按正则)'),
+      cwd: z.string().optional().describe('只搜这个工作目录下的会话(realpath 精确匹配); 不传=全部'),
+      regex: z.boolean().optional().describe('把 query 当正则解释(默认 false 当普通子串)'),
+      limit: z.number().int().min(1).max(200).optional().describe('最多扫描最近 N 个会话(默认 50, 最大 200; 调大更全但更慢)'),
     },
     async ({ query, cwd, regex, limit }) => {
       try {
-        if (!query || !query.trim()) return out(JSON.stringify({ error: 'query must not be empty' }))
+        if (!query || !query.trim()) return out(JSON.stringify({ error: 'query must not be empty (传一个要搜的关键词)' }))
         let re: RegExp | undefined
         if (regex) {
           try {
             re = new RegExp(query)
           } catch (e) {
-            return out(JSON.stringify({ error: `invalid regex: ${(e as Error)?.message ?? String(e)}` }))
+            return out(JSON.stringify({ error: `invalid regex: ${(e as Error)?.message ?? String(e)} (改写成合法正则, 或设 regex=false 按普通文本搜)` }))
           }
         }
         const needle = query.toLowerCase()
         const maxScan = Math.min(Math.max(1, Math.trunc(limit ?? 50)), 200)
-        const headers = await listMergedHeaders(ctx)
+        const { headers } = await listMergedHeaders(ctx)
         let rows = [...headers.values()]
         // cwd 过滤: 双侧 realpath 规范化后精确比对
         if (cwd) {
@@ -2158,9 +2420,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           truncated: hits.length > 20,
           content_search: contentSearched,
           results: hits.slice(0, 20),
+          // [r2] A: 自解释下一步 —— 找到的 id 怎么用; 没找到怎么办
+          next: hits.length > 0
+            ? '拿到 sessionId 后: 看细节用 session_log(sessionId=...), 续接干活用 agent_run(sessionId=...)'
+            : `没有命中; 可尝试: 调大 limit(当前扫了最近 ${scanned.length} 个)、换更短的关键词、或设 regex=true 用正则; 全部会话列表用 session_list`,
         }, null, 2))
       } catch (e) {
-        return out(JSON.stringify({ error: `session_search failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `session_search failed: ${(e as Error)?.message ?? String(e)} (可去掉 regex 或缩小 cwd 再试; 单会话读取超时会被跳过, 属正常)` }))
       }
     },
   )
@@ -2168,7 +2434,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P0: preset(preset_list / preset_get) ──
   mcp.tool(
     'preset_list',
-    '列出可用 agent preset(standard/code/minimal/cordis 及本地自研)与默认 preset。',
+    '列出当前部署可用的 agent preset(能力组合模板)与默认项。什么时候用: ① 想给某类任务换个更合适的 preset(如编码用 code、最小工具集用 minimal), 先来这里查合法 id —— agent_run/task_inbox 的 preset 参数和 preset_set 都只认这里返回的 id ② 传 preset 报 unknown preset 后, 用这里拿 available 名单。返回 {source(agentPresets 或 builtin-fallback),default,presets:[{id,name,description,trust,broken}]}。选好 id 后: 单次任务用 agent_run(preset=...), 改默认用 preset_set(presetId=...)。',
     {},
     async () => {
       try {
@@ -2197,8 +2463,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
 
   mcp.tool(
     'preset_get',
-    '查询会话实际运行的 preset(header.agentPreset + agent-preset/selected 事件最新者胜); 无 sessionId 时返回默认 preset。',
-    { sessionId: z.string().optional().describe('要查询的会话 id(缺省返回默认 preset)') },
+    '查某个会话当前实际用的是哪个 preset —— 用于解释"为什么这个会话没有某个工具"。什么时候用: agent_run 结果不符合预期、怀疑 preset 影响了可用工具集时。不传 sessionId = 只看服务当前默认 preset(便宜)。返回 {sessionId,preset,source(取值 live/persisted/header/default)} 或 {preset,source(取值 plugin-config/agentPresets.defaultId)}。source=default 说明该会话没有 preset 记录(可能不存在)。要改默认用 preset_set。',
+    { sessionId: z.string().optional().describe('要查询的会话 id(缺省 = 只返回本服务的默认 preset, 不查具体会话)') },
     async ({ sessionId }) => {
       if (sessionId) {
         const sid = SessionId(sessionId)
@@ -2210,10 +2476,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             if (preset) return out(JSON.stringify({ sessionId, preset, source: 'live' }))
           }
         } catch { /* fallthrough */ }
-        // 2) 持久化 inspect
-        const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+        // 2) 持久化读取([r2] 0.1.2 inspect / 0.1.5 open+read)
         try {
-          const insp = await persistence?.inspect?.(sid)
+          const insp = await persistedInspect(ctx, sid)
           if (insp) {
             const preset = presetFromEvents(insp.meta, insp.events)
             if (preset) return out(JSON.stringify({ sessionId, preset, source: 'persisted' }))
@@ -2229,6 +2494,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           preset: (ctx.agentPresets as unknown as { defaultId?: string } | undefined)?.defaultId ?? runtimeConfig.preset,
           source: 'default',
           note: `session ${sessionId} 无 preset 记录(不存在或未记录), 返回默认值`,
+          next: `确认会话 id 是否正确用 session_list; 想改默认 preset 用 preset_set(presetId=..., scope=「new-default」)`,
         }))
       }
       let def = runtimeConfig.preset
@@ -2247,25 +2513,25 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P1: preset 切换(preset_set) ──
   mcp.tool(
     'preset_set',
-    '切换 agent preset。scope=new-default(默认): 更新运行时默认 preset(本服务新建会话生效 + 尽力写全局用户默认)。scope=session: 切换指定会话的 preset, 仅空白会话(未开始任何 turn)可切换, 非空白报错。',
+    '改 agent 的能力组合(preset)。两种范围, 先想清楚要哪种: ① scope=「new-default」(默认, 最常用)= 以后新起的会话都用这个 preset, 立刻生效且尽力写进全局用户默认(重启仍在) ② scope=「session」= 只改某一个已存在会话, 且仅限「还没开始任何 turn 的空白会话」(已跑过任务的会话 preset 已固化, 会明确报错)。什么时候用: 发现默认 preset 工具太少/太多, 想换成 code、minimal 等(合法 id 见 preset_list)。返回 {ok,scope,preset,runtimeDefault,globalDefaultUpdated,note?}。若只想给「某一个任务」换 preset, 不用这里 —— 直接 agent_run(preset=...) 更轻。',
     {
-      presetId: z.string().describe('目标 preset id(见 preset_list)'),
-      scope: z.enum(['new-default', 'session']).optional().describe('切换范围(默认 new-default)'),
-      sessionId: z.string().optional().describe('scope=session 时的目标会话 id'),
+      presetId: z.string().describe('目标 preset id(必须是 preset_list 返回的 id)'),
+      scope: z.enum(['new-default', 'session']).optional().describe('改哪一层: new-default(默认)=此后新会话都用它; session=只改指定的空白会话'),
+      sessionId: z.string().optional().describe('scope=session 时必填的目标会话 id(来自 session_list 或 agent_run 结果)'),
     },
     async ({ presetId, scope, sessionId }) => {
       const kind = scope ?? 'new-default'
       try {
         if (kind === 'session') {
-          if (!sessionId) return out(JSON.stringify({ error: 'scope=session requires sessionId' }))
+          if (!sessionId) return out(JSON.stringify({ error: 'scope=session requires sessionId (补上 sessionId, 或改用 scope=「new-default」改全局默认)' }))
           const sid = SessionId(sessionId)
           // 空白校验先行(官方 api-proxy select 同款: log 里出现过 turn/start 即视为已开始)
           const found = await collectSessionEvents(ctx, sid)
           if (found === undefined) {
-            return out(JSON.stringify({ error: `session not found: ${sessionId}` }))
+            return out(JSON.stringify({ error: sessionNotFoundError(sessionId) }))
           }
           if (found.events.some((e) => (e as { type?: string })?.type === 'turn/start')) {
-            return out(JSON.stringify({ error: `session ${sessionId} has already started; its agent preset is fixed (only blank sessions can switch)` }))
+            return out(JSON.stringify({ error: `session ${sessionId} has already started; its agent preset is fixed (only blank sessions can switch) (该会话已跑过任务, preset 已固化; 想换能力请用 agent_run(preset=...) 起新会话, 或用 scope=「new-default」改默认)` }))
           }
           // live 会话: 官方同款 recompose + 落一条 agent-preset/selected 事件
           let live: { ctx: Context; session: { append: (t: 'agent-preset/selected', d: { agentPreset: string }) => unknown } } | undefined
@@ -2276,9 +2542,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             try {
               const preset = await ctx.agentPresets.recompose(live.ctx as never, presetId)
               live.session.append('agent-preset/selected', { agentPreset: preset.id })
-              return out(JSON.stringify({ ok: true, scope: 'session', sessionId, preset: preset.id, source: 'live' }))
+              return out(JSON.stringify({ ok: true, scope: 'session', sessionId, preset: preset.id, source: 'live', next: HINT.resumeSession }))
             } catch (e) {
-              return out(JSON.stringify({ error: `preset switch failed: ${(e as Error)?.message ?? String(e)}` }))
+              return out(JSON.stringify({ error: `preset switch failed: ${(e as Error)?.message ?? String(e)} (用 preset_list 确认 presetId 合法; 或重启会话后重试)` }))
             }
           }
           // 冷会话: 直接以目标 preset resume(空白会话等价于切换), 落事件后 flush+dispose
@@ -2299,7 +2565,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
               },
             })
           } catch (e) {
-            return out(JSON.stringify({ error: `failed to resume blank session ${sessionId}: ${(e as Error)?.message ?? String(e)}` }))
+            return out(JSON.stringify({ error: `failed to resume blank session ${sessionId}: ${(e as Error)?.message ?? String(e)} (该会话可能已被清理; 用 session_list 确认; 或改用 scope=「new-default」只改默认)` }))
           }
           try {
             ;(handle.agent.session as unknown as { append: (t: 'agent-preset/selected', d: { agentPreset: string }) => unknown })
@@ -2313,13 +2579,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           try {
             await handle.dispose()
           } catch { /* dispose 失败不阻断 */ }
-          return out(JSON.stringify({ ok: true, scope: 'session', sessionId, preset: presetId, source: 'resumed' }))
+          return out(JSON.stringify({ ok: true, scope: 'session', sessionId, preset: presetId, source: 'resumed', next: HINT.resumeSession }))
         }
         // scope=new-default: 先验证 preset 存在, 再更新本服务运行时默认 + 尽力写全局用户默认
         try {
           await ctx.agentPresets.resolve(presetId)
         } catch (e) {
-          return out(JSON.stringify({ error: `unknown preset "${presetId}": ${(e as Error)?.message ?? String(e)}` }))
+          return out(JSON.stringify({ error: `unknown preset "${presetId}": ${(e as Error)?.message ?? String(e)} (用 preset_list 查看合法 id)` }))
         }
         runtimeConfig.preset = presetId
         let globalDefaultUpdated = false
@@ -2351,22 +2617,23 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P3: 权限三档(policy_get / set_policy) ──
   mcp.tool(
     'policy_get',
-    '查询会话生效策略: {sessionId,sandboxMode,source:override|default,workspaceRoot,approvalPolicy}。sandboxMode 取最后一条 sandbox/mode 事件(无则 defaultSandbox); approvalPolicy 取最后一条 approval/policy(无则部署默认)。无 sessionId 返回部署默认。',
-    { sessionId: z.string().optional().describe('会话 id(缺省返回部署默认档)') },
+    '查某个会话现在到底有多少文件权限(沙箱档位), 以及为什么是这个档。什么时候用: ① agent_run 报"拒绝写入/权限不足", 先来这里确认实际档位 ② 想确认 danger-full-access 是否真的没开(安全自查) ③ 查审批策略是 ask 还是 never。不传 sessionId = 只看部署默认档(便宜)。返回 {sessionId,sandboxMode,source(override 或 default),workspaceRoot,approvalPolicy}(source=override 表示该会话有专门的 sandbox/mode 记录)。要改档用 set_policy。',
+    { sessionId: z.string().optional().describe('会话 id(缺省 = 只返回部署默认档; 会话 id 来自 session_list 或 agent_run 结果)') },
     async ({ sessionId }) => {
       try {
         if (!sessionId) {
           return out(JSON.stringify({
             sandboxMode: runtimeConfig.defaultSandbox,
             source: 'default',
-            workspaceRoot: process.cwd(),
+            workspaceRoot: defaultTaskCwd(), // [r2] B: 与 agent_run 默认工作目录保持一致
             approvalPolicy: deploymentApprovalPolicy(ctx),
+            next: '这是部署默认值; 查具体会话请传 sessionId(从 session_list 获取)',
           }, null, 2))
         }
         const sid = SessionId(sessionId)
         const found = await collectSessionEvents(ctx, sid)
         if (found === undefined) {
-          return out(JSON.stringify({ error: `session not found: ${sessionId}` }))
+          return out(JSON.stringify({ error: sessionNotFoundError(sessionId) }))
         }
         const override = sandboxModeFromEvents(found.events)
         const header = await findSessionHeader(ctx, sid)
@@ -2374,21 +2641,22 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           sessionId,
           sandboxMode: override ?? runtimeConfig.defaultSandbox,
           source: override !== undefined ? 'override' : 'default',
-          workspaceRoot: header?.cwd !== undefined ? await canonicalCwd(header.cwd) : process.cwd(),
+          workspaceRoot: header?.cwd !== undefined ? await canonicalCwd(header.cwd) : defaultTaskCwd(),
           approvalPolicy: approvalPolicyFromEvents(found.events) ?? deploymentApprovalPolicy(ctx),
+          ...(override === undefined ? { next: '该会话沿用部署默认档; 想单独提档/降档请用 set_policy(sessionId=..., mode=...)' } : {}),
         }, null, 2))
       } catch (e) {
-        return out(JSON.stringify({ error: `policy_get failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `policy_get failed: ${(e as Error)?.message ?? String(e)} (可用无参调用看部署默认; 会话 id 用 session_list 确认)` }))
       }
     },
   )
 
   mcp.tool(
     'set_policy',
-    '切换已存在会话的文件权限档。mode: read-only(只读)|workspace-write(工作区可写)|danger-full-access(完全绕过围栏+bash 解禁, 无审批任意读写, 仅限可信环境)。仅 live 会话可切(追加 sandbox/mode 事件, 下一次受限调用生效, 重启靠 replay 保持); 冷会话需先 resume(agent_run/task_inbox 带该 sessionId 跑一轮)再切。',
+    '改某个已存在会话的文件权限档(什么时候用: agent 抱怨写不了文件 / 需要临时放宽或收紧权限)。三档: read-only(只读, 最安全)|workspace-write(工作区可写, 默认)|danger-full-access(完全绕过围栏 + bash 解禁, 无审批任意读写 —— 仅限可信环境!)。重要限制: 只有 live 会话能改(会追加一条 sandbox/mode 事件, 下一次受限调用即生效, 重启后靠 replay 保持); 冷会话必须先跑一轮(agent_run/task_inbox 带该 sessionId)让它活起来再改。只影响这一个会话; 想给新任务定档请直接用 agent_run(sandbox=...)。返回 {ok,sessionId,sandboxMode,source(固定为 live)}。改完用 policy_get 核对。',
     {
-      sessionId: z.string().describe('目标会话 id'),
-      mode: z.enum(SANDBOX_MODES).describe('目标权限档'),
+      sessionId: z.string().describe('目标会话 id(必须当前是 live 的; 来自 session_list 或 agent_run 结果)'),
+      mode: z.enum(SANDBOX_MODES).describe('目标权限档: read-only 只读 | workspace-write 工作区可写 | danger-full-access 无审批任意读写(仅限可信环境)'),
     },
     async ({ sessionId, mode }) => {
       try {
@@ -2405,13 +2673,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         }
         if (!target?.append) {
           return out(JSON.stringify({
-            error: `session ${sessionId} is not live; cold/persisted sessions must be resumed first (run agent_run or task_inbox with this sessionId), then set_policy`,
+            error: `session ${sessionId} is not live; cold/persisted sessions must be resumed first (先跑一轮让它活起来: agent_run(task=..., sessionId=...) 或 task_inbox(task=..., sessionId=...), 之后再调 set_policy; 或者干脆在那一轮里用 sandbox=... 直接指定档位)`,
           }))
         }
         appendSandboxMode(target, mode)
-        return out(JSON.stringify({ ok: true, sessionId, sandboxMode: mode, source: 'live' }))
+        return out(JSON.stringify({ ok: true, sessionId, sandboxMode: mode, source: 'live', next: `用 policy_get(sessionId="${sessionId}") 核对生效档位` }))
       } catch (e) {
-        return out(JSON.stringify({ error: `set_policy failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `set_policy failed: ${(e as Error)?.message ?? String(e)} (确认 sessionId 正确且会话是 live 的; 用 session_list 查会话, 用 policy_get 查当前档)` }))
       }
     },
   )
@@ -2419,7 +2687,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P3: 审批桥(approval_list / approval_respond) ──
   mcp.tool(
     'approval_list',
-    '列出当前挂起的审批(如沙箱提档 escalation): [{approvalId,sessionId,toolName,callId?,reason?,requestedAt,waitedMs}]。配合 approval_respond 回答; 审批未决期间 agent_run/task_inbox 会一直挂起(超时由 approvalTimeoutMs 兜底收尾, 绝不超时放行)。',
+    '看有没有"卡在等人批准"的请求(agent 想提权/执行敏感操作时, 会一直挂起等回答)。什么时候用: ① agent_run/task_inbox 迟迟不返回, 怀疑卡在审批上 —— 先调这个 ② status_get 显示 pendingApprovals>0 时。返回 {bridge,count,timeoutMs,approvals:[{approvalId,sessionId,toolName,callId?,reason?,requestedAt,waitedMs}]}。count=0 说明没有待审(任务卡住是别的原因)。有则立刻用 approval_respond(approvalId=..., sessionId=..., outcome=...) 回答 —— 不回答的话会一直挂到 approvalTimeoutMs 超时(超时按拒绝收尾, 绝不自动放行)。',
     {},
     async () => {
       const now = Date.now()
@@ -2437,26 +2705,29 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         count: approvals.length,
         timeoutMs: runtimeConfig.approvalTimeoutMs,
         approvals,
+        next: approvals.length > 0
+          ? `用 approval_respond(approvalId="${approvals[0].approvalId}", sessionId="${approvals[0].sessionId}", outcome="allowed-once"|"rejected") 回答; 已等 ${Math.round(approvals[0].waitedMs / 1000)}s, 超时 ${Math.round(runtimeConfig.approvalTimeoutMs / 1000)}s 后按拒绝收尾`
+          : '当前无待审请求; 若任务仍卡住请用 task_list/status_get 查队列与运行态',
       }, null, 2))
     },
   )
 
   mcp.tool(
     'approval_respond',
-    '回答挂起审批: outcome=allowed-once(仅本次调用放行)|rejected(拒绝)。与 Web UI 双通道先答者胜 —— 已被回答/超时/撤销的审批回 receipt=not-pending。⚠️ 这等于远程提权按钮: MCP server 暴露非 loopback 时必须开 authToken。',
+    '批准或拒绝一个挂起的审批(配合 approval_list 用: 先 list 拿 approvalId, 再 respond)。什么时候用: approval_list 显示 count>0, 或 agent_run/task_inbox 卡住不动。两种结果: outcome=「allowed-once」=只放行这一次(最常用, 不放长期权限); 「rejected」=拒绝该操作, agent 会收到拒绝并自己换路子。返回 {ok,receipt(accepted 或 not-pending),approvalId,sessionId,outcome}(receipt=not-pending 表示你慢了 —— 已被 Web UI 或另一路回答/已超时, 先答者胜)。⚠️ 安全提示: 这个工具等于远程提权按钮, 部署在非 loopback 地址时必须配置 authToken。',
     {
-      approvalId: z.string().describe('approval_list 返回的审批 id'),
-      sessionId: z.string().describe('发起审批的会话 id(须与审批归属一致)'),
-      outcome: z.enum(['allowed-once', 'rejected']).describe('allowed-once=本次放行; rejected=拒绝'),
+      approvalId: z.string().describe('approval_list 返回的 approvals[].approvalId'),
+      sessionId: z.string().describe('发起审批的会话 id(必须与 approval_list 里同一行的 sessionId 完全一致, 否则会被拒绝)'),
+      outcome: z.enum(['allowed-once', 'rejected']).describe('allowed-once=仅本次调用放行(最常用); rejected=拒绝该操作'),
     },
     async ({ approvalId, sessionId, outcome }) => {
       try {
         const entry = pendingApprovals.get(approvalId)
         if (!entry) {
-          return out(JSON.stringify({ ok: false, receipt: 'not-pending', approvalId, note: '不存在/已被回答/已超时(先答者胜)' }))
+          return out(JSON.stringify({ ok: false, receipt: 'not-pending', approvalId, note: '不存在/已被回答/已超时(先答者胜)', next: '重新调 approval_list 获取最新的 approvalId —— 该条目已被别处(Web UI/另一路调用)处理或超时' }))
         }
         if (entry.sessionId !== sessionId) {
-          return out(JSON.stringify({ ok: false, error: `sessionId mismatch: approval ${approvalId} belongs to session ${entry.sessionId}` }))
+          return out(JSON.stringify({ ok: false, error: `sessionId mismatch: approval ${approvalId} belongs to session ${entry.sessionId} (用属于该审批的 sessionId 重试, 见 approval_list)` }))
         }
         const r = await respondToApproval(ctx, entry, outcome)
         return out(JSON.stringify({
@@ -2465,9 +2736,12 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           approvalId,
           sessionId,
           outcome,
+          ...(r.accepted
+            ? { next: '已放行; 原本挂起的 agent_run/task_inbox 会继续跑, 稍后用 task_result 或等待 agent_run 返回' }
+            : { next: '未生效(已被别处回答或超时); 用 approval_list 确认当前状态' }),
         }))
       } catch (e) {
-        return out(JSON.stringify({ error: `approval_respond failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `approval_respond failed: ${(e as Error)?.message ?? String(e)} (先 approval_list 刷新审批列表再重试)` }))
       }
     },
   )
@@ -2475,15 +2749,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 同步执行任务(简单场景: Hermes 下发 → 立即拿结果)
   mcp.tool(
     'agent_run',
-    '同步执行任务(改代码/分析/跑命令), 返回结构化结果。可传 sessionId 续接已有会话(长任务分多轮投喂)。需要提档审批(escalation)时会挂起等待审批 —— 审批未决期间本调用阻塞, 可用 approval_list/approval_respond 回答, 超时(approvalTimeoutMs)收尾为取消, 绝不超时放行; 长阻塞场景建议改用 task_inbox。',
+    '【同步执行】发任务 → 阻塞等结果 → 一次拿到完整产出。适合 < 5 分钟的任务(改代码、分析、跑命令)。什么时候选它而不是 task_inbox: 任务短、你想在这一个调用里直接拿到 changes/verification, 或者需要把长任务分多轮投喂(传 sessionId 续接同一会话)。什么时候别用: 任务可能要跑很久、或你希望中途能取消 —— 那种用 task_inbox(异步队列)+ task_result 轮询。返回结构化结果 {taskId,sessionId,assistantText,changes,verification,leftovers,toolCalls,toolResults,stats,...}; 有会话可续时结果顶部会带 next 提示。注意: 若 agent 请求提权, 本调用会一直阻塞到有人回答审批(用 approval_list/approval_respond 回答), 超时按拒绝收尾, 绝不自动放行。',
     {
-      task: z.string().describe('要 Harness 执行的自然语言任务'),
-      context: z.string().optional().describe('Hermes 记忆/上下文, 注入给 agent 参考'),
-      cwd: z.string().optional().describe('工作目录(默认当前)'),
-      sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果里的 sessionId 字段)'),
-      title: z.string().optional().describe('新会话的标题(创建时命名, 便于会话列表归档)'),
-      preset: z.string().optional().describe('本次任务的 preset 覆盖(见 preset_list); 仅影响新建/resume 的会话组合, 已有会话保持原 preset'),
-      sandbox: z.enum(SANDBOX_MODES).optional().describe('本次任务的文件权限三档覆盖: read-only|workspace-write|danger-full-access; 仅影响新建/resume 的会话组合, 已有会话保持原档位(切换用 set_policy); danger-full-access=无审批任意读写, 仅限可信环境'),
+      task: z.string().describe('要 Harness 执行的自然语言任务(写清楚目标与验收标准, agent 会照此干活)'),
+      context: z.string().optional().describe('记忆/上下文, 注入给 agent 参考(来自你之前的对话/笔记)'),
+      cwd: z.string().optional().describe(`工作目录; 不传 = ${defaultCwdHint()}`),
+      sessionId: z.string().optional().describe('续接已有会话的 id(来自上次 agent_run/task_inbox 结果的 sessionId 字段); 不传 = 新建会话。长任务分多轮投喂就靠它'),
+      title: z.string().optional().describe('新会话的标题(只对新建会话生效, 便于之后在 session_list 里认出来)'),
+      preset: z.string().optional().describe('本次任务的 preset 覆盖(合法 id 见 preset_list); 只影响新建/resume, 已有会话保持原 preset'),
+      sandbox: z.enum(SANDBOX_MODES).optional().describe('本次任务的文件权限档: read-only 只读 | workspace-write 工作区可写(默认) | danger-full-access 无审批任意读写(仅限可信环境); 只影响新建/resume, 已有会话保持原档(要改已有会话用 set_policy)'),
     },
     async ({ task, context, cwd, sessionId, title, preset, sandbox }) => {
       // A/P3: 请求级参数预检(preset 未知即拒带 available 名单; sandbox 由 schema 枚举兜底再校验一次)
@@ -2494,26 +2768,33 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       if (sandbox !== undefined && !(SANDBOX_MODES as readonly string[]).includes(sandbox)) {
         return out(JSON.stringify({ error: `invalid sandbox "${sandbox}"; valid modes: ${SANDBOX_MODES.join('|')}` }))
       }
-      const result = await executeTask(ctx, task, context ?? '', cwd ?? process.cwd(), sessionId, title, {
+      const result = await executeTask(ctx, task, context ?? '', cwd ?? defaultTaskCwd(), sessionId, title, {
         ...(preset ? { preset } : {}),
         ...(sandbox !== undefined ? { sandbox } : {}),
       })
-      return out(JSON.stringify(truncateResult(result), null, 2))
+      const truncated = truncateResult(result)
+      // [r2] A: 结果顶部自解释字段 —— 只在真的有会话可续时给(agent 一读就知道下一步怎么走)
+      return out(JSON.stringify({
+        ...(sessionId !== undefined && sessionId !== ''
+          ? { next: `已续接会话; ${HINT.resumeSession}` }
+          : { next: `续接此会话时传 sessionId=${String(result.sessionId)} (${HINT.resumeSession})` }),
+        ...truncated,
+      }, null, 2))
     },
   )
 
   // 异步 push 任务到队列(Hermes → Harness 任务入口)
   mcp.tool(
     'task_inbox',
-    'Hermes 把结构化任务(任务+记忆上下文)推入 Harness 队列, 异步执行, 返回 taskId。记忆喂编码的入口。审批转接(P3)的主路径: 任务挂起等审期间轮询 approval_list → approval_respond 即可续跑。',
+    '【异步队列】把任务丢进队列立刻返回 taskId(不阻塞), 之后自己轮询取结果。适合长任务、或可能需要中途取消的任务。什么时候选它而不是 agent_run: ① 任务可能跑超过 5 分钟(避免 HTTP 调用超时) ② 你想同时推多个任务并行跑 ③ 你希望保留随时取消的能力(task_cancel)。典型流程: task_inbox 拿 taskId → 用 task_result(taskId=...) 轮询 status/result → done 后取 changes/verification; 中途想停用 task_cancel。返回 {taskId,status:"queued",next}。注意: 不返回结果本身, 只是"已收下"。看队列全貌用 task_list; 任务卡在审批上时用 approval_list → approval_respond 放行。',
     {
-      task: z.string().describe('任务内容'),
-      context: z.string().optional().describe('Hermes 记忆/上下文, 随任务注入给 agent'),
-      cwd: z.string().optional().describe('工作目录'),
-      sessionId: z.string().optional().describe('续接已有会话的 sessionId(来自上次 agent_run 结果)'),
-      title: z.string().optional().describe('新会话的标题(创建时命名)'),
-      preset: z.string().optional().describe('本次任务的 preset 覆盖(见 preset_list); 仅影响新建/resume 的会话组合'),
-      sandbox: z.enum(SANDBOX_MODES).optional().describe('本次任务的文件权限三档覆盖: read-only|workspace-write|danger-full-access; 仅影响新建/resume 的会话组合, 已有会话保持原档位'),
+      task: z.string().describe('要执行的任务内容(写清楚目标与验收标准)'),
+      context: z.string().optional().describe('记忆/上下文, 随任务注入给 agent(这是喂记忆的主入口)'),
+      cwd: z.string().optional().describe(`工作目录; 不传 = ${defaultCwdHint()}`),
+      sessionId: z.string().optional().describe('续接已有会话的 id(来自上次 agent_run/task_inbox 结果); 不传 = 新建会话'),
+      title: z.string().optional().describe('新会话的标题(只对新建会话生效, 便于 session_list 归档识别)'),
+      preset: z.string().optional().describe('本次任务的 preset 覆盖(合法 id 见 preset_list); 只影响新建/resume'),
+      sandbox: z.enum(SANDBOX_MODES).optional().describe('本次任务的文件权限档: read-only | workspace-write(默认) | danger-full-access(仅限可信环境); 只影响新建/resume'),
     },
     async ({ task, context, cwd, sessionId, title, preset, sandbox }) => {
       // A/P3: 请求级参数预检(入队前即拒, 不占队列容量)
@@ -2539,7 +2820,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       }
       const id = randomUUID()
       const item: TaskItem = {
-        id, task, context: context ?? '', cwd: cwd ?? process.cwd(), status: 'queued', createdAt: now,
+        id, task, context: context ?? '', cwd: cwd ?? defaultTaskCwd(), status: 'queued', createdAt: now,
         ...(sessionId ? { sessionId } : {}),
         ...(title ? { title } : {}),
         ...(preset ? { preset } : {}),
@@ -2571,23 +2852,37 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         }
         item.finishedAt = Date.now()
       })()
-      return out(JSON.stringify({ taskId: id, status: 'queued' }))
+      return out(JSON.stringify({
+        taskId: id,
+        status: 'queued',
+        // [r2] B/A: 拿到 id 立刻告诉 agent 怎么取结果(链路自解释)
+        next: `用 task_result(taskId="${id}") 轮询结果; 队列全貌用 task_list; 想中途取消用 task_cancel(taskId="${id}")`,
+      }))
     },
   )
 
   // 取回任务结果(结构化 changes/verification/leftovers)
   mcp.tool(
     'task_result',
-    '取回 task_inbox 提交任务的结构化结果(changes/verification/leftovers)。',
-    { taskId: z.string().describe('task_inbox 返回的 taskId') },
+    '取回 task_inbox 提交的任务当前结果(这是异步链路的第二半: task_inbox 拿 taskId → 用本工具轮询)。什么时候用: task_inbox 返回 taskId 之后; 或 agent_run 场景外想确认某个后台任务好了没。返回 {taskId,status,error,result}(status ∈ queued|running|done|error|cancelled; result 仅 done 时有, 含 changes/verification/leftovers/assistantText/toolCalls 等)。轮询建议: running 时等几秒再问, 别高频空转; status=done 即可停。任务不见了(task not found)通常是已过期(默认保留 10 分钟)或被取消。看队列全貌用 task_list。',
+    { taskId: z.string().describe('task_inbox 返回的 taskId(也可从 task_list 的 tasks[].id 取)') },
     async ({ taskId }) => {
       const item = taskQueue.get(taskId)
-      if (!item) return out(JSON.stringify({ error: `task not found: ${taskId}` }))
+      if (!item) return out(JSON.stringify({ error: taskNotFoundError(taskId) }))
+      const done = item.status === 'done'
       return out(JSON.stringify({
         taskId: item.id,
         status: item.status,
         error: item.error,
         result: item.result ? truncateResult(item.result) : undefined,
+        // [r2] A: 按状态给下一步, 免得 agent 无脑轮询或误以为失败
+        ...(done
+          ? { next: item.result?.sessionId ? `任务完成; ${HINT.resumeSession}` : '任务完成' }
+          : item.status === 'running' || item.status === 'queued'
+            ? { next: `仍在${item.status === 'running' ? '执行' : '排队'}; 稍后再次调用本工具取结果(建议间隔数秒); 卡在审批上可先看 approval_list` }
+            : item.status === 'error'
+              ? { next: '任务失败; 看 error 字段定位原因 —— 常见是权限不足(用 policy_get 查档位)或会话失效(用 session_list 确认)' }
+              : { next: '任务已取消, 结果已丢弃; 需要的话重新用 task_inbox 提交' }),
       }, null, 2))
     },
   )
@@ -2595,7 +2890,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P1: 任务队列快照(task_list) ──
   mcp.tool(
     'task_list',
-    '异步任务队列快照: [{id,status,createdAt,error,...}](新任务在前, 最多 100 条)。status ∈ queued|running|done|error|cancelled。',
+    '看异步任务队列的全貌(有哪些排队/在跑/已完成的)。什么时候用: ① task_result 报 task not found, 来这里确认是不是已过期 ② 不记得 taskId 了, 按标题/cwd 找 ③ 确认没有僵尸任务在跑。与 status_get 的区别: 这里列出每一条任务明细, status_get 只给一个 queueActive 总数。返回 {total,active,count,truncated,tasks:[{id,status,createdAt,finishedAt?,error?,title?,preset?,sandbox?,cwd,sessionId?,hasResult}]}(新任务在前, 最多 100 条; status ∈ queued|running|done|error|cancelled)。取具体结果用 task_result(taskId=...)。',
     {},
     async () => {
       try {
@@ -2625,17 +2920,17 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P2: 取消队列任务(task_cancel) ──
   mcp.tool(
     'task_cancel',
-    '取消 task_inbox 提交的任务。queued: 直接移除; running: 尽力中止(agent.cancel, 结果丢弃, 会话保留可续接; 未起 agent 时在锁内协作取消); done/error/cancelled/不存在: 明确报错不可取消。',
-    { taskId: z.string().describe('task_inbox 返回的 taskId') },
+    '取消一个还在排队或正在跑的异步任务(这是 task_inbox 相对 agent_run 的核心优势)。什么时候用: 发现任务方向错了 / 不想等了 / 要腾出队列名额。行为: queued(还在排队)=直接出队; running(正在跑)=尽力中止(结果丢弃, 但会话保留, 之后还能用那个 sessionId 续接); 已完成/已失败/已取消/不存在=明确报错(不可取消)。返回 {ok,status:"cancelled",was,taskId,sessionId?,note}。取消后想看队列现状用 task_list。',
+    { taskId: z.string().describe('task_inbox 返回的 taskId(也可从 task_list 取)') },
     async ({ taskId }) => {
       try {
         const item = taskQueue.get(taskId)
-        if (!item) return out(JSON.stringify({ ok: false, error: `task ${taskId} not cancellable (status=missing)` }))
+        if (!item) return out(JSON.stringify({ ok: false, error: `task ${taskId} not cancellable (status=missing) (用 task_list 查看当前队列 —— 该任务可能已过期清理)` }))
         if (item.status === 'queued') {
           // 还没开跑(仅存在于入队同 tick 的窗口): 直接出队即取消
           item.status = 'cancelled'
           taskQueue.delete(taskId)
-          return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'queued', taskId }))
+          return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'queued', taskId, next: '已出队; 需要的话重新用 task_inbox 提交新任务' }))
         }
         if (item.status === 'running') {
           const sid = taskRunSessions.get(taskId)
@@ -2651,9 +2946,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             const waitingOnLock = sid === undefined
             if (waitingOnLock) {
               item.cancelled = true
-              return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'running', taskId, note: 'agent not started yet; will be cancelled at cooperative checkpoint' }))
+              return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'running', taskId, note: 'agent not started yet; will be cancelled at cooperative checkpoint', next: '取消将在协作检查点生效; 用 task_list 确认最终状态' }))
             }
-            return out(JSON.stringify({ ok: false, error: 'task running; no abort API', hint: '等待完成或 sessionId 续接接管' }))
+            return out(JSON.stringify({ ok: false, error: 'task running; no abort API', hint: '等待完成或 sessionId 续接接管', next: '该任务已起 agent 但拿不到中止句柄; 等它跑完(用 task_result 轮询), 或拿到 sessionId 后用 agent_run 接管该会话' }))
           }
           // 先置标志再 cancel: 防 whenIdle 恰在此间收敛、runner 抢先落 done 的竞态
           item.cancelled = true
@@ -2661,13 +2956,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             agent.cancel({ kind: 'user' })
           } catch (e) {
             delete item.cancelled
-            return out(JSON.stringify({ ok: false, error: `cancel failed: ${(e as Error)?.message ?? String(e)}`, hint: '等待完成或 sessionId 续接接管' }))
+            return out(JSON.stringify({ ok: false, error: `cancel failed: ${(e as Error)?.message ?? String(e)}`, hint: '等待完成或 sessionId 续接接管', next: '重试 task_cancel, 或等任务自然结束' }))
           }
-          return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'running', taskId, sessionId: sid, note: 'abort requested; result will be discarded' }))
+          return out(JSON.stringify({ ok: true, status: 'cancelled', was: 'running', taskId, sessionId: sid, note: 'abort requested; result will be discarded', next: sid ? `会话已保留; ${HINT.resumeSession}` : '结果将被丢弃' }))
         }
-        return out(JSON.stringify({ ok: false, error: `task ${taskId} not cancellable (status=${item.status})` }))
+        return out(JSON.stringify({ ok: false, error: `task ${taskId} not cancellable (status=${item.status})`, next: '该任务已处于终态, 无需取消; 用 task_result(taskId=...) 取结果, 或 task_list 看队列现状' }))
       } catch (e) {
-        return out(JSON.stringify({ error: `task_cancel failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `task_cancel failed: ${(e as Error)?.message ?? String(e)} (用 task_list 确认 taskId 与状态)` }))
       }
     },
   )
@@ -2675,18 +2970,18 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 给已有会话改名(走 sessionTitle 服务, 便于会话列表归档)
   mcp.tool(
     'rename_session',
-    '给已有会话改名(走 sessionTitle 服务的 rename), 便于会话列表归档区分。',
+    '给一个已有会话改标题(纯整理, 不影响会话内容或能力)。什么时候用: agent_run/task_inbox 建的会话越来越多, 想按用途命名便于日后在 session_list 里一眼认出、或让 session_search 更好命中。注意: 只能改当前 live 的会话(冷会话会报 session not found —— 先跑一轮让它活起来)。返回 {ok,sessionId,title}。改完用 session_list 确认。',
     {
-      sessionId: z.string().describe('要改名的会话 id(来自 agent_run 结果里的 sessionId 字段)'),
-      title: z.string().describe('新标题'),
+      sessionId: z.string().describe('要改名的会话 id(来自 session_list 或 agent_run/task_inbox 结果)'),
+      title: z.string().describe('新标题(建议写清用途, 便于日后检索)'),
     },
     async ({ sessionId, title }) => {
       try {
         const sessions = ctx.get('sessions') as { get?: (id: string) => unknown } | undefined
         const session = sessions?.get?.(sessionId)
-        if (!session) return out(JSON.stringify({ error: `session not found: ${sessionId}` }))
+        if (!session) return out(JSON.stringify({ error: `${sessionNotFoundError(sessionId)}; 注意本工具只能改 live 会话 —— 若该会话是冷的, 先用 agent_run(task=..., sessionId=...) 唤醒它再改名` }))
         const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
-        if (!st?.rename) return out(JSON.stringify({ error: 'sessionTitle service unavailable' }))
+        if (!st?.rename) return out(JSON.stringify({ error: 'sessionTitle service unavailable (该 dsh 部署未加载会话标题服务, 无法改名; 不影响其他功能)' }))
         const snapshot = st.rename(session, title) as { title?: string } | undefined
         return out(JSON.stringify({ ok: true, sessionId, title: snapshot?.title ?? title }))
       } catch (e) {
@@ -2698,32 +2993,32 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 手动归组补给站: 官方 UI 没有"移动会话到工作区"功能, 本工具供随时归组
   mcp.tool(
     'attach_session',
-    '把会话归组到工作区(补给站: 官方 UI 无移动会话功能)。path 缺省用该会话 header 的 cwd; 归组依赖官方 attachSession 的强校验——realpath(header.cwd) 必须与工作区路径精确相等, 不匹配会返回官方报错。',
+    '把一个会话归组到它的工作区下(纯整理操作, 让 dsh Web UI 的工作区侧栏能正确归类)。什么时候用: 会话出现在"未分组"里、或 agent_run 建的会话没自动归到期望的工作区。path 不传 = 用该会话 header 里的 cwd。硬性要求: 目标目录必须真实存在, 且 realpath(header.cwd) 必须与工作区路径精确相等, 否则官方 attachSession 会拒绝(这是官方强校验, 本插件无法绕过)。返回 {sessionId,workspaceId,workspacePath,attached}(attached=false 表示本来就在该工作区下)。本插件只做整理, 不改会话内容。',
     {
-      sessionId: z.string().describe('要归组的会话 id(live 或已持久化)'),
-      path: z.string().optional().describe('目标工作区目录(缺省: 会话 header 的 cwd)'),
+      sessionId: z.string().describe('要归组的会话 id(live 或已持久化都可以; 来自 session_list)'),
+      path: z.string().optional().describe('目标工作区目录(不传 = 用会话 header 里的 cwd; 必须是已存在的目录)'),
     },
     async ({ sessionId, path }) => {
       const sid = SessionId(sessionId)
       const header = await findSessionHeader(ctx, sid)
       if (header === undefined) {
-        return out(JSON.stringify({ error: `session not found: ${sessionId}(live 与持久化里都没有)` }))
+        return out(JSON.stringify({ error: `${sessionNotFoundError(sessionId)} (live 与持久化里都没找到)` }))
       }
       const target = path ?? header.cwd
       if (target === undefined) {
-        return out(JSON.stringify({ error: `session ${sessionId} 的 header 没有 cwd, 官方 attachSession 无法校验, 不能归组` }))
+        return out(JSON.stringify({ error: `session ${sessionId} 的 header 没有 cwd, 官方 attachSession 无法校验, 不能归组 (请显式传 path=目标工作区目录)` }))
       }
       try {
         const canonical = await realpath(target) // 目标必须是存在的目录, 否则 ENOENT
         const ws = await ensureWorkspace(ctx, canonical)
-        if (!ws?.attachSession) return out(JSON.stringify({ error: 'workspaceRegistry unavailable' }))
+        if (!ws?.attachSession) return out(JSON.stringify({ error: 'workspaceRegistry unavailable (该部署未加载工作区注册表服务, 无法归组; 不影响任务执行)' }))
         if (ws.sessionIds.includes(sid)) {
           return out(JSON.stringify({ sessionId, workspaceId: ws.id, workspacePath: ws.path, attached: false, note: 'already attached' }))
         }
         await ws.attachSession(sid)
         return out(JSON.stringify({ sessionId, workspaceId: ws.id, workspacePath: ws.path, attached: true }))
       } catch (e) {
-        return out(JSON.stringify({ error: `attach failed: ${(e as Error)?.message ?? String(e)}` }))
+        return out(JSON.stringify({ error: `attach failed: ${(e as Error)?.message ?? String(e)} (确认 path 目录真实存在; 且 realpath(会话 cwd) 必须与该目录完全相等 —— 不一致时官方会拒绝)` }))
       }
     },
   )
