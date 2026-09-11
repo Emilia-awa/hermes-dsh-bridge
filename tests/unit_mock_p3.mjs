@@ -777,5 +777,191 @@ check('C实例 initialize', await initMcp(PC, 'mock-p3c'))
   check('[r2] session_log preset=tools 只返回工具事件', (toolsLog.events ?? []).every((e) => e.type === 'tool/call' || e.type === 'tool/result'), toolsLog.events?.map((e) => e.type))
 }
 
+// ═══ [r3] R3: A 返回结构精简 / B agent 工作流指引 / C 一致性与防御 ═══
+// 直接经 __internals 纯函数通道断言格式化与错误文案(确定性), 再经实例 W 的 HTTP 面断言
+// 工具级返回体(分页信封 / 审批汇总 / 任务落点提示)。
+{
+  console.log('\n── [r3] A: 时间戳/字节/时长格式化 + 列表分页 ──')
+  const I = __internals
+  // 前面的 D 块用的是独立 rpcD 会话; 共享 mcpSession 仍停留在别的端口 → 重新握手再打 HTTP 面
+  await initMcp(PW, 'mock-p3-r3a')
+
+  // A2: 时间戳统一 ISO8601 本地时区 + 原始 epoch
+  const ht = I.humanTime(Date.UTC(2024, 4, 1, 4, 34, 56))
+  check('[r3] A2 humanTime 输出 ISO8601 带本地时区偏移', /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$/.test(ht.at), ht)
+  check('[r3] A2 humanTime 保留原始 epoch(ms)', typeof ht.at_epoch === 'number' && ht.at_epoch > 0, ht)
+  check('[r3] A2 humanTime 与本地 Date 分量一致', (() => {
+    const d = new Date(Date.UTC(2024, 4, 1, 4, 34, 56))
+    const p = (n) => String(n).padStart(2, '0')
+    return ht.at.startsWith(`${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`)
+  })(), ht)
+  check('[r3] A2 humanTime 非法/缺失返回 undefined', I.humanTime(undefined) === undefined && I.humanTime(NaN) === undefined, I.humanTime(NaN))
+  check('[r3] A2 timeFields 展开 <prefix> 与 <prefix>_epoch', I.timeFields('createdAt', 1000).createdAt !== undefined && I.timeFields('createdAt', 1000).createdAt_epoch === 1000, I.timeFields('createdAt', 1000))
+
+  // A3: 字节 / 时长人类可读, 原始值由调用方保留
+  check('[r3] A3 formatBytes 9.4KB 量级', I.formatBytes(9600) === '9.4KB', I.formatBytes(9600))
+  check('[r3] A3 formatBytes 小值用 B / 大值 MB', I.formatBytes(512) === '512B' && I.formatBytes(1024 * 1024 * 2) === '2MB', [I.formatBytes(512), I.formatBytes(1024 * 1024 * 2)])
+  check('[r3] A3 formatDuration 8.8s(需求示例)', I.formatDuration(8800) === '8.8s', I.formatDuration(8800))
+  check('[r3] A3 formatDuration 毫秒/分钟/小时', I.formatDuration(250) === '250ms' && I.formatDuration(90000) === '1.5m' && I.formatDuration(3600000) === '1h', [I.formatDuration(250), I.formatDuration(90000), I.formatDuration(3600000)])
+  check('[r3] A3 非法输入返回 undefined(不抛)', I.formatBytes(-1) === undefined && I.formatDuration(NaN) === undefined, [I.formatBytes(-1), I.formatDuration(NaN)])
+
+  // A1: 分页信封 —— 超 20 条截断 + total/truncated/next
+  const rows = Array.from({ length: 45 }, (_, i) => i)
+  const p1 = I.pageEnvelope(rows, 0, I.LIST_PAGE_DEFAULT, 'session_list')
+  check('[r3] A1 列表默认页 20 条(45 条被截断)', p1.page.length === 20 && p1.meta.truncated === true, { n: p1.page.length, m: p1.meta })
+  check('[r3] A1 截断时给出 total 与翻页 next', p1.meta.total === 45 && /offset=20/.test(String(p1.meta.next)), p1.meta)
+  check('[r3] A1 最后一页 truncated=false 且无 next', (() => { const p = I.pageEnvelope(rows, 40, 20, 'session_list'); return p.page.length === 5 && p.meta.truncated === false && p.meta.next === undefined })(), I.pageEnvelope(rows, 40, 20, 'session_list').meta)
+  check('[r3] A1 parsePage 负 offset 归零 / limit 夹取', (() => { const r = I.parsePage(-5, 9999); return r.offset === 0 && r.limit === I.LIST_PAGE_MAX })(), I.parsePage(-5, 9999))
+
+  // 工具级: task_list 分页信封 + 人类可读时间
+  const tl0 = await callTool(PW, 'task_list', {})
+  check('[r3] A1 task_list 带 offset/limit/total 分页字段', typeof tl0.offset === 'number' && typeof tl0.limit === 'number' && typeof tl0.total === 'number', tl0)
+  check('[r3] A2 task_list 行时间戳为 ISO8601 + epoch', (() => {
+    const t = tl0.tasks?.[0]
+    return t !== undefined && /[+-]\d{2}:\d{2}$/.test(String(t.createdAt)) && typeof t.createdAt_epoch === 'number'
+  })(), tl0.tasks?.[0])
+  check('[r3] A1 task_list 分页 limit 生效(limit=1 只回 1 条)', (await callTool(PW, 'task_list', { limit: 1 })).tasks?.length <= 1, await callTool(PW, 'task_list', { limit: 1 }))
+
+  // 工具级: session_log 默认 50 条上限 + 首尾截断 + truncated 提示
+  const cfg = { sessionId: 'sess-many-events' }
+  envW.liveSessions.set('sess-many-events', {
+    header: { id: 'sess-many-events', cwd: WS, createdAt: 1000 },
+    log: Array.from({ length: 120 }, (_, i) => ({ type: 'user/message', seq: i + 1, time: 1000 + i, data: { content: [{ type: 'text', text: 'ev' + i }] } })),
+  })
+  const bigLog = await callTool(PW, 'session_log', { ...cfg, preset: 'dialog' })
+  check('[r3] A1 session_log 默认最多 50 条事件', bigLog.shown === 50, { shown: bigLog.shown, total: bigLog.totalMatched })
+  check('[r3] A1 session_log 超限置 truncated + omitted + next 取更多提示', bigLog.truncated === true && bigLog.omitted === 70 && /tail|head/.test(String(bigLog.next)), bigLog)
+  check('[r3] A1 session_log 截断时返回首尾(最早与最新事件都在)', (() => {
+    const seqs = (bigLog.events ?? []).map((e) => e.seq)
+    return seqs.includes(1) && seqs.includes(120)
+  })(), (bigLog.events ?? []).map((e) => e.seq))
+  check('[r3] A2 session_log 事件时间戳人类可读 + epoch', (() => {
+    const e = bigLog.events?.[0]
+    return e !== undefined && /[+-]\d{2}:\d{2}$/.test(String(e.time)) && typeof e.time_epoch === 'number'
+  })(), bigLog.events?.[0])
+  const smallLog = await callTool(PW, 'session_log', { sessionId: 'sess-many-events', tail: 200, preset: 'dialog' })
+  check('[r3] A1 session_log 调大 tail 可取更多(200>120 → 不截断)', smallLog.shown === 120 && smallLog.truncated === false, { shown: smallLog.shown, tr: smallLog.truncated })
+  envW.liveSessions.delete('sess-many-events')
+
+  // 工具级: fs_stat / echo 的人类可读字段(原始值保留)
+  // 选一个必在允许根内的已存在路径: ~/.dsh(白名单根之一) 或仓库 cwd
+  const homeDsh = `${process.env.HOME ?? '/root'}/.dsh`
+  const candidates = [homeDsh, process.cwd(), WS_TASK]
+  let fsOk = { error: 'no candidate' }
+  for (const p of candidates) {
+    const r = await callTool(PW, 'fs_stat', { path: p })
+    if (r.error === undefined && r.exists === true) { fsOk = r; break }
+    fsOk = r
+  }
+  check('[r3] A3 fs_stat 大小带单位且保留 size_bytes', typeof fsOk.size === 'string' && typeof fsOk.size_bytes === 'number', fsOk)
+  check('[r3] A2 fs_stat mtime 为 ISO8601 + mtime_epoch', /[+-]\d{2}:\d{2}$/.test(String(fsOk.mtime)) && typeof fsOk.mtime_epoch === 'number', fsOk)
+  const ec = await callTool(PW, 'echo', { text: 'hi' })
+  check('[r3] A2 echo 回显文本 + ISO8601 at + at_epoch', ec['收到'] === 'hi' && /[+-]\d{2}:\d{2}$/.test(String(ec.at)) && typeof ec.at_epoch === 'number', ec)
+}
+
+{
+  console.log('\n── [r3] B: agent 工作流指引(B4 落点 / B5 保留与轮询 / B6 审批汇总) ──')
+  const I = __internals
+  await initMcp(PW, 'mock-p3-r3b')
+
+  // B4: fileLandingHint —— 提到写入但无绝对路径 → 给沙箱 cwd 提示
+  const mkResult = (over = {}) => ({ taskId: 't', sessionId: 's', assistantText: '', toolCalls: [], toolResults: [], changes: '', verification: '', leftovers: '', ...over })
+  const hit = I.fileLandingHint(mkResult({ changes: '已写入文件, 新增了配置解析逻辑' }), '/tmp/sandbox-cwd')
+  check('[r3] B4 提到写入但无路径 → 返回 hint 指向沙箱 cwd', hit !== undefined && hit.likelyDir === '/tmp/sandbox-cwd' && /\/tmp\/sandbox-cwd/.test(hit.hint), hit)
+  check('[r3] B4 hint 给出下一步(fs_list/fs_stat 定位)', /fs_list|fs_stat/.test(String(hit?.hint)), hit)
+  const noWrite = I.fileLandingHint(mkResult({ changes: '只做了一次分析, 没有改动' }), '/tmp/sandbox-cwd')
+  check('[r3] B4 未提及写入 → 不打扰(无 hint)', noWrite === undefined, noWrite)
+  const withPath = I.fileLandingHint(mkResult({ changes: '已写入 /tmp/sandbox-cwd/src/a.ts 完成改造' }), '/tmp/sandbox-cwd')
+  check('[r3] B4 已带绝对路径 → 不再提示(避免冗余)', withPath === undefined, withPath)
+  check('[r3] B4 extractAbsPaths 抽取绝对路径并去掉行尾标点', (() => { const p = I.extractAbsPaths('写入 /tmp/x/a.ts, 以及 /tmp/x/b.ts。'); return p.includes('/tmp/x/a.ts') && p.includes('/tmp/x/b.ts') })(), I.extractAbsPaths('写入 /tmp/x/a.ts, 以及 /tmp/x/b.ts。'))
+
+  // B4 工具级: agent_run 结果若提到写入且有 cwd, 应带 landing(或至少结构自洽)
+  const arB = await callTool(PW, 'agent_run', { task: 'write-a-file', cwd: WS_TASK })
+  check('[r3] B4 agent_run 返回仍含 next(未破坏 R2 契约)', typeof arB.next === 'string', arB.next)
+  check('[r3] B4 agent_run 命中时 landing.hint 为字符串, 未命中则字段缺省', arB.landing === undefined || typeof arB.landing?.hint === 'string', arB.landing)
+
+  // B5: task_inbox 提交后附预计保留时长与轮询建议
+  const tiB = await callTool(PW, 'task_inbox', { task: 'b5-retain', cwd: WS_TASK })
+  check('[r3] B5 task_inbox 返回 retain/retainMs(预计保留时长)', typeof tiB.retain === 'string' && typeof tiB.retainMs === 'number' && tiB.retainMs > 0, tiB)
+  check('[r3] B5 task_inbox 返回 pollAdvice 轮询建议', /轮询|5~15s|高频/.test(String(tiB.pollAdvice)), tiB.pollAdvice)
+  check('[r3] B5 task_inbox next 含轮询节奏 + task_result', /task_result/.test(String(tiB.next)) && /5~15s/.test(String(tiB.next)), tiB.next)
+  check('[r3] B5 task_inbox 返回 createdAt(ISO8601)+epoch', /[+-]\d{2}:\d{2}$/.test(String(tiB.createdAt)) && typeof tiB.createdAt_epoch === 'number', tiB)
+
+  // B6: approval_list 的"当前挂起审批数"汇总(0 与非 0 两种)
+  const alEmpty = await callTool(PW, 'approval_list', {})
+  check('[r3] B6 approval_list 空表 pending=0 且给汇总句', alEmpty.pending === 0 && /0/.test(String(alEmpty.summary)), { p: alEmpty.pending, s: alEmpty.summary })
+  check('[r3] B6 approval_list timeout 人类可读 + timeoutMs 原始值', typeof alEmpty.timeout === 'string' && typeof alEmpty.timeoutMs === 'number', { t: alEmpty.timeout, ms: alEmpty.timeoutMs })
+
+  fakeW.push({ type: 'approval/requested', sessionId: 'sess-b6', approvalId: 'apr-b6', toolName: 'bash', reason: 'b6' }, 'rpc-b6')
+  const alOne = await waitFor(async () => { const l = await callTool(PW, 'approval_list', {}); return l.pending === 1 ? l : undefined })
+  check('[r3] B6 有挂起时 approval_list.pending=1 且 summary 报数', alOne?.pending === 1 && /1 个审批挂起/.test(String(alOne.summary)), alOne)
+  check('[r3] B6 挂起行 waited 人类可读 + requestedAt ISO8601', typeof alOne?.approvals?.[0]?.waited === 'string' && /[+-]\d{2}:\d{2}$/.test(String(alOne?.approvals?.[0]?.requestedAt)), alOne?.approvals?.[0])
+
+  // B6: approval_respond 回答后直接回报剩余挂起数(省一次 list)
+  const respB6 = await callTool(PW, 'approval_respond', { approvalId: 'apr-b6', sessionId: 'sess-b6', outcome: 'allowed-once' })
+  check('[r3] B6 approval_respond 回报 pendingRemaining=0', respB6.ok === true && respB6.pendingRemaining === 0, respB6)
+  check('[r3] B6 approval_respond 给 pendingSummary 收尾句', /0/.test(String(respB6.pendingSummary)), respB6.pendingSummary)
+  const respMiss = await callTool(PW, 'approval_respond', { approvalId: 'nope-approval', sessionId: 'sess-b6', outcome: 'rejected' })
+  check('[r3] B6 答空条目也回报 pendingRemaining(not-pending)', respMiss.ok === false && typeof respMiss.pendingRemaining === 'number' && respMiss.receipt === 'not-pending', respMiss)
+}
+
+{
+  console.log('\n── [r3] C: 错误文案统一 + 参数预校验 + dsh 服务不可用指引 ──')
+  const I = __internals
+  await initMcp(PW, 'mock-p3-r3c')
+
+  // C7: 三类错误统一为 `<错误>: <关键值> (<原因一句话>; <下一步动作>)`
+  const e1 = I.missingParamError('fs_read', 'path', 'string')
+  check('[r3] C7 必传缺失文案格式统一', /^missing required parameter: fs_read\.path \(expected string, got nothing; .+\)$/.test(e1), e1)
+  const e2 = I.idNotFoundError('session', 'sid-1', '用 session_list 查看')
+  check('[r3] C7 id 不存在文案格式统一', /^session not found: sid-1 \(.+; 用 session_list 查看\)$/.test(e2), e2)
+  const e3 = I.emptySessionError('sid-2')
+  check('[r3] C7 会话为空文案格式统一 + 带下一步', /^session is empty: sid-2 \(.+; .+\)$/.test(e3), e3)
+  check('[r3] C7 三类错误都含"; "分隔的原因与下一步', [e1, e2, e3].every((s) => s.includes('; ')), [e1, e2, e3])
+
+  // C8: 参数预校验 —— 必填/类型, 回显 expected/got
+  const vMissing = I.validateArgs('fs_read', {}, [{ name: 'path', type: 'string', required: true }])
+  check('[r3] C8 必填缺失被入口拦截', /missing required parameter/.test(String(vMissing)) && /fs_read\.path/.test(String(vMissing)), vMissing)
+  const vType = I.validateArgs('fs_read', { path: 123 }, [{ name: 'path', type: 'string', required: true }])
+  check('[r3] C8 类型错误回显 expected string, got number', /expected string, got number/.test(String(vType)), vType)
+  check('[r3] C8 类型判定区分 array/object/string(不误判)', (() => {
+    const gotObj = String(I.validateArgs('x', { a: {} }, [{ name: 'a', type: 'array' }]))
+    const gotStr = String(I.validateArgs('x', { a: 'str' }, [{ name: 'a', type: 'array' }]))
+    const okArr = I.validateArgs('x', { a: [] }, [{ name: 'a', type: 'array' }])
+    return /got object/.test(gotObj) && /got string/.test(gotStr) && okArr === undefined
+  })(), [I.validateArgs('x', { a: {} }, [{ name: 'a', type: 'array' }]), I.validateArgs('x', { a: 'str' }, [{ name: 'a', type: 'array' }]), I.validateArgs('x', { a: [] }, [{ name: 'a', type: 'array' }])])
+  check('[r3] C8 合法参数放行(返回 undefined)', I.validateArgs('x', { a: 'ok', b: 3 }, [{ name: 'a', type: 'string', required: true }, { name: 'b', type: 'number' }]) === undefined, I.validateArgs('x', { a: 'ok', b: 3 }, [{ name: 'a', type: 'string', required: true }, { name: 'b', type: 'number' }]))
+  check('[r3] C8 可选参数缺省不报错', I.validateArgs('x', {}, [{ name: 'a', type: 'string' }]) === undefined, I.validateArgs('x', {}, [{ name: 'a', type: 'string' }]))
+
+  // C9: dsh 服务未启动/连接拒绝 → 统一"检查 dsh.service 状态"
+  check('[r3] C9 ECONNREFUSED 被识别为服务不可用', I.isDshServiceDown(Object.assign(new Error('connect ECONNREFUSED 127.0.0.1:3080'), { code: 'ECONNREFUSED' })) === true, 'ECONNREFUSED')
+  check('[r3] C9 fetch failed / socket hang up 文案被识别', I.isDshServiceDown(new Error('fetch failed')) === true && I.isDshServiceDown(new Error('socket hang up')) === true, 'msg')
+  check('[r3] C9 普通业务错误不误判', I.isDshServiceDown(new Error('file not found')) === false, I.isDshServiceDown(new Error('file not found')))
+  const down = I.toolFailure('agent_run', Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }))
+  check('[r3] C9 服务不可用文案含 dsh.service 指引', /dsh\.service/.test(down) && /agent_run failed/.test(down), down)
+  const plain = I.toolFailure('fs_read', new Error('EACCES: permission denied'))
+  check('[r3] C9 普通失败仍走统一格式并保留原因', /^fs_read failed: EACCES: permission denied \(.+; .+\)$/.test(plain), plain)
+
+  // C7/C8 工具级: 类型校验确实"前移"(schema 层即拒, 消息里含字段名与期望/实际类型);
+  // 若未来改为 handler 层拦截, 则 expected/got 文案同样成立 —— 两种前移都算通过。
+  const typeRejected = (r, field, want) => {
+    const raw = String(r._raw ?? '')
+    if (r._rpcError !== undefined || /-32602|Invalid arguments/.test(raw)) {
+      return /-32602|Invalid arguments/.test(raw) && raw.includes(field) && raw.includes(`expected ${want}`)
+    }
+    return new RegExp(`expected ${want}, got \\w+`).test(String(r.error))
+  }
+  const fsBad = await callTool(PW, 'fs_read', { path: 42 })
+  check('[r3] C8 fs_read 传 number 被前移拦截且指明字段与期望类型', typeRejected(fsBad, 'path', 'string'), fsBad)
+  const tlBad = await callTool(PW, 'task_list', { limit: 'many' })
+  check('[r3] C8 task_list limit 传字符串被前移拦截', typeRejected(tlBad, 'limit', 'number'), tlBad)
+  const emptySearch = await callTool(PW, 'session_search', { query: '   ' })
+  check('[r3] C7 session_search 空 query 走统一句式(保留契约前缀)', /^query must not be empty: \(blank\) \(.+; .+\)$/.test(String(emptySearch.error)), emptySearch.error)
+  const badSid = await callTool(PW, 'session_log', { sessionId: 123 })
+  check('[r3] C8 session_log sessionId 类型被前移拦截', typeRejected(badSid, 'sessionId', 'string'), badSid)
+  const missingTask = await callTool(PW, 'agent_run', {})
+  check('[r3] C8 agent_run 缺 task 被拒(schema 层或 handler 层)', Boolean(missingTask.error) || missingTask._rpcError !== undefined || /-32602|Invalid arguments/.test(String(missingTask._raw)), missingTask)
+}
+
 console.log(`\n══ P3 单元级结果: PASS=${passCount} FAIL=${failCount} ══`)
 process.exit(failCount > 0 ? 1 : 0)
