@@ -1,169 +1,480 @@
-# TOOLS — Full Reference
+# TOOLS — Full Reference (26 tools)
 
-All tools are MCP tools on the StreamableHTTP server (`http://127.0.0.1:8090/mcp`). Every response is JSON; tool outputs that are JSON strings are double-encoded (the `content[0].text` field holds the serialized object).
+> **Ground truth**: every parameter table below was checked against the tool's actual
+> `zod` schema and its `validateArgs` spec in `src/index.ts`, and the live `tools/list`
+> output of a running 0.7.0 server. 25 tools are registered by default; `fs_write` is the
+> 26th and only appears when the deployment sets `enableFsWrite: true`.
 
-Output caps: `assistantText` ≤ 8000 chars, `toolCalls` ≤ 50 × 2000, `toolResults` ≤ 20 × 2000. Truncated payloads set `truncated: true`; read the full session log via `session_log` when you need everything.
+All tools are MCP tools on the StreamableHTTP server (default `http://127.0.0.1:8090/mcp`).
+Every response is JSON; because tool results are returned as MCP text content, the object
+is serialized into `content[0].text` (clients must `JSON.parse` it).
+
+**Response conventions (v0.7.0 / R3):**
+
+- Timestamps are ISO8601 in the server's local timezone with an explicit offset
+  (e.g. `2024-05-01T12:34:56+08:00`). The original epoch is always preserved next to it as
+  `<name>_epoch` / `<name>_at_epoch`.
+- Durations and byte counts carry a human-readable form (`8.8s`, `1.5m`, `9.4KB`) while the
+  raw value stays in `<name>Ms` / `<name>_bytes` / `bytes_raw` / `uptimeSec`.
+- List tools use a uniform pagination envelope: `total` / `count` / `offset` / `limit` /
+  `truncated` / `next` (default page 20, max 100).
+- Errors are strings shaped `<error>: <key> (<one-line reason>; <next action>)`, built by
+  `errText` / `missingParamError` / `idNotFoundError` / `emptySessionError` (see Error codes).
+- Every parameterised tool runs `validateArgs` at the entrance (type + required) *before*
+  business logic and echoes `expected <type>, got <actual>`.
+- Output caps on task results: `assistantText` ≤ 8000 chars, `toolCalls` ≤ 50 × 2000,
+  `toolResults` ≤ 20 × 2000. Truncation is per-field, so the JSON always stays valid; use
+  `session_log` for the full record.
+
+---
 
 ## Task execution
 
-### `agent_run(task, context?, cwd?, sessionId?, title?, preset?, sandbox?)`
-Synchronously run a task and return a structured result. Use this for tasks expected to finish in under ~5 minutes; for long-running or cancellable work use `task_inbox` + `task_result` instead. The result starts with a `next` field (v0.7.0) telling the caller how to resume the session.
+### `agent_run`
 
-| Field | Type | Notes |
-|---|---|---|
-| `task` | string | required; the instruction |
-| `context` | string | memory/context injected into the prompt |
-| `cwd` | string | working directory; agent sessions are keyed/reused by cwd. **v0.7.0**: defaults to `workspaceRoots[0]` when configured, otherwise `process.cwd()` — the effective default is stated in the parameter description |
-| `sessionId` | string | resume an existing session (3-level: live pool → live → persisted) |
-| `title` | string | session title (shown in `session_list`) |
-| `preset` | string | per-task preset override (single-use; does not touch global default). `standard` (default) / `code` (PTC) / `minimal` (bash+str_replace_editor only, cheapest, DeepSeek-friendly) / `cordis` (for authoring new presets). Unknown id → error with `available` list |
-| `sandbox` | string | per-task sandbox-mode override: `read-only` \| `workspace-write` \| `danger-full-access`. Only affects newly created/resumed compositions; existing sessions keep their fixed tier (switch explicitly via `set_policy`). A request whose tier differs from the pooled session's is not served from the pool; dedicated (non-default-tier) sessions never enter the pool — the three tiers never pollute each other on the same cwd. Echoed back as `result.sandbox` when set. ⚠️ `danger-full-access` = unrestricted read/write with no approvals |
+Synchronously run a task and return a structured result. Use it for tasks expected to finish
+in under ~5 minutes; for long-running or cancellable work use `task_inbox` + `task_result`.
 
-Result: `{ sessionId, assistantText, toolCalls, toolResults, changes, verification, leftovers, stats, sandbox? }`.
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `task` | string | ✅ | The instruction. State the goal and acceptance criteria. |
+| `context` | string | — | Memory/context injected into the prompt. |
+| `cwd` | string | — | Working directory. Default: `workspaceRoots[0]` when configured, else `process.cwd()` — the effective default is spelled out in the live parameter description. |
+| `sessionId` | string | — | Resume an existing session (3-level takeover: pool → live → persisted). Omit = new session. |
+| `title` | string | — | Title for a newly created session (only affects creation). |
+| `preset` | string | — | Per-task preset override; validated up front against `preset_list`. Only affects created/resumed compositions. |
+| `sandbox` | enum | — | `read-only` \| `workspace-write` \| `danger-full-access`. Per-task tier override; only affects created/resumed compositions. |
 
-`stats` (run-scoped): `{ sessionId, scope: "run", rounds, steps, llmTime, llmTimeMs, toolTime, toolTimeMs, ttft, ttftSteps, tokensPerSec, cacheHitRate, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }`.
+**Returns**: `{ next, landing?, ...result }` where `result` is
+`{ taskId, sessionId, assistantText, changes, verification, leftovers, toolCalls, toolResults, stats, sandbox? }`.
 
-Notes:
-- HTTP timeout 120s; heavy reviews/refactors should be launched as background jobs by the client.
-- Reasoning/thinking blocks are stripped from `assistantText` (see ARCHITECTURE note in README).
-- If the stream dies mid-run (`TRANSPORT: terminated`), **resume with the same `sessionId`** — do not reopen a fresh session (a fresh session re-reads all code from scratch).
-- **Approvals**: if the agent hits a sandbox escalation, this call blocks while the approval is pending. Poll `approval_list` and answer via `approval_respond`; after `approvalTimeoutMs` (default 120s) it settles as cancelled/rejected — **never auto-allowed**. Prefer `task_inbox` for approval-prone workloads.
+- `next` — how to resume this session (`sessionId=...`) or confirmation that it was resumed.
+- `landing` — only when the output mentions writing a file but carries no absolute path:
+  `{ hint, likelyDir, mentionedWrite, pathsInResult }` pointing at the run's sandbox `cwd`.
+- `stats` (run-scoped):
+  `{ sessionId, scope: "run", rounds, steps, llmTime, llmTimeMs, toolTime, toolTimeMs, llmTimeHuman, toolTimeHuman, ttft, ttftHuman, ttftSteps, tokensPerSec, cacheHitRate, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }`.
+- The request's `sandbox` is echoed back as `result.sandbox` when set.
 
-### `task_inbox(task, context?, cwd?, sessionId?, title?, preset?, sandbox?)`
-Push a task to the async in-memory queue. Returns `{ taskId, status, next }` — `next` (v0.7.0) shows the exact `task_result(taskId=...)` call to poll with. Queue: max 100, TTL 10 min, **lost on restart** — do not queue long critical work through this path; prefer `agent_run` + `sessionId`. `preset`/`sandbox` behave exactly like their `agent_run` counterparts. This is the **primary path for approval bridging**: while a task is suspended waiting for an approval, poll `approval_list` → `approval_respond` and the task resumes on its own.
+**Notes**: HTTP timeout 120 s; reasoning/thinking blocks are stripped from `assistantText`.
+If the stream dies mid-run (`TRANSPORT: terminated`), **resume with the same `sessionId`**.
+If the agent hits a sandbox escalation this call blocks while the approval is pending — poll
+`approval_list` and answer via `approval_respond`; after `approvalTimeoutMs` (default
+300000 ms) it settles cancelled/rejected, **never auto-allowed**.
 
-### `task_result(taskId)`
-Poll a queued task's result: `{ taskId, status: queued|running|done|error|cancelled, result?, error?, next }`. `next` (v0.7.0) explains what to do for the current status (keep polling / read the error / task expired). A missing id returns `task not found` with a pointer to `task_list`.
+### `task_inbox`
 
-### `task_list()`
-Queue snapshot: `{ total, active, count, truncated, tasks: [{ id, status, createdAt, error?, title?, preset?, sandbox?, cwd?, hasResult }] }`.
+Push a task to the async in-memory queue and return immediately.
 
-### `task_cancel(taskId)`
-Cancel a queued/running task:
-- `queued`: removed from queue → `{ ok: true, status: "cancelled", was: "queued" }`
-- `running`: sets the cancelled flag first, then `agent.cancel({kind:'user'})` (real turn abort; result discarded on completion; session preserved for `agent_run` resume). Returns `{ ok: true, status: "cancelled", was: "running", sessionId }`.
-- `done`/`error`/`cancelled`/missing: `{ ok: false, error: "task <id> not cancellable (status=...)" }`
-- Note: the queue executes immediately (no deferred worker), so `queued` is usually transient; the real value is aborting `running` tasks.
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `task` | string | ✅ | Task content; state the goal and acceptance criteria. |
+| `context` | string | — | Memory/context; the main channel for feeding memory. |
+| `cwd` | string | — | Same default rule as `agent_run`. |
+| `sessionId` | string | — | Resume an existing session. |
+| `title` | string | — | Title for a newly created session. |
+| `preset` | string | — | Per-task preset override (validated pre-enqueue; rejected before it takes a queue slot). |
+| `sandbox` | enum | — | Three-tier override, same semantics as `agent_run`. |
+
+**Returns**: `{ taskId, status: "queued", retainMs, retain, createdAt, createdAt_epoch, pollAdvice, next }`.
+
+Queue: max `maxQueue` (default 100) active tasks, TTL `taskTtlMs` (default 10 min),
+**lost on restart** — do not queue critical long work through this path. This is the primary
+path for approval bridging: while a task is suspended on an approval, poll `approval_list`
+→ `approval_respond` and the task resumes on its own.
+
+### `task_result`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `taskId` | string | ✅ | From `task_inbox` or `task_list[].id`. |
+
+**Returns**: `{ taskId, status, error?, createdAt, createdAt_epoch, finishedAt?, finishedAt_epoch?, waitedMs?, waited?, result?, landing?, next }`.
+`status` ∈ `queued` \| `running` \| `done` \| `error` \| `cancelled`. `result` is only present
+when `done`, and is the same truncated structured result as `agent_run` (`result.taskId` is
+filled in). `landing` behaves exactly as in `agent_run`. `next` explains what to do for the
+current status. A missing id returns `task not found: <id> (已过期或从未存在; 用 task_list
+查看当前队列; 任务默认保留 N 分钟)`.
+
+### `task_list`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `offset` | number | — | Page offset (default 0). |
+| `limit` | number | — | Page size, `1..100`, default 20. |
+
+**Returns**: `{ total, active, count, offset, limit, truncated, next?, tasks: [...] }` where
+each task is
+`{ id, status, createdAt, createdAt_epoch, finishedAt?, finishedAt_epoch?, waitedMs?, waited?, error?, title?, preset?, sandbox?, cwd, sessionId?, hasResult }`.
+Newest first; default page 20, max 100. `active` = queued + running.
+
+### `task_cancel`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `taskId` | string | ✅ | From `task_inbox` or `task_list`. |
+
+**Returns** by state:
+
+- `queued`: `{ ok: true, status: "cancelled", was: "queued", taskId, next }` (removed from the queue).
+- `running`: `{ ok: true, status: "cancelled", was: "running", taskId, sessionId, note, next }` —
+  the cancelled flag is set first, then `agent.cancel({ kind: 'user' })`. Result is discarded,
+  the session is preserved for `agent_run` resume. If the agent has not started yet it returns
+  a cooperative-cancellation note instead.
+- terminal (`done`/`error`/`cancelled`): `{ ok: false, error: "task <id> not cancellable (status=...)", next }`.
+- missing: `{ ok: false, error: "task <id> not cancellable (status=missing) (用 task_list …)" }`.
+
+Note: the queue starts tasks immediately, so `queued` is a narrow window — the real value is
+aborting `running` tasks.
+
+---
 
 ## Session inspection
 
-### `session_list(cwd?, limit?)`
-`{ total, count, truncated, skipped, sessions: [{ id, title, cwd, createdAt, updatedAt, messageCount, inputTokens, outputTokens, llmTime, sandboxMode? }] }` — live + persisted merged, deduped by id, newest first. Filter by `cwd` (workspace path); omit it to list everything. `sandboxMode` (v0.5.0) appears when the session has at least one `sandbox/mode` event (the effective tier).
+### `session_list`
 
-`skipped` (v0.7.0): number of sessions dropped by per-row fault isolation — one unreadable or malformed entry no longer fails the whole listing. `0` means every row was read; `total`/`count`/`truncated` keep their previous meaning.
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `cwd` | string | — | Filter by working directory (realpath-normalized exact match). Omit = all sessions. |
+| `limit` | number | — | Page size, `1..50`, default 20. |
+| `offset` | number | — | Skip the first N rows (default 0). |
 
-**v0.7.0 — dsh 0.1.5 storage contract.** `sessionPersistence.list()` now returns snapshots (`{ header, revision, sizeBytes }`) rather than bare headers, and `inspect(id)` was replaced by `open(id, 'read')` + `handle.read()`. The plugin supports both contracts transparently, and reads v3 session files (`session.v3.jsonl.zstd`, session directories without the `session-` prefix).
+**Returns**: `{ total, count, offset, limit, truncated, skipped, next?, sessions: [...] }`,
+newest first. Each row:
+`{ id, title, cwd, createdAt, createdAt_epoch, updatedAt, updatedAt_epoch, messageCount, inputTokens, outputTokens, llmTime, llmTimeHuman, sandboxMode? }`.
 
-### `session_log(sessionId, tail?, preset?, types?, sinceIndex?)`
-Read a session's event log. Default types: `assistant/message`, `tool/call`, `tool/result`. `tail`: last N events. `sinceIndex`: incremental pull. Reasoning/thinking event types are stripped.
+- Live + persisted sessions are merged and deduped by id.
+- `skipped` counts sessions dropped by per-row fault isolation (`0` = everything read); one
+  unreadable/malformed entry never fails the whole listing.
+- `sandboxMode` appears only when the session has at least one `sandbox/mode` event.
+- If nothing matches, this returns the unified `session is empty: <key> (...)` error rather
+  than an empty array.
 
-`preset` (v0.7.0) is a shortcut for common filters — no need to hand-assemble a `types` array:
-- `"dialog"` — `user/message` + `assistant/message` (the human/agent conversation)
-- `"tools"` — `tool/call` + `tool/result`
-- `"all"` — no type filter
+### `session_log`
 
-An explicit `types` array still wins over `preset`; omitting both keeps the default. The response echoes the effective `preset`, and sets `next` when output was truncated.
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `sessionId` | string | ✅ | From `session_list[].id` or a result's `sessionId`. |
+| `tail` | number | — | Last N matching events, `1..500`, default 50. |
+| `head` | number | — | When truncated, additionally keep the oldest N events, `0..200`, default 5. `head: 0` = newest only. |
+| `preset` | enum | — | `dialog` (`user/message` + `assistant/message`) \| `tools` (`tool/call` + `tool/result`) \| `all` (no type filter). |
+| `types` | string[] | — | Exact event-type filter; **takes precedence over `preset`**. Default `[user/message, assistant/message, tool/call, tool/result]`. |
 
-### `session_stats(sessionId?)`
-`{ sessionId, scope: "session"|"run", rounds, steps, llmTime, llmTimeMs, toolTime, toolTimeMs, ttft, ttftSteps, tokensPerSec, cacheHitRate, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens, source: "live"|"persisted" }`.
+**Returns**: `{ sessionId, header: { cwd, createdAt, createdAt_epoch, preset }, preset?, types, totalMatched, shown, truncated, omitted?, order?, next?, events: [...] }`.
 
-Without `sessionId`, returns stats for the most recent agent session (error if none yet, with the suggested next action).
+- Events are chronological (`seq`, `type`, `time`, `time_epoch`, …). Reasoning/thinking
+  blocks are stripped.
+- When `totalMatched` exceeds the cap it keeps head + tail (`order` describes which), sets
+  `truncated: true` and adds `omitted` + `next` with the three ways to get more.
+- A global 60 KB budget is applied on top: the oldest records are dropped first.
+- A `preset` you pass is echoed back; `types` always shows the effective filter.
 
-Aggregation: `rounds` = count of `turn/end` events; `ttft` = avg time-to-first-token per step; `cacheHitRate` = hit/(hit+input) with a denominator heuristic covering DeepSeek and Anthropic token accounting.
+### `session_stats`
 
-### `session_search(query, cwd?, regex?, limit?)`
-Cross-session search:
-- `query` (required): substring match, or regex when `regex: true` (invalid regex → error).
-- Matches session **titles** first, then **content** (persisted events via `persistence.inspect`; falls back to live log / zstd multi-frame decompress of `session.jsonl.zstd` when inspect is unavailable). Content search result reports `content_search: true/false`.
-- Per-session 2s timeout (skipped and counted in `total`); concurrency 8; `limit` default 50 (clamp 1..200 sessions scanned); results capped at 20 with ±60-char `snippet`.
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `sessionId` | string | — | Omit = the most recent `agent_run`/`task_inbox` session. |
 
-Result: `{ query, regex, total, count, truncated, content_search, results: [{ sessionId, title, cwd, updatedAt, matched: "title"|"content", snippet? }], next }` — `next` (v0.7.0) tells the caller how to use the hits, or what to try when nothing matched.
+**Returns** (pretty-printed):
+`{ ...stats, source: "live"|"persisted", next }` where stats is
+`{ sessionId, scope: "session", rounds, steps, llmTime, llmTimeMs, toolTime, toolTimeMs, llmTimeHuman, toolTimeHuman, ttft, ttftHuman, ttftSteps, tokensPerSec, cacheHitRate, inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens }`.
 
-### `rename_session(sessionId, title)`
-Rename a session (goes through the session-title service).
+Without `sessionId` and with no prior run, it returns the unified `session is empty:
+(last agent session) (...)` error with the suggested next action. Aggregation: `rounds` =
+count of `turn/end`; `ttft` = average time to first token per step (`null` with no samples);
+`cacheHitRate` = hit/(hit+input) with a denominator heuristic covering DeepSeek and Anthropic
+token accounting; `tokensPerSec` is `null` when no decode time was recorded.
 
-### `attach_session(sessionId, path?)`
-Group a session into a workspace. `path` defaults to the session header's cwd; strong validation: realpath(header.cwd) must exactly equal the workspace path.
+### `session_search`
 
-## Files (path-jail enforced)
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `query` | string | ✅ | Substring match (case-insensitive), or regex when `regex: true`. Whitespace-only is rejected. |
+| `cwd` | string | — | Restrict to sessions under this working directory (realpath exact match). |
+| `regex` | boolean | — | Treat `query` as a regex (default false). Invalid regex → `invalid regex: <query> (...)`. |
+| `limit` | number | — | Max **sessions to scan**, `1..200`, default 50. |
+| `offset` | number | — | Page offset into the hits (default 0). |
+| `pageSize` | number | — | Hits per page, `1..100`, default 20. |
 
-All file tools are bound by: configured `workspaceRoots` (if any) → else the union of registered workspace paths + `~/.dsh`. Sensitive names (`.ssh/**`, `*.pem`, `*token*`, `.env`) are blacklisted for read and write.
+**Returns** (pretty-printed):
+`{ query, regex, total, count, offset, limit, truncated, matched, scanned, content_search, results: [...], next?, hint }`.
 
-### `fs_read(path, offset?, limit?, maxBytes?)`
-Read a text file: `{ path, totalLines, truncated, content }`. Binary (magic-number detect) returns metadata only. Paginate with `offset`/`limit` (lines).
+⚠️ `total` means **sessions scanned**, not matches — `matched` is the hit count and `scanned`
+is an equivalent alias. `content_search: false` means only titles were searched (content scan
+was impossible/skipped). Each result:
+`{ sessionId, title, cwd, updatedAt, updatedAt_epoch, matched: "title"|"content", snippet? }`.
+Titles are matched first; content matching is best-effort with a per-session 2 s timeout and
+concurrency 8. `hint` tells you what to do next (use the id, or how to widen the search).
 
-### `fs_list(path, depth?)`
-`{ path, entries: [{ name, type, size, mtime }], truncated }`. Sensitive entries hidden.
+### `rename_session`
 
-### `fs_stat(path)`
-`{ exists, size, mtime, isDir, isFile, symlinkTarget? }`.
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `sessionId` | string | ✅ | From `session_list` or a task result. |
+| `title` | string | ✅ | New title. |
 
-### `fs_write(path, content, mode?)` — opt-in
-Registered only when `enableFsWrite: true`. `mode`: `overwrite` (default) | `append` | `create-new`. 4MB content cap. Path must stay inside workspaceRoots and pass the sensitive-name blacklist; ancestor realpath checks prevent traversal.
+**Returns**: `{ ok: true, sessionId, title }`. **Only live sessions can be renamed** — a cold
+session returns `session not found: <id> (...)` plus a note to wake it with `agent_run` first.
+If the deployment has no `sessionTitle` service it returns
+`sessionTitle service unavailable (...)`. See [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#-6-rename_session-错误文案里的分号拼接)
+for a cosmetic shape issue in this tool's error string.
+
+### `attach_session`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `sessionId` | string | ✅ | Live **or** persisted session id. |
+| `path` | string | — | Target workspace dir; omit = the session header's `cwd`. Must exist. |
+
+**Returns**: `{ sessionId, workspaceId, workspacePath, attached }` (`attached: false` means it
+was already grouped there, with `note: "already attached"`). Strong validation:
+`realpath(header.cwd)` must exactly equal the workspace path, otherwise upstream
+`attachSession` refuses. Returns `workspaceRegistry unavailable (...)` when the deployment has
+no workspace registry.
+
+---
+
+## Files (path jail enforced)
+
+All file tools are bound by: configured `workspaceRoots` (when non-empty) → else the union of
+registered workspace paths + `~/.dsh` + the process cwd. Sensitive names (`.ssh/**`, `*.pem`,
+`*token*`, `.env`) are blacklisted for read and write and hidden from listings.
+
+### `fs_read`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `path` | string | ✅ | Absolute path (realpath-normalized). |
+| `offset` | number | — | 1-based first line, `>= 1`, default 1. |
+| `limit` | number | — | Max lines, `1..2000`, default 400. `content` also has a 48 KB cap. |
+
+**Returns**: `{ path, totalLines, offset, limit, truncated, content, size, size_bytes, modifiedAt, modifiedAt_epoch, next? }`.
+A file > 8 MB is refused (`file too large`). A directory returns
+`is a directory, use fs_list`. A missing path returns `path not found`. When truncated, `next`
+tells you the exact `offset` to continue from. (See
+[KNOWN_ISSUES.md #2](./KNOWN_ISSUES.md) for the out-of-range `offset` behaviour.)
+
+### `fs_list`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `path` | string | ✅ | Absolute directory path; passing a file errors. |
+| `depth` | number | — | Recursion depth, `1..5`, default 1. |
+| `offset` | number | — | Page offset (default 0). |
+| `limit` | number | — | Page size, `1..100` (the shared pagination maximum). `fs_list` itself collects up to 1000 entries before paging; `parsePage` is called with a default of 1000 here, so omitting `limit` returns up to 1000 rows in one page. |
+
+**Returns**: `{ path, depth, count, total, offset, limit, truncated, next?, entries: [...] }`.
+Each entry: `{ name, type, size, size_bytes, mtime, mtime_epoch }` with
+`type` ∈ `dir` \| `file` \| `symlink` \| `other`. Sensitive entries are hidden. Sorting is
+case-aware alphabetical.
+
+### `fs_stat`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `path` | string | ✅ | May not exist — that is not an error. |
+
+**Returns**: `{ exists: true, path, size, size_bytes, mtime, mtime_epoch, isDir, isFile }`, or
+just `{ exists: false, path }` when missing. Nearly free, so probe before a big `fs_read`.
+
+> The upstream schema advertises no `symlinkTarget` field; the implementation does not emit
+> one. Earlier docs listed it — that was wrong.
+
+### `fs_write` — opt-in
+
+Registered **only** when `enableFsWrite: true`.
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `path` | string | ✅ | Absolute path; parent dirs are created. Must be inside `workspaceRoots`. |
+| `content` | string | ✅ | UTF-8 text, ≤ 4 MB. |
+| `mode` | enum | — | `overwrite` (default) \| `append` \| `create-new` (errors if the file exists). |
+
+**Returns**: `{ ok: true, path, bytes, bytes_raw, mode, next }`. Ancestor realpath checks
+prevent traversal; the sensitive-name blacklist applies. Over-limit content returns
+`content too large`. (See [KNOWN_ISSUES.md #9](./KNOWN_ISSUES.md) for the `create-new` race.)
+
+---
 
 ## Status & config
 
-### `status_get()`
-`{ version, uptimeSec, startedAt, provider, model, preset, activeSessionsCount, agentsLive, queueActive, sandboxPolicy: { defaultMode, bridge, pendingApprovals }, node, pid }`. `sandboxPolicy.defaultMode` is the configured tier for new sessions; `bridge` ∈ `web|builtin|off`; `pendingApprovals` is the live count of suspended approvals.
+### `status_get`
 
-### `config_get()`
-Runtime config summary — `authToken` masked as `***` (never leaks secrets). Includes workspace registry list plus the v0.5.0 keys: `defaultSandbox`, `approvalsBridge`, `approvalTimeoutMs`.
+No parameters. **Returns** (pretty-printed):
+`{ version, uptimeSec, uptime, startedAt, startedAt_epoch, provider, model, preset, activeSessionsCount, agentsLive, queueActive, sandboxPolicy: { defaultMode, bridge, pendingApprovals }, node, pid }`.
+
+- `model` is `'(follow dsh default)'` when the plugin does not override it.
+- `sandboxPolicy.bridge` is the **live** effective bridge (`web` \| `builtin` \| `file-push`
+  \| `off`), so a degraded `web` shows as `builtin`.
+- `queueActive` = queued + running tasks; `agentsLive` = `ctx.agents.list().length`.
+
+### `config_get`
+
+No parameters. **Returns** (pretty-printed):
+`{ version, http, server: { port, host }, provider, model, preset, maxQueue, taskTtlMs, taskTtl, maxAgents, approvalTimeout, authTokenSet, workspaceRoots, enableFsWrite, defaultSandbox, approvalsBridge, approvalTimeoutMs, approvalFileDir }`.
+
+`authToken` is never echoed — only `authTokenSet: boolean`. Use this for "how is this plugin
+configured"; use `status_get` for "how is it doing right now".
+
+> Note: the tool description mentions a `timeouts: {...}` object; the actual response exposes
+> the duration configs as `taskTtl` + `taskTtlMs` and `approvalTimeout` +
+> `approvalTimeoutMs` (no nested `timeouts` key). The field list above is the code truth.
+
+---
 
 ## Presets
 
-### `preset_list()`
-`{ presets: [{ id, name, description, order }], defaultPreset, runtimeDefault, roots }`.
+### `preset_list`
 
-### `preset_get(sessionId?)`
-Effective preset of a session: `agent-preset/selected` event wins (latest), header is the fallback. Without `sessionId`, returns the plugin's runtime default.
+No parameters. **Returns** (pretty-printed):
+`{ source: "agentPresets"|"builtin-fallback", default, presets: [{ id, name, description, trust?, broken? }] }`.
+The built-in fallback lists `standard` / `code` / `minimal` / `cordis`.
 
-### `preset_set(presetId, scope?, sessionId?)`
-- `scope: "new-default"` (default): resolve-validate, then update runtime config (new sessions) + best-effort write to user-level settings. Returns `{ ok, scope, preset, runtimeDefault, globalDefaultUpdated }`.
-- `scope: "session"` (requires `sessionId`): only **blank** sessions (no `turn/start` in log) can switch — dsh semantics forbid changing presets on sessions with history (toolset inconsistency). Live sessions are recomposed and record an `agent-preset/selected` event; cold sessions resume with the target preset, record the event, flush and dispose. Non-blank ⇒ `{ error: "session not blank; preset can only be set at creation or while blank" }`.
+### `preset_get`
 
-## Policy & approvals (v0.5.0)
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `sessionId` | string | — | Omit = this service's default preset (cheap). |
 
-Sandbox tiers map 1:1 to Harness `SandboxMode`; the write path is a session-log `sandbox/mode` event (durable, replayed on restart), effective on the session's next confined call.
+**Returns** with `sessionId`: `{ sessionId, preset, source: "live"|"persisted"|"header"|"default" }`
+(plus `note`/`next` when falling back to `default` — that means the session had no preset
+record, e.g. it does not exist). Without `sessionId`:
+`{ preset, source: "plugin-config"|"agentPresets.defaultId" }`.
 
-### `policy_get(sessionId?)`
-Effective policy of a session: `{ sessionId, sandboxMode, source: "override"|"default", workspaceRoot, approvalPolicy }`.
-- `sandboxMode`: last `sandbox/mode` event; falls back to the configured `defaultSandbox` (`source: "default"`).
-- `approvalPolicy`: last `approval/policy` event, else the deployment default (`ctx.approval.config.policy ?? 'ask'`).
-- Without `sessionId`: the deployment defaults (`workspaceRoot` = `workspaceRoots[0]` if configured, else `process.cwd()`).
+### `preset_set`
 
-### `set_policy(sessionId, mode)`
-Switch an **existing live session's** sandbox tier. `mode`: `read-only` | `workspace-write` | `danger-full-access`. Returns `{ ok: true, sessionId, sandboxMode, source: "live" }`.
-- Appends one `sandbox/mode` event — takes effect on the session's next confined call and survives restarts via replay.
-- Cold (persisted-only) sessions error out: `"session <id> is not live; cold/persisted sessions must be resumed first (run agent_run or task_inbox with this sessionId), then set_policy"`.
-- ⚠️ `danger-full-access` bypasses file confinement AND unblocks bash — unrestricted reads/writes with no approvals. Trusted environments only.
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `presetId` | string | ✅ | Must be an id returned by `preset_list`. |
+| `scope` | enum | — | `new-default` (default) \| `session`. |
+| `sessionId` | string | — | **Required when `scope: "session"`** (missing → unified `missing required parameter` error). |
 
-### `approval_list()`
-Currently pending approvals (e.g. sandbox escalations): `{ bridge, count, timeoutMs, approvals: [{ approvalId, sessionId, toolName, callId?, reason?, requestedAt, waitedMs }] }`. Poll this while tasks/agent runs are suspended on an approval.
+**Returns**:
 
-### `approval_respond(approvalId, sessionId, outcome)`
-Answer a pending approval. `outcome`: `allowed-once` (grant this single call) | `rejected`. Returns `{ ok, receipt: "accepted"|"not-pending", approvalId, sessionId, outcome }`.
-- The Web UI and Hermes answer over two channels — **first responder wins**; the loser gets `receipt=not-pending` and no side effect.
-- Timeout handling: after `approvalTimeoutMs` the bridge settles cancelled (builtin) / rejected (web protocol has no `cancelled`) — it never auto-allows.
-- ⚠️ This is a remote privilege-escalation button: always set `authToken` before any non-loopback exposure.
+- `scope: "new-default"`: `{ ok: true, scope, preset, runtimeDefault, globalDefaultUpdated, note? }`.
+  Resolves/validates the id, updates the runtime default immediately, then best-effort writes
+  the global user default (`globalDefaultUpdated: false` + `note` when that write was skipped).
+- `scope: "session"`, live: `{ ok: true, scope: "session", sessionId, preset, source: "live", next }`.
+- `scope: "session"`, cold blank: `{ ok: true, scope: "session", sessionId, preset, source: "resumed", next }`
+  (the session is resumed with the target preset, the event recorded, flushed and disposed).
+
+Only **blank** sessions (no `turn/start` event) can switch: otherwise
+`session has already started: <id> (该会话已跑过任务, agent preset 已固化, 只有空白会话能切换;
+…)`. An unknown id returns `unknown preset: <id> (不在当前部署的 preset 名单里 …; 用 preset_list 查看合法 id)`.
+
+---
+
+## Policy & approvals
+
+Sandbox tiers map 1:1 to the Harness `SandboxMode`; the write path is a session-log
+`sandbox/mode` event (durable, replayed on restart), effective on the session's next
+confined call.
+
+### `policy_get`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `sessionId` | string | — | Omit = deployment defaults. |
+
+**Returns** (pretty-printed): `{ sessionId, sandboxMode, source: "override"|"default", workspaceRoot, approvalPolicy, next? }`.
+`source: "override"` = the session has its own `sandbox/mode` event. `approvalPolicy` is the
+last `approval/policy` event, else `ctx.approval.config.policy ?? 'ask'`. Without `sessionId`:
+`{ sandboxMode, source: "default", workspaceRoot, approvalPolicy, next }`.
+
+### `set_policy`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `sessionId` | string | ✅ | Must currently be live. |
+| `mode` | enum | ✅ | `read-only` \| `workspace-write` \| `danger-full-access`. |
+
+**Returns**: `{ ok: true, sessionId, sandboxMode, source: "live", next }` (pretty-printed).
+Cold/persisted-only sessions return
+`session <id> is not live; cold/persisted sessions must be resumed first (...)` — run one round
+with that `sessionId` first, or pass `sandbox=` on that round.
+
+### `approval_list`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `offset` | number | — | Page offset (default 0). |
+| `limit` | number | — | Page size, `1..100`, default 20. |
+
+**Returns** (pretty-printed):
+`{ bridge, pending, count, total, offset, limit, truncated, timeoutMs, timeout, approvals: [...], next?, summary, hint? }`.
+
+Each approval:
+`{ approvalId, sessionId, toolName, callId?, reason?, requestedAt, requestedAt_epoch, waitedMs, waited }`.
+
+`pending` is the first-class total (`0` means nothing to answer — stop polling) and `summary`
+states it in one sentence. `hint` (only when non-empty) gives the exact `approval_respond`
+call for the oldest entry.
+
+### `approval_respond`
+
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `approvalId` | string | ✅ | From `approval_list[].approvalId`. |
+| `sessionId` | string | ✅ | Must exactly match that approval's `sessionId`. |
+| `outcome` | enum | ✅ | `allowed-once` (grant this single call) \| `rejected`. |
+
+**Returns**: `{ ok, receipt: "accepted"|"not-pending", approvalId, sessionId, outcome, pendingRemaining, pendingSummary, next }`.
+
+- The Web UI and Hermes answer over two channels — **first responder wins**; the loser gets
+  `receipt: "not-pending"` and no side effect (same for an answered/timed-out/withdrawn entry).
+- A `sessionId` that does not own the approval returns
+  `{ ok: false, error: "sessionId mismatch: <approvalId> (该审批属于会话 <real>; …)", pendingRemaining }`.
+- Timeout: after `approvalTimeoutMs` the bridge settles cancelled (builtin/file-push) or
+  rejected (web) — it never auto-allows.
+- ⚠️ This is a remote privilege-escalation button: always set `authToken` before any
+  non-loopback exposure.
+
+---
 
 ## Meta
 
-### `echo(text)`
-Verify connectivity; echoes back.
+### `echo`
 
-### `harness_list_tools()`
-Lists tool names registered inside Harness (the agent's own toolset).
+| Param | Type | Req | Notes |
+|---|---|---|---|
+| `text` | string | ✅ | Echoed back verbatim. |
+
+**Returns**: `{ "收到": "<text>", at, at_epoch }`. The cheapest possible liveness check.
+
+### `harness_list_tools`
+
+No parameters. **Returns** a JSON array of tool names registered **inside Harness** (the
+agent's own toolset, e.g. `bash`, `fs`, `web`). This is not the same as this plugin's 26 MCP
+tools.
+
+---
 
 ## Error codes
 
-| Code | Meaning |
-|---|---|
-| `MISSING_CREDENTIAL: <provider>` | Provider API key not injected into the Harness process env |
-| `path outside allowed roots` | fs_* tool crossed the path jail |
-| `sensitive path` | fs_* tool hit `.ssh/.env/*token*/*.pem` |
-| `session not blank; …` | `preset_set` on a non-blank session |
-| `UnknownPresetError` | unknown preset id (response carries `available` list) |
-| `invalid sandbox "…"; valid modes: …` | `sandbox` value outside the three-tier enum (schema also rejects pre-call) |
-| `receipt=not-pending` | `approval_respond` lost the first-responder race, or the approval was answered/timed out/withdrawn already |
-| `sessionId mismatch: approval … belongs to …` | `approval_respond` called with a sessionId that doesn't own the approval |
-| `session <id> is not live; cold/persisted sessions must be resumed first` | `set_policy` on a non-live session |
+The uniform shape is `<error>: <key> (<one-line reason>; <next action>)`. Existing prefixes
+that clients match on are preserved.
+
+| Code / prefix | Meaning | Fix |
+|---|---|---|
+| `missing required parameter: <tool>.<param>` | Required param absent/null | Supply it; the message names the expected type. |
+| `invalid parameter type: <tool>.<param>` | Wrong JSON type | Message echoes `expected X, got Y`. |
+| `session not found: <id>` | Session absent or expired | `session_list` to pick a valid id. |
+| `session is empty: <key>` | Session exists but has no events (or none match) | Run one round with that `sessionId`, or choose another. |
+| `task not found: <id>` | Task expired (TTL, default 10 min) or never existed | `task_list`; re-submit via `task_inbox`. |
+| `unknown preset: <id>` | Preset not in this deployment | `preset_list`. |
+| `invalid sandbox "<v>"; valid modes: …` | `sandbox` outside the three-tier enum | Use one of the three (the zod schema also rejects pre-call). |
+| `path outside allowed roots (~/.dsh + workspaces): <p>` | `fs_*` crossed the path jail | Use a path under `workspaceRoots` (see `config_get`). |
+| `path denied by policy (sensitive name): <p>` | `fs_*` hit `.ssh` / `.env` / `*token*` / `*.pem` | Choose another file. |
+| `path not found: <p>` | realpath resolution found nothing | `fs_list` the parent directory. |
+| `is a directory, use fs_list` | `fs_read` aimed at a directory | `fs_list`, or add a filename. |
+| `file too large: <size>` | `fs_read` file > 8 MB | Read in `offset`/`limit` chunks (or use `bash` side). |
+| `content too large: <size>` | `fs_write` content > 4 MB | Split into multiple `mode=append` writes. |
+| `file already exists: <p>` | `fs_write` `mode=create-new` on an existing file | Use `overwrite` / `append`, or a new path. |
+| `session has already started: <id>` | `preset_set scope=session` on a non-blank session | Use `agent_run(preset=...)`, or `scope=new-default`. |
+| `session <id> is not live; …` | `set_policy` on a cold session | Run one round with that `sessionId` first. |
+| `query must not be empty: (blank)` | `session_search` got a blank query | Pass a keyword. |
+| `invalid regex: <q>` | Bad regex with `regex: true` | Fix the pattern, or `regex: false`. |
+| `sessionId mismatch: <approvalId>` | `approval_respond` with the wrong session | Use the `sessionId` from the same `approval_list` row. |
+| `receipt=not-pending` | Lost the first-responder race / already answered / timed out | Re-run `approval_list`. |
+| `<tool> failed: dsh service unreachable` | `ECONNREFUSED`/`ECONNRESET`/socket hang up etc. | `systemctl status dsh.service`, restart if needed. |
+| `MISSING_CREDENTIAL: <provider>` (upstream) | Provider API key not in the Harness process env | Add it to the systemd unit / environment. |
+| `task queue full (N/M)` | `maxQueue` reached | Wait or `task_cancel` something. |

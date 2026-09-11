@@ -4,6 +4,50 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased] — R4: 安装体验与文档 (开箱即用)
+
+R4 目标：用户拿到包之后 **README 5 分钟内跑通、每个报错都能自查、AI agent 装也能一次成功**。
+本轮**不改 `src/index.ts` 核心逻辑**（发现的缺陷只记录到 `docs/KNOWN_ISSUES.md`），
+全部改动为文档 + 新增自检脚本。
+
+### Added
+- **`scripts/doctor.mjs`** — 零依赖、`node` 直接跑的安装自检（只读，不改文件/不重启服务）：
+  7 项检查（Node 版本 / dsh 可执行与版本 / profile 存在 / settings 文件 / patch 是否配了插件 /
+  端口监听 / MCP 握手 + `tools/list`），每项输出 ✓/✗ + 一条修复建议，最后汇总
+  「N 项通过，M 项失败」并以退出码 `0`/`1` 区分。支持 `--url/--host/--port/--profile/--token`，
+  自动探测 profile，识别历史包名别名（`dsh-harness-mcp-server`），区分 `dump-config` 的
+  EACCES 权限问题与真实配置问题。
+- **`docs/KNOWN_ISSUES.md`** — 逐字段核对代码时发现的缺陷清单（10 条，含 4 个真实缺陷：
+  `fs_read` offset 越界静默、`fs_list.total` 硬上限下偏小、`rename_session` 错误串破坏统一句式、
+  `set_policy` 冷会话错误串前缀不在统一家族；以及 3 条文档/代码口径不一致的 ⚠️）。按约束**本轮不修**。
+
+### Changed
+- **README 重写为 quickstart 优先**：首屏 = 一句话是什么 → 30 秒 quickstart（4 步命令跑通 `echo`）
+  → 分场景进阶。新增前置依赖表（每项带检查命令）、三种安装路径分人群说明（npm / 源码构建 /
+  Hermes 一键配置片段）、常见错误排查表（把 `src/index.ts` 全部面向用户的错误文案逐条过了一遍，
+  22 行「原因 + 修复步骤」）、0.1.5 用户升级特别注意表、0.5.x/0.6.x → 0.7.0 升级指南与破坏性变更清单。
+  README 内嵌的 doctor 预期输出是**本机真实运行原文**。
+- **`docs/CONFIG.md` 与实际 zod schema / `Config` 接口逐字段核对**：16 个字段全部补齐
+  （此前缺 `approvalFileDir`；`approvalsBridge` 补上第四值 `file-push`）。修正两处长期口径错误：
+  - `approvalTimeoutMs` 真实默认值是 **300000 ms（5 分钟）**，此前文档写 120s —— 以代码为准修正；
+  - `provider` 默认值实为 `'deepseek-official'`（非"必填无默认"），`model` 默认空串 = 不覆盖。
+  配置示例全部改成 `<your-provider-id>` / `<your-model-id>` 占位符，可复制即用，不写死任何本机配置。
+- **`docs/TOOLS.md` 与 26 个工具逐个核对**：每个工具补全参数表（名称/类型/必填/说明）、
+  返回字段示例与错误码表。修正：`fs_stat` 不再宣称输出不存在的 `symlinkTarget`；
+  `session_search` 补充 `pageSize`/`offset`/`matched`/`scanned` 并标注 `total` = 扫描数而非命中数；
+  `session_log` 补 `head`；`fs_list` 补 `offset`/`limit` 与真实分页默认值；
+  `approval_list` 补分页与 `pending`/`summary`/`hint`；`config_get` 标注实际没有嵌套 `timeouts` 键；
+  `task_list` 补上被遗漏的 `offset`/`limit` 参数。敏感路径错误码更正为代码里的真实文案
+  `path denied by policy (sensitive name)`。
+
+### Verification
+- 26 个工具的「schema 参数名 ↔ TOOLS.md 入参表」自动化比对：**26/26 通过**。
+- CONFIG.md 表格 vs `Config` 接口 + `runtimeConfigDefaults()`：**16/16 字段覆盖**（`port`/`host`
+  在 `apply()` 里直接读取、不在 defaults 中，已在文档显式标注）。
+- `scripts/doctor.mjs` 在本机真实环境跑通（Node v22.22.3 / dsh 0.1.5-rc.2 / 真实 profile）：
+  8 项通过 1 项失败（失败项为本机 profile 目录不可写导致的 `dump-config` EACCES，运行态握手通过）。
+- `npm test`：三套 mock 单测 **178 断言全绿**，未回归。
+
 ## [Unreleased] — 0.7.0
 
 dsh runtime upgraded 0.1.2-rc.1 → **0.1.5-rc.2**. This release fixes the

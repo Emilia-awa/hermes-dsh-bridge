@@ -1,235 +1,46 @@
 # hermes-dsh-bridge
 
-> 专门桥接 **Hermes ↔ DeepSeek Harness** 的 MCP 插件：在 Harness 内部启动一个 MCP server，让外部 MCP 客户端（如 [Hermes](https://hermes-agent.nousresearch.com/)）驱动 Harness 的 Agent 执行真实编码任务。
-
+**一句话**：把 DeepSeek Harness 的 Agent 能力封装成一个 MCP server（跑在 Harness **内部**），
+让外部 MCP 客户端（Hermes / Claude Code / Codex / dsh 等）驱动 Harness 去真正干活。
 **Hermes 是大脑，Harness 是双手。**
 
 [![license](https://img.shields.io/badge/license-GPLv3-blue.svg)](./LICENSE)
 [![node](https://img.shields.io/badge/node-%3E%3D22.18-orange)](https://nodejs.org)
 [![npm](https://img.shields.io/npm/v/hermes-dsh-bridge)](https://www.npmjs.com/package/hermes-dsh-bridge)
 [![CI](https://github.com/Emilia-awa/hermes-dsh-bridge/workflows/CI/badge.svg)](https://github.com/Emilia-awa/hermes-dsh-bridge/actions)
-
-**版本兼容性**：v0.7.0 支持 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 上实测通过；含 0.1.2 破坏性变更适配：dsh-llm 移除 `isTokenDelta`、dsh-agent-presets 移除 `resolveSessionPreset`、dsh 移除 `apiProxy` 服务；以及 0.1.5 的会话存储契约变更适配：`sessionPersistence.list()` 改返回 snapshot、`inspect()` 移除改为 `open()`+`read()`、会话文件升级为 `session.v3.jsonl.zstd`）。v0.5.0 及更早版本仅兼容 dsh ≤ 0.1.1-rc.2（旧 API）。
-
-## 为什么存在
-
-Harness 自带强大的 Agent 运行时（工具、LLM、Agent、会话），但它是 **Cordis 应用**，别的 Agent 调不动它。这个插件把 Harness 翻了个面：在 Harness **内部**启动一个真正的 **MCP server**（StreamableHTTP），桥接 Harness 核心服务（`ctx.agents` / `ctx.agentPresets` / `ctx.tools`），让外部"大脑"把真正的活派给 Harness 的"双手"。
+[![dsh](https://img.shields.io/badge/dsh-%3E%3D0.1.2--rc.1-blue)](https://www.npmjs.com/package/@deepseek-ai/dsh)
 
 ```
-Hermes (MCP client, 大脑)
-   │  agent_run / task_inbox / fs_read / session_stats ... (HTTP)
-   ▼
-harness-mcp-server (MCP server, :8090)
-   │  ctx.agents.create → mount 'standard' preset
-   ▼
-Harness agent — 完整工具集: bash, fs, todo, web…
+Hermes (MCP client, 大脑)  ──HTTP──▶  harness-mcp-server (:8090)
+                                         │  ctx.agents.create → mount preset
+                                         ▼
+                                   Harness agent（bash / fs / todo / web… 完整工具集）
 ```
 
-## 工具（25 个）
+**当前版本 0.7.0**：兼容 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 实测）；26 个工具。
 
-### 任务
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `agent_run` | → Harness | 同步执行任务；返回结构化结果 + 本轮 `stats` 统计；可选 `preset` 单次覆盖预设、`sandbox` 单次覆盖权限三档；需要提档审批时会挂起等审（见"权限三档与审批桥"） |
-| `task_inbox` | → Harness | 推结构化任务（任务+记忆上下文+cwd+可选 `preset`/`sandbox`）进异步队列；**审批转接的主路径**：挂起等审期间轮询 `approval_list` → `approval_respond` 即续跑 |
-| `task_result` | ← Harness | 取回队列任务的结构化结果 |
-| `task_list` | ← Harness | 异步任务队列快照（id/status/createdAt/error） |
-| `task_cancel` | → | 取消队列任务：queued 直接移除；running 尽力中止（agent.cancel，结果丢弃、会话保留可续接） |
+---
 
-### 会话
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `session_list` | ← | 列会话（live+持久化合并），每行带 token/LLM 用时摘要 |
-| `session_log` | ← | 读会话事件日志（已剥离 reasoning），tail N 条、按类型过滤 |
-| `session_stats` | ← | 会话统计：rounds/steps/llmTime/toolTime/ttft/tokensPerSec/cacheHitRate/inputTokens/outputTokens |
-| `session_search` | ← | 跨会话搜索：标题匹配 + 内容搜索（持久化事件，单会话 2s 超时跳过），正则可选 |
-| `rename_session` | ← | 会话改名（便于归档区分） |
-| `attach_session` | ← | 会话归组到工作区 |
+## 30 秒 quickstart
 
-### 文件（受 path jail 约束）
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `fs_read` | ← | 读文本文件（行号分页；路径 jail + 敏感名黑名单） |
-| `fs_list` | ← | 列目录（递归 depth 层，敏感项自动隐藏） |
-| `fs_stat` | ← | 文件/目录元数据 |
-| `fs_write` | → | 写文件（overwrite/append/create-new）——**opt-in**（`enableFsWrite: true` 才注册），仅限 workspaceRoots |
-
-### 预设
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `preset_list` | ← | 列出可用 agent preset + 默认 |
-| `preset_get` | ← | 查询会话实际生效的 preset（或默认） |
-| `preset_set` | → | 切换默认 preset（`scope=new-default`）或空白会话的 preset（`scope=session`） |
-
-### 元
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `echo` | — | 验证 MCP 连通 |
-| `harness_list_tools` | — | 列出 Harness 内部注册的工具名 |
-
-### 权限与审批
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `policy_get` | ← | 查询会话生效策略：`{sessionId, sandboxMode, source: override\|default, workspaceRoot, approvalPolicy}`；无参返回部署默认 |
-| `set_policy` | → | 切换 **live 会话** 的文件权限档（追加 `sandbox/mode` 事件，下一次受限调用生效，重启靠 replay 保持）；冷会话需先 resume 再切 |
-| `approval_list` | ← | 列出挂起审批（沙箱提档 escalation 等）：`[{approvalId, sessionId, toolName, callId?, reason?, requestedAt, waitedMs}]` + bridge 形态/超时配置 |
-| `approval_respond` | → | 回答挂起审批：`allowed-once`（仅本次放行）/`rejected`；与 Web UI 双通道**先答者胜**，败者回 `receipt=not-pending` |
-
-### 状态与配置
-| 工具 | 方向 | 用途 |
-|------|------|------|
-| `status_get` | ← | 版本/uptime/provider/model/preset/live agents/队列深度 + `sandboxPolicy{defaultMode,bridge,pendingApprovals}` |
-| `config_get` | ← | 运行时配置摘要（authToken 打码为 `***`）+ `defaultSandbox/approvalsBridge/approvalTimeoutMs` |
-
-### 结构化结果与统计
-
-每次 `agent_run` 返回结构化结果，并附带本轮用量统计：
-
-```json
-{
-  "sessionId": "...",
-  "assistantText": "最终回答",
-  "toolCalls": [{ "name": "bash", "args": "..." }],
-  "toolResults": ["命令输出"],
-  "changes": "改了什么",
-  "verification": "怎么验证的",
-  "leftovers": "遗留问题",
-  "stats": {
-    "rounds": 1, "steps": 3,
-    "llmTime": 13.9, "toolTime": 0.04,
-    "ttft": 3349, "tokensPerSec": 40.7,
-    "cacheHitRate": 1, "inputTokens": 8831, "outputTokens": 157
-  }
-}
-```
-
-闭环：客户端把记忆作为 `context` 喂进每次任务，结果（`changes`/`verification`/`leftovers`）再存回客户端记忆，供下一轮使用。
-
-## 权限三档与审批桥（v0.5.0）
-
-### 三档语义
-
-会话文件权限档与 Harness 原生 `SandboxMode` 一一对应，通过会话日志的 `sandbox/mode` 事件固化（重启靠 replay 保持）：
-
-| 档位 | 语义 |
-|------|------|
-| `read-only` | 只读（仅 `/dev/null` 等必要 sink 可写） |
-| `workspace-write` | 工作区 + 后端临时区可写（**默认**，`defaultSandbox` 可改） |
-| `danger-full-access` | **完全绕过文件围栏 + bash 解禁，全程无审批任意读写** —— 仅限可信环境 |
-
-- `agent_run` / `task_inbox` 的 `sandbox` 参数是**请求级覆盖**：仅影响新建/resume 的会话组合；已有会话保持原档位（显式切换用 `set_policy`）。请求档与会话固化档不一致时不会复用池会话、专用会话不入池——同 cwd 三档互不污染。
-- `session_list` 行在会话有 `sandbox/mode` 记录时带 `sandboxMode` 列。
-
-### 审批转接（approvals 桥）
-
-Agent 沙箱提档（escalation）等场景会向审批链提问。本插件把审批**转接到 MCP 侧**：
-
-```
-Harness agent 需要提权 → approval/request → [审批桥挂起]
-Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allowed-once'|'rejected')
-→ agent 继续（或收到拒绝）；Web UI 与 Hermes 双通道先答者胜
-```
-
-- `approvalsBridge: 'web'`（默认）：订阅 apiProxy 的 mux 流复用 Web 审批通道，回答经 `apiProxy.respond` 路由；apiProxy 缺失时自动降级 `'builtin'`（插件内建应答器）。设为 `'off'` 关闭桥（审批回到部署默认 fail-closed 行为）。
-- 审批未决期间 `agent_run` **同步阻塞**（长阻塞场景请用 `task_inbox` 异步路径）；`approvalTimeoutMs`（默认 120s）超时收尾为取消/拒绝——**绝不超时放行**。
-- ⚠️ `approval_respond` 等于远程提权按钮：MCP server 暴露非 loopback 时必须开 `authToken`（见 docs/SECURITY.md）。
-
-## 安装
-
-### 方式 A — 从 npm 安装到 Harness profile
+前置：Node ≥ 22.18、dsh ≥ 0.1.2-rc.1、一个已配置好的 Harness profile。
+下面 4 步跑通最小闭环（假设 profile 名是 `<PROFILE>`，端口用默认 8090）。
 
 ```bash
-# 在 Harness profile 的 node_modules 下
-cd ~/.dsh/profiles/<你的profile>/node_modules
-npm install hermes-dsh-bridge
-```
-> 包主页: https://www.npmjs.com/package/hermes-dsh-bridge
+# ① 装插件到 profile
+cd ~/.dsh/profiles/<PROFILE>/node_modules && npm install hermes-dsh-bridge
 
-### 方式 B — 源码构建
-
-```bash
-git clone https://github.com/Emilia-awa/hermes-dsh-bridge.git
-cd hermes-dsh-bridge
-npm install && npm run build   # 产出 lib/index.js
-# 把构建产物放进 Harness profile:
-#   ~/.dsh/profiles/<你的profile>/node_modules/hermes-dsh-bridge
-```
-
-> ⚠️ **dual-package hazard（必读）**：Harness 从**全局树**解析 `@deepseek-ai/*`，而插件自身 node_modules 可能带平行副本——两个模块实例 ⇒ `Symbol` 不匹配 ⇒ Agent 悄悄失去全部工具（表现为 `agent_run` 只输出 `<tool_calls>` 文本、`toolCalls` 恒为空数组）。修复：把插件的 `@deepseek-ai/*` 依赖 symlink 到 Harness 全局树：
-> ```bash
-> PROFILE=~/.dsh/profiles/<你的profile>/node_modules
-> GLOBAL=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
-> for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
->            dsh-agent-presets dsh-code-runtime dsh-system-prompt dsh-typert-protocol \
->            dsh-attachment dsh-brand dsh-invariants dsh-timeout dsh-settings \
->            dsh-home-paths dsh-atomic-write dsh-user-approval \
->            cordis-plugin-include cordis-plugin-loader; do
->   rm -rf "$PROFILE/@deepseek-ai/$pkg" && ln -sfn "$GLOBAL/$pkg" "$PROFILE/@deepseek-ai/$pkg"
-> done
-> ```
-> （`cordis-plugin-include/loader` 未发布到 npm registry，只在 Harness 全局树里，必须 symlink。）
-
-### Patch 配置
-
-在你的 Harness profile 的 `cordis.patch.yml`（或等价 patch 文件）末尾追加：
-
-```yaml
-- insert:
-    - id: hermes-dsh-bridge
-      name: 'hermes-dsh-bridge'
-      config:
-        http: true
-        port: 8090
-        host: 127.0.0.1        # 默认仅本机; 暴露前必须加认证
-        # authToken: '你的随机长token'     # 可选: Bearer token 认证
-        # workspaceRoots: ['/workspace']  # 可选: cwd 白名单
-        # enableFsWrite: true             # 可选: 开启 fs_write(默认关)
-        # defaultSandbox: workspace-write # 可选: 新建会话默认权限档(read-only|workspace-write|danger-full-access)
-        # approvalsBridge: web            # 可选: 审批桥(web|builtin|off, 默认 web)
-        # approvalTimeoutMs: 120000       # 可选: 审批等待超时(超时收尾为取消/拒绝, 绝不超时放行)
-        # ⚠️ 必须显式声明 provider/model(你的 Harness 里已配置好的),
-        #    否则 agent 组装会因空 {{model}} 崩溃。改成你自己的, 例如:
-        #    provider: <your-provider-id>
-        #    model: <your-model-id>
-```
-
-### 重启并验证
-
-```bash
-systemctl restart dsh.service        # 或你管理 Harness 的方式
-# 验证 25 个工具全在线:
-python3 examples/hermes_dsh_mcp.py list
-python3 examples/hermes_dsh_mcp.py call status_get '{}'
-```
-
-## 🤖 AI 一键安装指南（给 AI Agent 看的安装说明）
-
-> 下面的步骤是给 **另一个 AI Agent** 看的：如果你是一个 AI agent，要把这个插件装到你管理的 Harness 环境里，请严格按以下编号步骤执行，每步做完检查输出再继续。
-
-**前置检查（先做这 3 步）**
-1. 确认 Node ≥ 22.18：`node --version`（低于 22.18 会报 zstd/`stripTypeScriptTypes` 缺失，先升级 Node）。
-2. 确认目标 Harness profile 存在：`ls ~/.dsh/profiles/`（找到你要装的 profile 名，下文用 `<PROFILE>` 代替）。
-3. 确认 Harness 全局树存在：`npm root -g`（下文用 `$GLOBAL_TREE` 代替 `npm root -g`）。
-
-**安装步骤（复制即可执行）**
-```bash
-# ① 安装插件到 profile
-cd ~/.dsh/profiles/<PROFILE>/node_modules
-npm install hermes-dsh-bridge        # 安装自 npm registry
-
-# ② 修复 dual-package hazard: 把所有 @deepseek-ai/* 和 cordis-plugin-* symlink 到全局树
+# ② 修 dual-package hazard（必做，否则 agent 会「嘴炮」没有工具）
 GLOBAL_TREE=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
 for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
            dsh-agent-presets dsh-code-runtime dsh-system-prompt dsh-typert-protocol \
            dsh-attachment dsh-brand dsh-invariants dsh-timeout dsh-settings \
            dsh-home-paths dsh-atomic-write dsh-user-approval \
            cordis-plugin-include cordis-plugin-loader; do
-  rm -rf "@deepseek-ai/$pkg" 2>/dev/null
-  ln -sfn "$GLOBAL_TREE/$pkg" "@deepseek-ai/$pkg"
+  rm -rf "@deepseek-ai/$pkg" 2>/dev/null; ln -sfn "$GLOBAL_TREE/$pkg" "@deepseek-ai/$pkg"
 done
 
-# ③ 在 profile 的 cordis patch 文件(cordis.patch.yml)末尾追加配置
-#    ⚠️ provider/model 必须填你这个 Harness 已配置好的, 否则 agent 组装会崩
+# ③ 在 profile 的 cordis.patch.yml 末尾追加配置
 cat >> ~/.dsh/profiles/<PROFILE>/cordis.patch.yml <<'EOF'
 - insert:
     - id: hermes-dsh-bridge
@@ -242,45 +53,393 @@ cat >> ~/.dsh/profiles/<PROFILE>/cordis.patch.yml <<'EOF'
         model: <your-model-id>         # ← 你的 Harness 里已配置的 model
 EOF
 
-# ④ 重启 Harness(注意: 若你正跑在 Harness 里, 用 systemd-run 脱离进程树重启)
+# ④ 重启 + 自检（doctor 会逐项告诉你哪里没配好）
 systemctl restart dsh.service
-
-# ⑤ 验证: 等 8 秒后检查 MCP server 起来 + 工具列表
-sleep 8
-curl -s -X POST http://127.0.0.1:8090/mcp \
-  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ai-setup","version":"1.0"}}}' \
-  | tail -1 | head -c 300
-python3 examples/hermes_dsh_mcp.py list | grep -cE "agent_run|session_stats|preset_set"   # 期望 ≥ 3
+node scripts/doctor.mjs --profile <PROFILE>
 ```
 
-**验收标准**
-- `dsh_mcp.py list` 输出 ≥ 25 个工具，其中必须包含 `agent_run`、`session_stats`、`preset_set`、`fs_read`。
-- `status_get` 返回的 `version` 为 `0.5.0`，`provider`/`model` 是你配置的值，`sandboxPolicy.bridge` 非空。
-- 跑一个冒烟任务 `python3 examples/hermes_dsh_mcp.py run '回复:安装成功'`，返回里含 `stats` 字段。
+看到 `全部通过` 后，验证一次真实连通（最便宜的调用是 `echo`）：
 
-**常见失败与对策（遇到再查）**
-| 症状 | 原因 | 对策 |
+```bash
+curl -s -X POST http://127.0.0.1:8090/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"quickstart","version":"1.0"}}}'
+# 期望：data: {... "serverInfo":{"name":"harness","version":"0.7.0"}}
+
+python3 examples/hermes_dsh_mcp.py list                 # 应列出 25 个工具
+python3 examples/hermes_dsh_mcp.py call echo '{"text":"hi"}'
+python3 examples/hermes_dsh_mcp.py run '回复:安装成功'   # 真跑一次 agent（会调 LLM，稍慢）
+```
+
+跑通后按需进入下面的分场景进阶。
+
+---
+
+## 前置依赖
+
+| 依赖 | 要求 | 检查命令 | 不满足会怎样 |
+|---|---|---|---|
+| **Node.js** | **≥ 22.18** | `node --version` | 缺 `zstd` / `stripTypeScriptTypes`，dsh 或插件直接启动失败 |
+| **dsh** | **≥ 0.1.2-rc.1**（实测 0.1.5-rc.2） | `dsh --version` | 旧 API：会话存储契约不符、`session_list` 崩溃；v0.5.0 及更早只兼容 dsh ≤ 0.1.1-rc.2 |
+| **Harness profile** | 已用 `dsh --profile <name>` 启动过一次 | `ls ~/.dsh/profiles/` | 没有 profile 目录可装 |
+| **Harness 全局树** | 含 `@deepseek-ai/*` 包 | `npm root -g` | symlink 修复无从下手 → dual-package hazard |
+| **LLM provider** | profile 的 `cordis.patch.yml` 里已配好 `llm-*` 段 | `grep -n 'llm-' ~/.dsh/profiles/<PROFILE>/cordis.patch.yml` | agent 组装崩：`prompt variable "{{model}}" has no value` 或 `MISSING_CREDENTIAL` |
+| **bubblewrap**（可选） | 宿主机装了才能跑受限 bash | `which bwrap` | `workspace-write` 档下写命令被拒（读命令仍可用） |
+
+### Hermes 端配置片段
+
+把 MCP server 注册到 Hermes（或任何 MCP 客户端）。最小配置：
+
+```jsonc
+{
+  "mcpServers": {
+    "harness": {
+      "type": "streamable-http",
+      "url": "http://127.0.0.1:8090/mcp",
+      "headers": { "Authorization": "Bearer <你的 authToken；未开启认证则省略>" }
+    }
+  }
+}
+```
+
+没有现成客户端时，仓库自带零依赖 Python 客户端可直接用：
+
+```bash
+python3 examples/hermes_dsh_mcp.py list
+python3 examples/hermes_dsh_mcp.py call status_get '{}'
+# 非默认地址/认证：
+DSH_MCP_URL=http://127.0.0.1:8090/mcp DSH_MCP_TOKEN=xxx python3 examples/hermes_dsh_mcp.py list
+```
+
+---
+
+## 安装（三种路径，按人群选）
+
+### 方式 A — npm 安装（推荐给绝大多数人）
+
+适用于：**只想用，不想改代码**。
+
+```bash
+cd ~/.dsh/profiles/<PROFILE>/node_modules
+npm install hermes-dsh-bridge
+```
+
+装完**必须**做 dual-package hazard 修复（见上面 quickstart 第 ② 步或下方 FAQ），
+否则 agent 会失去全部工具。包主页：<https://www.npmjs.com/package/hermes-dsh-bridge>
+
+### 方式 B — 源码构建
+
+适用于：**要改代码 / 要跑最新未发布提交 / 排查问题**。
+
+```bash
+git clone https://github.com/Emilia-awa/hermes-dsh-bridge.git
+cd hermes-dsh-bridge
+npm install && npm run build        # tsc -b && tsdown → 产出 lib/index.js
+npm test                            # 三套 mock 单测（不需要真实 dsh）
+
+# 把整个目录放进 profile：
+rm -rf ~/.dsh/profiles/<PROFILE>/node_modules/hermes-dsh-bridge
+cp -r . ~/.dsh/profiles/<PROFILE>/node_modules/hermes-dsh-bridge
+# 然后同样做 dual-package hazard symlink 修复并重启
+```
+
+### 方式 C — Hermes 一键配置片段
+
+适用于：**AI agent 帮人装**、或想直接抄一份完整可用的 patch。
+
+```bash
+# ① 装包（同方式 A）
+cd ~/.dsh/profiles/<PROFILE>/node_modules && npm install hermes-dsh-bridge
+
+# ② 修 symlink（同 quickstart 第 ② 步，略）
+
+# ③ 追加完整配置段
+cat >> ~/.dsh/profiles/<PROFILE>/cordis.patch.yml <<'EOF'
+- insert:
+    - id: hermes-dsh-bridge
+      name: 'hermes-dsh-bridge'
+      config:
+        http: true
+        port: 8090
+        host: 127.0.0.1
+        # authToken: '<随机长token>'      # 非 loopback 暴露时必须开
+        workspaceRoots: ['<你的工作区>']  # 限制 agent 能在哪干活
+        enableFsWrite: false              # 需 fs_write 才开
+        defaultSandbox: workspace-write   # read-only | workspace-write | danger-full-access
+        approvalsBridge: web              # web | builtin | file-push | off
+        approvalTimeoutMs: 300000         # 超时按拒绝收尾，绝不放行
+        provider: <your-provider-id>      # ⚠️ 必填：你 Harness 里已配置的
+        model: <your-model-id>            # ⚠️ 必填：该 provider 下的 model
+EOF
+
+# ④ 重启并自检
+systemctl restart dsh.service
+node scripts/doctor.mjs --profile <PROFILE>   # 应全部通过
+```
+
+> **给 AI agent 的硬性约束**：`provider` / `model` 一律写成占位符 `<your-provider-id>` /
+> `<your-model-id>`，**不要**写死某台机器的真实配置；装完必须跑 `doctor.mjs` 并把失败项的修复建议读完。
+
+---
+
+## 自检：`node scripts/doctor.mjs`
+
+零依赖，`node` 直接跑，**只读**（不改文件、不重启服务）。逐项输出 ✓/✗ + 修复建议，
+最后汇总「N 项通过，M 项失败」，退出码 `0`=全通过 / `1`=有失败。
+
+```bash
+node scripts/doctor.mjs                      # 默认 127.0.0.1:8090，自动探测 profile
+node scripts/doctor.mjs --profile web        # 指定 profile
+node scripts/doctor.mjs --port 8091 --host 127.0.0.1
+DSH_MCP_TOKEN=xxx node scripts/doctor.mjs    # 开了 authToken 的部署
+```
+
+检查 7 项：Node 版本 / dsh 可执行与版本 / profile 存在 / settings 文件 / patch 是否配了插件 /
+端口监听 / MCP 握手 + `tools/list`。
+
+### 本机真实运行输出（作为预期输出示例）
+
+以下是在本机（Node v22.22.3 / dsh 0.1.5-rc.2，插件确实装在该 profile）实际跑出来的原文：
+
+```console
+$ node scripts/doctor.mjs --profile web
+环境
+  ✓ Node 版本 — v22.22.3 (需要 >= v22.18.0)
+
+dsh
+  ✓ dsh 可执行 + 版本 — dsh 0.1.5-rc.2 (本插件需要 >= 0.1.2-rc.1; 已在 0.1.5-rc.2 实测)
+  ✓ dsh profile 存在 — /root/.dsh/profiles/web (--profile 指定)
+  ✓ dsh settings 文件 — /root/.dsh/settings.yaml
+  ✓ profile patch 已配置插件 — /root/.dsh/profiles/web/cordis.patch.yml → - id: harness-mcp-server
+  ✗ dsh --dump-config 可运行 — node:fs:2430 (profile 目录不可写)
+      ↳ 修复: dump-config 需要写 /root/.dsh/profiles/web/cordis.yml; 用对该目录有写权限的用户跑, 或直接看下面「MCP 握手」的运行态结论(运行态通过即插件已装载)
+
+运行时
+  ✓ 8090 端口监听 — 127.0.0.1:8090 已监听
+  ✓ MCP 握手 — serverInfo.name=harness version=0.5.0
+  ✓ tools/list 工具可用 — 25 个工具(期望 25~26; 含 agent_run, session_stats, preset_set, fs_read, approval_respond)
+
+────────────────────────────────────────────────────────────
+结果: 8 项通过, 1 项失败
+
+失败项一览:
+  ✗ dsh --dump-config 可运行: node:fs:2430 (profile 目录不可写)
+
+工具清单(25): echo, harness_list_tools, status_get, config_get, fs_read, fs_list, fs_stat, session_list, session_log, session_stats, session_search, preset_list, preset_get, preset_set, policy_get, set_policy, approval_list, approval_respond, agent_run, task_inbox, task_result, task_list, task_cancel, rename_session, attach_session
+
+按上面每项的 ↳ 修复建议处理后重跑本脚本。
+```
+
+**怎么读这份输出**：
+
+- `dsh --dump-config` 那一项 ✗ 是**权限问题**（该目录属 root，当前用户不可写 `cordis.yml`），
+  不是插件问题 —— 它只用于静态确认，**运行态的「MCP 握手 + tools/list」通过就说明插件已装载**。
+  本机以 `web` profile 启动的服务其实已经在跑本插件（`version=0.5.0` 是该进程启动时的旧版本号，
+  升级后重启即变 `0.7.0`）。
+- `tools/list` 是 25 个（`enableFsWrite` 未开）；开了 `enableFsWrite: true` 会是 26 个。
+- 若 `tools/list` 失败但端口在听，通常是 `authToken` 开了却没带 token —— 用 `--token` 或 `DSH_MCP_TOKEN` 重跑。
+
+---
+
+## 工具（26 个）
+
+默认注册 **25 个**；`enableFsWrite: true` 时多一个 `fs_write`。
+
+| 分类 | 工具 |
+|---|---|
+| 任务 | `agent_run`（同步）、`task_inbox`（异步队列）、`task_result`、`task_list`、`task_cancel` |
+| 会话 | `session_list`、`session_log`、`session_stats`、`session_search`、`rename_session`、`attach_session` |
+| 文件 | `fs_read`、`fs_list`、`fs_stat`、`fs_write`（opt-in） |
+| 预设 | `preset_list`、`preset_get`、`preset_set` |
+| 权限/审批 | `policy_get`、`set_policy`、`approval_list`、`approval_respond` |
+| 状态 | `status_get`、`config_get` |
+| 元 | `echo`、`harness_list_tools` |
+
+完整的入参表 / 返回字段 / 错误码见 **[docs/TOOLS.md](docs/TOOLS.md)**。
+
+### 典型闭环
+
+```
+Hermes 记忆 ──context──▶ task_inbox ──▶ Harness agent 执行 ──▶ 结构化结果 {changes, verification, leftovers}
+                                                                        │
+                              task_result 轮询 ◀────────────────────────┘
+                                                                        ▼
+                                                        结果回写 Hermes 记忆（下一轮 context）
+```
+
+`agent_run` 返回示例：
+
+```json
+{
+  "sessionId": "…",
+  "assistantText": "最终回答",
+  "toolCalls": [{ "name": "bash", "args": "…" }],
+  "toolResults": ["命令输出"],
+  "changes": "改了什么",
+  "verification": "怎么验证的",
+  "leftovers": "遗留问题",
+  "stats": {
+    "rounds": 1, "steps": 3,
+    "llmTime": 13.9, "llmTimeMs": 13900,
+    "toolTime": 0.04, "toolTimeMs": 40,
+    "ttft": 3349, "tokensPerSec": 40.7,
+    "cacheHitRate": 1, "inputTokens": 8831, "outputTokens": 157
+  }
+}
+```
+
+---
+
+## 进阶：权限三档与审批桥
+
+### 三档语义
+
+会话文件权限档与 Harness 原生 `SandboxMode` 一一对应，通过会话日志的 `sandbox/mode`
+事件固化（重启靠 replay 保持）：
+
+| 档位 | 语义 |
+|---|---|
+| `read-only` | 只读（仅 `/dev/null` 等必要 sink 可写） |
+| `workspace-write` | 工作区 + 后端临时区可写（**默认**，`defaultSandbox` 可改） |
+| `danger-full-access` | **完全绕过文件围栏 + bash 解禁，全程无审批任意读写** —— 仅限可信环境 |
+
+- `agent_run` / `task_inbox` 的 `sandbox` 参数是**请求级覆盖**：仅影响新建/resume 的会话组合；
+  已有会话保持原档位（显式切换用 `set_policy`）。同 cwd 三档互不污染。
+- `session_list` 行在会话有 `sandbox/mode` 记录时带 `sandboxMode` 列。
+
+### 审批转接（approvals 桥）
+
+```
+Harness agent 需要提权 → approval/request → [审批桥挂起]
+Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allowed-once'|'rejected')
+→ agent 继续（或收到拒绝）；Web UI 与 Hermes 双通道先答者胜
+```
+
+- `approvalsBridge` 四档：`web`（默认，订阅 apiProxy mux；apiProxy 缺失时自动降级 `builtin`）/
+  `builtin`（插件内建应答器）/ `file-push`（内建应答 + `pending_<id>.json` 文件通知）/
+  `off`（关闭桥，审批回到部署默认 fail-closed）。
+- 审批未决期间 `agent_run` **同步阻塞**（长阻塞场景请用 `task_inbox` 异步路径）；
+  `approvalTimeoutMs`（默认 **300000ms = 5 分钟**）超时收尾为取消/拒绝 —— **绝不超时放行**。
+- ⚠️ `approval_respond` 等于远程提权按钮：MCP server 暴露非 loopback 时必须开 `authToken`
+  （见 [docs/SECURITY.md](docs/SECURITY.md)）。
+
+完整配置字段见 **[docs/CONFIG.md](docs/CONFIG.md)**。
+
+---
+
+## FAQ：常见错误排查
+
+把 `src/index.ts` 里所有面向用户的错误文案过了一遍，每条给「原因 + 修复步骤」。
+所有错误的统一形状是 `<错误>: <关键值> (<原因一句话>; <下一步动作>)`。
+
+| 症状 / 错误文案 | 原因 | 修复步骤 |
 |---|---|---|
-| `agent_run` 返回文本但 toolCalls 恒空 | dual-package hazard，symlink 被 npm 重装还原 | 重做第②步 symlink，重启 |
-| 启动报 `prompt variable "{{model}}" has no value` | patch 没写 provider/model | 补第③步的 provider/model |
-| `MISSING_CREDENTIAL: <provider>` | API key 没注入 Harness 进程 env | 在 systemd unit 加 `Environment=KEY=...` 或 export |
-| `Cannot find package '@deepseek-ai/cordis-plugin-include'` | 第②步漏了 cordis-plugin-* | 补 symlink 这两个包 |
-| 版本号符合但行为像旧版 | 系统里有双 npm 全局树，装错树 | `which dsh` + `npm prefix -g` 核对，统一到实际启动的树 |
+| `agent_run` 返回文本但 `toolCalls` 恒空；agent 只输出 `<tool_calls>` 文本 | **dual-package hazard**：插件自己的 `node_modules` 和 Harness 全局树各有一份 `@deepseek-ai/*`，`Symbol` 不匹配 → `scopeOf` 为 `undefined` → preset 挂载被跳过 | ① 重做 symlink 修复（quickstart 第 ② 步）② 重启 Harness。**dsh 升级/重装后 symlink 可能被还原，需再跑一次**。日志特征：`agent ctx unscoped (dsh rc.6 bug); preset mount skipped` |
+| `prompt variable "{{model}}" has no value` | patch 没写 `provider`/`model`（插件默认 provider 是 `deepseek-official`、model 为空） | 在 patch 的 `config` 里补 `provider: <your-provider-id>` 和 `model: <your-model-id>`，**必须是你的 Harness 里已配置好的**，然后重启 |
+| `MISSING_CREDENTIAL: <provider>` | API key 没注入 Harness 进程 env | 在 systemd unit 加 `Environment=<KEY>=...`（或 `EnvironmentFile=`），或 `export` 后重启服务 |
+| `Cannot find package '@deepseek-ai/cordis-plugin-include'` | symlink 修复漏了 `cordis-plugin-*`；它们没发布到 npm registry，只存在于 Harness 全局树 | 补做 quickstart 第 ② 步里的 `cordis-plugin-include` / `cordis-plugin-loader` 两个 symlink |
+| 版本号对但行为像旧版 | 系统里有双 npm 全局树，装错树 | `which dsh` + `npm prefix -g` 核对；用 `systemctl show dsh.service -p ExecStart` 看**服务实际启动的** bin.js 路径，统一到那棵树 |
+| `session_list failed: Cannot read properties of undefined (reading 'length')` | dsh 0.1.5 改了 `sessionPersistence` 契约（`list()` 返回 snapshot、`inspect()` 移除）；v0.7.0 已修 | 升级到 `hermes-dsh-bridge@0.7.0` 并重启。若仍报，是 `lib/index.js` 陈旧 → `npm run build` 或重装 |
+| `tools/list` 只返回很少工具，或缺 `fs_write` | `enableFsWrite` 默认 `false`（fs_write 是 opt-in）；或插件没被加载 | `fs_write` 缺失属正常；其他缺失看 doctor 的 `profile patch 已配置插件` 与 `dsh 已装载插件` 两项 |
+| MCP 请求返回 `401 {"message":"Unauthorized"}` | 部署开了 `authToken` 但请求没带 | 请求头加 `Authorization: Bearer <token>`；doctor 用 `--token` / `DSH_MCP_TOKEN` |
+| MCP 请求返回 `404 Session not found` | 用了失效的 `Mcp-Session-Id` | 客户端必须回显 `initialize` 响应头里的 `Mcp-Session-Id`；会话过期就重新 `initialize` |
+| `session not found: <id>` | 会话不存在或已清理（`rename_session` 还要求会话是 **live**） | `session_list` 取有效 id；冷会话先 `agent_run(sessionId=...)` 唤醒再改名；`attach_session` 支持 live 或持久化 |
+| `session is empty: <key>` | 会话存在但完全没有事件（或该 `cwd` 下没有会话） | 先跑一轮 `agent_run` / `task_inbox` 带上这个 `sessionId`，或去掉 `cwd` 过滤 / 换一个会话 |
+| `task not found: <id>` | 任务结果已过 TTL（默认 10 分钟）被清理，或 id 从不存在 | `task_list` 看队列现状；结果要在保留期内取走 |
+| `unknown preset: <id>` | preset id 不在当前部署名单里 | `preset_list` 拿合法 id；单次任务用 `agent_run(preset=...)` |
+| `session has already started: <id>` | `preset_set(scope=session)` 只能改**空白**会话（log 里没出现过 `turn/start`） | 已跑过的会话 preset 已固化 → 改用 `agent_run(preset=...)` 起新会话，或用 `scope=new-default` 改默认 |
+| `session <id> is not live; cold/persisted sessions must be resumed first` | `set_policy` 只能改 **live** 会话 | 先 `agent_run(task=..., sessionId=...)` 让它活起来再 `set_policy`；或直接在那一轮用 `sandbox=...` 定档 |
+| `path outside allowed roots (~/.dsh + workspaces): <p>` | `fs_*` 路径越过了 path jail | 换到 `workspaceRoots` 内的路径；`config_get` 看允许哪些目录 |
+| `path denied by policy (sensitive name): <p>` | 命中敏感名黑名单（`.ssh` / `.env` / 含 `token` / `*.pem`） | 这批路径设计上永不开放，换文件 |
+| `file too large: <size>` / `content too large: <size>` | `fs_read` 单文件 > 8MB / `fs_write` 单次 > 4MB | `fs_read` 用 `offset`/`limit` 分段；`fs_write` 拆成多次 `mode=append` |
+| `<tool> failed: dsh service unreachable (...)` | `ECONNREFUSED`/`ECONNRESET`/`socket hang up` —— Harness 没起或断了 | `systemctl status dsh.service`，必要时 `systemctl restart dsh.service`，再 `status_get` 确认 |
+| `task queue full (N/100)` | 活动任务（queued+running）达到 `maxQueue` | 等任务结束、`task_cancel` 取消一些，或调大 `maxQueue` |
+| `receipt=not-pending`（`approval_respond`） | 你慢了：审批已被 Web UI / 另一路回答，或已超时/撤回（**先答者胜**） | `approval_list` 刷新拿最新 `approvalId`；`note` 字段会说明原因 |
+| `sessionId mismatch: <approvalId>` | `approval_respond` 的 `sessionId` 与该审批不匹配 | 用 `approval_list` 里**同一行**的 `sessionId` 重试 |
+| 审批一直挂起不返回 | 没人在回答；超时前会一直等 | `approval_list` 看 `pending`（>0 就回答）；`status_get.sandboxPolicy.pendingApprovals` 也能一眼看到 |
+| `TRANSPORT: terminated` 中途断流 | LLM provider 抖了一下，流断 | **用同一个 `sessionId` 续接**，不要新开会话（新会话会重读所有代码） |
+| `assistantText` 只到 ~8000 字符 | 结果字段有意限长（`assistantText` ≤ 8000，`toolCalls` ≤ 50×2000，`toolResults` ≤ 20×2000） | 用 `session_log(sessionId=..., preset="dialog")` 取完整文本 |
+| `rename_session` 报 `sessionTitle service unavailable` | 该部署没加载会话标题服务 | 不影响其他功能；改用 `agent_run(title=...)` 在创建时命名 |
+| `workspaceRegistry unavailable` | 该部署没加载工作区注册表服务 | 不影响任务执行；`attach_session`（纯整理）不可用而已 |
 
-完整排障见 [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)。
+### 0.1.5 用户从旧版升级特别注意
+
+| 变化 | 旧行为（≤ 0.1.1-rc.2 / dsh ≤ 0.1.1） | 新行为（dsh ≥ 0.1.2，0.1.5 起强制） | 你要做什么 |
+|---|---|---|---|
+| **会话存储格式** | `session.jsonl.zstd` + 目录带 `session-` 前缀 | **`session.v3.jsonl.zstd`** + 目录**无** `session-` 前缀 | 不用迁数据；升级插件到 0.7.0 即自动兼容两代格式 |
+| **`sessionPersistence` 契约** | `list()` 返回裸 header；有 `inspect(id)` | `list()` 返回 snapshot `{header, revision, sizeBytes}`；`inspect()` 移除，改 `open(id,'read')` + `handle.read()` | 升级插件；0.7.0 已做双契约兼容层 |
+| **`session_list` 行为** | 单行读取失败可能整表崩 | 逐行容错：坏行跳过并计入新的 `skipped` 字段（`0` = 全部正常） | 检查结果的 `skipped`；非 0 说明有个别会话读不出来，但列表仍可用 |
+| **`ctx.agent`（单数）** | 存在 | 移除 | 与本插件无关（只用 `ctx.agents`），但要保证 dsh ≥ 0.1.2 |
+| **`apiProxy` 服务** | 随包提供，审批桥走 `web` | 0.1.5 不再随包发布 | 审批桥自动降级 `builtin`（本机部署用 `file-push`）→ `status_get.sandboxPolicy.bridge` 会显示实际生效值 |
+| **Web UI 面板 slot** | `'conversation'` | `'main'` | 与本插件无关（不注册任何 UI slot） |
+
+---
+
+## 升级指南
+
+### 0.5.x / 0.6.x → 0.7.0
+
+**破坏性变更：无。** 工具名、参数名、既有返回字段全部保持不变 —— 0.7.0 只**新增**字段
+（`next` / `landing` / `skipped` / `preset` / `offset` / `pending` 等）并统一错误串后缀。
+按下面步骤迁移：
+
+```bash
+# 1) 升级插件
+cd ~/.dsh/profiles/<PROFILE>/node_modules && npm install hermes-dsh-bridge@0.7.0
+
+# 2) 重做 symlink（npm install 会把 symlink 还原成实体目录）
+#    见 quickstart 第 ② 步
+
+# 3) 检查 dsh 版本（0.7.0 要求 >= 0.1.2-rc.1）
+dsh --version
+
+# 4) 重启 + 自检
+systemctl restart dsh.service
+node scripts/doctor.mjs --profile <PROFILE>
+python3 examples/hermes_dsh_mcp.py call status_get '{}'   # version 应为 0.7.0
+```
+
+**需要留意的行为变化（非破坏性，但客户端如有硬编码需调整）**：
+
+| 变化 | 影响 | 应对 |
+|---|---|---|
+| 时间戳改为 ISO8601 本地时区 + `*_epoch` 原值 | 原来读 epoch 数字的客户端若直接展示会看到日期串 | 用 `*_epoch` 字段排序/计算，用 `*At` 字段展示 |
+| 列表类返回统一分页（默认 20，最大 100），带 `next` | 之前"一次全返回"，现在可能截断 | 读 `truncated`/`next` 翻页；需要更多一次给 `limit` |
+| `session_log` 默认最多 50 条事件 | 长会话默认只给首尾 | 调大 `tail`（最大 500）、`head=0` 只看最新，或用 `preset`/`types` 收窄 |
+| 错误串统一加了 `(<原因>; <下一步>)` 后缀 | 用 `==` 精确比对错误串的客户端会失配 | 用前缀匹配（`task not found` / `session not found` / `unknown preset` / `query must not be empty` 均保留） |
+| `config_get` 不再回显 `authToken: '***'` | 只有 `authTokenSet: boolean` | 用布尔值判断是否开启 |
+| 默认 `cwd` 改为 `workspaceRoots[0]`（配了才生效） | 之前是 `process.cwd()`（对远程调用无意义） | 不配 `workspaceRoots` 则行为不变；配了就是显式工作区 |
+| `approvalTimeoutMs` 默认 **300000ms（5 分钟）** | 老文档曾写 120s，是文档错误 | 想回到 2 分钟请显式设 `approvalTimeoutMs: 120000` |
+
+### 0.5.0 以下 → 0.7.0
+
+**跨大版本，有破坏性变更**：v0.5.0 及更早只兼容 **dsh ≤ 0.1.1-rc.2**（旧 API）。
+
+1. 先升级 dsh 到 ≥ 0.1.2-rc.1（建议 0.1.5-rc.2），否则旧插件在 0.1.5 上会因会话存储契约变更崩溃。
+2. 升级插件到 0.7.0。
+3. 确认 patch 里审批桥配置：0.1.2 起 `apiProxy` 不再注入，`approvalsBridge: web` 会静默降级 `builtin`；
+   如需文件通知改用 `file-push`（配套 `approvalFileDir`）。
+4. 旧 `sandbox` 相关默认值不变（`workspace-write`），无需迁移数据。
+5. 重做 symlink → 重启 → `node scripts/doctor.mjs`。
+
+完整历史见 [CHANGELOG.md](CHANGELOG.md)。
+
+---
 
 ## 文档
 
-- [docs/TOOLS.md](docs/TOOLS.md) — 25 个工具的完整参考（入参/出参/限额/错误码）
-- [docs/CONFIG.md](docs/CONFIG.md) — 配置字段、安全默认值
-- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 已知坑（SSE 解析、8KB 截断、dual-package hazard…）
+- [docs/CONFIG.md](docs/CONFIG.md) — 全部配置字段（与代码逐字段核对）、安全默认值、可复制示例
+- [docs/TOOLS.md](docs/TOOLS.md) — 26 个工具的完整参考（入参表 / 返回字段 / 错误码）
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 深度排障（SSE 解析、8KB 截断、dual-package hazard…）
+- [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — 已发现但本轮不修的缺陷（含真实默认值口径）
 - [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型
+- [scripts/doctor.mjs](scripts/doctor.mjs) — 安装自检
 - [examples/hermes_dsh_mcp.py](examples/hermes_dsh_mcp.py) — 零依赖 Python MCP 客户端（仅标准库）
 
 ## 定位
 
-适合做**备用工具**而非日常主力：日常改代码请直接驱动你的主 Agent。需要**上下文隔离**（大重构会撑爆客户端上下文）或**并行执行**不相关任务时再找它。
+适合做**备用工具**而非日常主力：日常改代码请直接驱动你的主 Agent。需要**上下文隔离**
+（大重构会撑爆客户端上下文）或**并行执行**不相关任务时再找它。
 
 - Agent 会话按 cwd **复用**（避免每次调用重新加载项目上下文）。
 - Bash 沙箱化（`workspace-write`）：宿主机装 `bubblewrap`，否则写命令会被拒。

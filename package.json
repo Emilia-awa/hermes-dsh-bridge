@@ -8,12 +8,15 @@
   "files": [
     "lib",
     "src",
+    "scripts",
+    "docs",
     "cordis.patch.yml",
     "README.md",
     "NOTICE.md"
   ],
   "scripts": {
     "build": "tsc -b && tsdown --env.DSH_BUILD_FACE host",
+    "doctor": "node scripts/doctor.mjs",
     "test": "node tests/unit_mock_p1.mjs && node tests/unit_mock_p2.mjs && node tests/unit_mock_p3.mjs"
   },
   "keywords": [
