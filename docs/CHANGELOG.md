@@ -4,7 +4,7 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased] — R4: 安装体验与文档 (开箱即用)
+## [0.7.0] - 2026-09-13 — R4: 安装体验与文档 (开箱即用)
 
 R4 目标：用户拿到包之后 **README 5 分钟内跑通、每个报错都能自查、AI agent 装也能一次成功**。
 本轮**不改 `src/index.ts` 核心逻辑**（发现的缺陷只记录到 `docs/KNOWN_ISSUES.md`），
@@ -48,7 +48,7 @@ R4 目标：用户拿到包之后 **README 5 分钟内跑通、每个报错都�
   8 项通过 1 项失败（失败项为本机 profile 目录不可写导致的 `dump-config` EACCES，运行态握手通过）。
 - `npm test`：三套 mock 单测 **178 断言全绿**，未回归。
 
-## [Unreleased] — 0.7.0
+## [0.7.0] - 2026-09-13
 
 dsh runtime upgraded 0.1.2-rc.1 → **0.1.5-rc.2**. This release fixes the
 `session_list` crash reported in R1 and reworks all 26 tool descriptions for
