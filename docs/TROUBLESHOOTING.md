@@ -51,11 +51,4 @@ The plugin's default provider is `deepseek-official` with an empty model. Withou
 
 ## Tests in CI
 
-`tests/unit_mock_p1.mjs` runs standalone (mock ctx, no dsh needed). The integration suites (`tests/integration_p1.py`, `tests/integration_p1_phase2.py`) need a real Harness instance with a live LLM provider — run locally, not in CI:
-```bash
-npm run build
-node tests/unit_mock_p1.mjs
-# local only:
-python3 tests/integration_p1.py
-python3 tests/integration_p1_phase2.py
-```
+`tests/unit_mock_p1.mjs` runs standalone (mock ctx, no dsh needed). Real-Harness integration tests run locally only, not in CI.

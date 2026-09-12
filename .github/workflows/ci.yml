@@ -47,5 +47,4 @@ jobs:
       - name: Python client syntax check
         run: python3 -m py_compile examples/hermes_dsh_mcp.py
 
-      # NOTE: 集成测试 (tests/integration_p1.py, tests/integration_p1_phase2.py)
-      # 需要真实 Harness 实例 + 可用 LLM provider —— 在本地跑，不进 CI。
+      # 集成测试需要真实 Harness 实例 + 可用 LLM provider，仅本地自测，不进 CI。
