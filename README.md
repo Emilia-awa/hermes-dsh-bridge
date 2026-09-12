@@ -422,7 +422,7 @@ python3 examples/hermes_dsh_mcp.py call status_get '{}'   # version 应为 0.7.0
 4. 旧 `sandbox` 相关默认值不变（`workspace-write`），无需迁移数据。
 5. 重做 symlink → 重启 → `node scripts/doctor.mjs`。
 
-完整历史见 [CHANGELOG.md](CHANGELOG.md)。
+完整历史见 [CHANGELOG.md](docs/CHANGELOG.md)。
 
 ---
 
