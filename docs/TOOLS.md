@@ -2,7 +2,7 @@
 
 > **Ground truth**: every parameter table below was checked against the tool's actual
 > `zod` schema and its `validateArgs` spec in `src/index.ts`, and the live `tools/list`
-> output of a running 0.7.0 server. 25 tools are registered by default; `fs_write` is the
+> output of a running 0.8.0 server. 25 tools are registered by default; `fs_write` is the
 > 26th and only appears when the deployment sets `enableFsWrite: true`.
 
 All tools are MCP tools on the StreamableHTTP server (default `http://127.0.0.1:8090/mcp`).

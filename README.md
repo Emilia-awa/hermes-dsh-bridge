@@ -17,7 +17,7 @@ Hermes (MCP client, 大脑)  ──HTTP──▶  harness-mcp-server (:8090)
                                    Harness agent（bash / fs / todo / web… 完整工具集）
 ```
 
-**当前版本 0.7.0**：兼容 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 实测）；26 个工具。
+**当前版本 0.8.0**：兼容 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 实测）；26 个工具。新增 `task_inbox` 终态主动回调（Webhooks / HMAC-SHA256 / SSRF 防护）。
 
 ---
 
@@ -64,7 +64,7 @@ node scripts/doctor.mjs --profile <PROFILE>
 curl -s -X POST http://127.0.0.1:8090/mcp \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"quickstart","version":"1.0"}}}'
-# 期望：data: {... "serverInfo":{"name":"harness","version":"0.7.0"}}
+# 期望：data: {... "serverInfo":{"name":"harness","version":"0.8.0"}}
 
 python3 examples/hermes_dsh_mcp.py list                 # 应列出 25 个工具
 python3 examples/hermes_dsh_mcp.py call echo '{"text":"hi"}'
@@ -376,6 +376,13 @@ Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allo
 ---
 
 ## 升级指南
+
+### 0.7.0 → 0.8.0
+
+**破坏性变更：无。**
+- `task_inbox` 新增可选参数 `notifyUrl` 与 `replyContext`；
+- 任务执行终态支持异步 HTTP POST 回调唤醒，带 HMAC-SHA256 验签与 SSRF 拦截；
+- 历史调用不传 callback 时完全遵循 0.7.0 行为，100% 零破坏兼容。
 
 ### 0.5.x / 0.6.x → 0.7.0
 
