@@ -6,6 +6,8 @@
  *   - harness_list_tools  : 列出 Harness 工具注册表
  *   - agent_run           : 同步执行任务(改代码/分析/跑命令), 返回结构化结果
  *   - task_inbox          : Hermes push 结构化任务(任务+记忆上下文)到 Harness 队列, 异步执行, 返回 taskId
+ *                           v0.8.0: 新增可选 callback —— 任务终态(done/error/cancelled)时主动
+ *                           HTTP POST 回执(带 HMAC 签名/SSRF 防护/超时, 非阻塞), 不传即 v0.7.0 行为
  *   - task_result         : 取回任务的结构化结果(changes/verification/leftovers)
  *   - attach_session      : 把会话归组到其 cwd 对应的工作区(手动补给站)
  *   - rename_session      : 给已有会话改名
@@ -37,6 +39,15 @@
  *     仅影响新建/resume 的会话组合; 池 key 纳入档位防同 cwd 三档互相污染)
  *   - status_get/config_get 新增 sandboxPolicy/审批桥字段; session_list 行可选 sandboxMode
  *
+ *   -- P0 批次新增(v0.8.0: 任务终态主动回调) --
+ *   - task_inbox 新增 callback?: 任务终态后向发起方指定端点 HTTP POST 回执
+ *     (event: task:done|task:error|task:cancelled; X-DSH-Signature HMAC-SHA256 防伪造;
+ *      X-DSH-Timestamp epoch_ms 防重放; replyContext opaque 原样透传用于会话路由唤醒)
+ *   - 安全: 仅 http/https; 私网/链路本地(含云 metadata 169.254.169.254)默认拒绝;
+ *      部署可用 allowedCallbackHosts 显式放行内网端点; 非 2xx 视为投递失败(仅告警不重试不抛错)
+ *   - 兼容: 不传 callback 时 TaskItem 不携带任何回调状态, runner 收尾路径零改动, 返回体与 v0.7.0 一致
+ *   - task_result/task_list/status_get 回显 notify 投递状态(delivered/failed/skipped)
+ *
  * sessionId 续接: 指定 sessionId 时按 本进程池 → live 会话(UI 手开)→ 持久化 resume 三级接管,
  * 前两者都找不到才报错, 所以进程重启前/UI 手开的会话也能续接。
  * 工作区分组: cwd 先 realpath 规范化再 `workspaceRegistry.resolveByPath ?? create` + attachSession;
@@ -65,8 +76,13 @@ import { scopeOf } from '@deepseek-ai/dsh-scope'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
+// [P0 回调] HMAC 签名与恒时比较(防伪造/防时序侧信道)
+import { createHmac, timingSafeEqual } from 'node:crypto'
 import { readdir, readFile, realpath, stat, writeFile, appendFile, mkdir, unlink } from 'node:fs/promises'
 import http from 'node:http'
+import https from 'node:https'
+// [P0 回调] X-DSH-Timestamp 取值(签名材料与重放窗口判定共用同一时钟源)
+import { performance } from 'node:perf_hooks'
 import { zstdDecompressSync } from 'node:zlib'
 import { homedir } from 'node:os'
 import { join as joinPath, resolve, dirname, basename } from 'node:path'
@@ -75,7 +91,7 @@ import { join as joinPath, resolve, dirname, basename } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(status_get 上报; 与 package.json 保持同步) */
-const PLUGIN_VERSION = '0.7.0'
+const PLUGIN_VERSION = '0.8.0'
 
 /**
  * 会话文件权限三档(与 dsh-sandbox 的 SandboxMode 一一对应; 不直接 import 该包, 免新增运行时依赖):
@@ -143,6 +159,12 @@ export interface Config {
   approvalTimeoutMs?: number
   /** 审批文件推送目录(P3 file-push 桥, 默认 ~/.dsh/approvals/)。Hermes 将在该目录下发现 pending_<id>.json 并写 response_<id>.json 回答 */
   approvalFileDir?: string
+  /** [P0 回调] 任务回调全局开关(默认 true; false 时所有 callback 参数直接 skipped, 纯逃生阀) */
+  notifyEnabled?: boolean
+  /** [P0 回调] 默认回调密钥(任务级 callback.secret 缺省时使用; 空=不签名) */
+  defaultCallbackSecret?: string
+  /** [P0 回调] 私网/回环回调目标放行名单(精确 host:port 或 host; 命中即放行 SSRF 私网拦截; 用于本机内网 Hermes 网关) */
+  allowedCallbackHosts?: string[]
 }
 
 /** 运行时配置默认值(apply 时重置再叠加 config, 保证重复 apply 幂等不残留上一次的状态) */
@@ -161,6 +183,10 @@ const runtimeConfigDefaults = () => ({
   approvalsBridge: 'web' as ApprovalsBridge,
   approvalTimeoutMs: 300 * 1000,
   approvalFileDir: joinPath(homedir(), '.dsh', 'approvals'),
+  // [P0 回调] 任务终态主动回调默认值(不传 callback 时零成本: 不构建任何对象/不进任何分支)
+  notifyEnabled: true,
+  defaultCallbackSecret: '',
+  allowedCallbackHosts: [] as string[],
 })
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
@@ -539,6 +565,23 @@ const pageArgSchema = {
   offset: z.number().int().min(0).optional().describe('跳过前 N 条(默认 0; 配合 limit 翻页)'),
   limit: z.number().int().min(1).max(LIST_PAGE_MAX).optional().describe(`本页最多返回条数(默认 ${LIST_PAGE_DEFAULT}, 最大 ${LIST_PAGE_MAX})`),
 }
+
+// ═══════════════════════ P0: 任务终态主动回调 schema(v0.8.0, REQ_CALLBACK_IMPL.md §1) ═══════════════════════
+//
+// 与 REQ §1 的字段逐一对应: url/method/headers/secret/events/replyContext/timeoutMs。
+// - timeoutMs 默认 5000(schema 层 default; resolveCallback 里再做 [1000,30000] 运行时复核);
+// - events 默认 ['done','error']('cancelled' 需显式订阅, 且该事件不含 result —— 收尾时结果已丢弃);
+// - replyContext 为 opaque(z.unknown), 序列化 ≤4KB 在 resolveCallback 里校验(schema 层无法表达);
+// - url 的 SSRF 防护(scheme/私网/metadata/白名单)在 resolveCallback 运行时层做, schema 只挡明显非法。
+const callbackSchema = z.object({
+  url: z.string().url().describe('回调接收地址(仅 http/https; 私网/回环/云 metadata 地址默认拒绝, 内网端点用部署配置 allowedCallbackHosts 放行)'),
+  method: z.enum(['POST', 'PUT']).optional().default('POST').describe('回调 HTTP 方法(默认 POST)'),
+  headers: z.record(z.string(), z.string()).optional().describe('自定义请求头(host/content-length/connection/transfer-encoding 为保留头会被忽略)'),
+  secret: z.string().optional().describe('HMAC-SHA256 签名密钥(缺省用部署配置 defaultCallbackSecret; 两者皆空 = 不签名), 用于在 X-DSH-Signature 头中防伪造'),
+  events: z.array(z.enum(['done', 'error', 'cancelled'])).optional().default(['done', 'error']).describe('订阅哪些终态事件(默认 ["done","error"]; "cancelled" 需显式订阅, 且该事件不含 result)'),
+  replyContext: z.unknown().optional().describe('调用方自定义上下文(如 sessionId/platform 等), opaque 原样在回调载荷 replyContext 字段中回传(序列化后 ≤4KB), 供发起方会话路由/唤醒'),
+  timeoutMs: z.number().int().min(1000).max(30000).optional().default(5000).describe('单次投递超时毫秒(默认 5000, 上限 30000)'),
+})
 
 // fs_write 专用路径 jail(P1): 只允许 workspaceRoots 内的路径(比 fs_read 的 ~/.dsh+工作区 更严),
 // 且拒绝敏感名(.ssh / .env / 含 token / .pem 结尾)。目标文件本身可以尚不存在: 向上找到最近存在祖先做
@@ -985,6 +1028,9 @@ async function executeTask(
 }
 
 /** 异步任务队列(进程内存, 骨架阶段; 后续可持久化) */
+const taskQueue = new Map<string, TaskItem>()
+
+/** 异步任务队列条目 */
 interface TaskItem {
   id: string
   task: string
@@ -1003,8 +1049,346 @@ interface TaskItem {
   error?: string
   createdAt: number
   finishedAt?: number
+  /** [P0 回调] 任务级主动回调配置(仅当调用方传入且解析成功时存在; 不传 = undefined, 收尾路径与 v0.7.0 完全一致) */
+  callback?: TaskCallbackConfig
+  /** [P0 回调] 回调投递状态回显(task_result/task_list/status_get 用; 未配置回调恒 undefined) */
+  notify?: CallbackNotifyState
 }
-const taskQueue = new Map<string, TaskItem>()
+
+/**
+ * [P0 回调] 任务级主动回调配置(task_inbox 新增可选 callback 参数经 schema 校验后的运行时形态)。
+ * 字段语义: url/method/headers/events/secret/replyContext/timeoutMs 与 REQ_CALLBACK_IMPL.md 逐一对应。
+ */
+interface TaskCallbackConfig {
+  url: string
+  method: 'POST' | 'PUT'
+  headers?: Record<string, string>
+  /** HMAC-SHA256 签名密钥(缺省回填部署级 defaultCallbackSecret; 两者皆空 = 不签名并在返回体提示) */
+  secret?: string
+  /** 订阅的终态事件(默认 ['done','error']; 'cancelled' 需显式订阅且不含 result) */
+  events: Array<'done' | 'error' | 'cancelled'>
+  /** 调用方自定义上下文(opaque, 原样放回 payload.replyContext; 用于发起方会话路由/唤醒) */
+  replyContext?: unknown
+  /** 单次投递超时毫秒(默认 5000, schema 限 [1000,30000]) */
+  timeoutMs: number
+}
+
+/** [P0 回调] 投递状态(不可变快照; delivered/failed 均为终态, 状态回显与调度零耦合) */
+interface CallbackNotifyState {
+  /** delivered=2xx 已投递; failed=网络失败/超时/非2xx/SSRF 拒绝(仅告警, 不重试不抛错); skipped=未订阅该事件或全局关闭 */
+  state: 'delivered' | 'failed' | 'skipped'
+  /** 尝试次数(恒 1; P0 无重试) */
+  attempts: number
+  /** 投递完成时刻(epoch ms) */
+  notifiedAt: number
+  /** 失败原因(仅 failed 时存在; 不含 url path/query, 防泄漏) */
+  lastError?: string
+}
+
+// ═══════════════════════ P0: 任务终态主动回调(v0.8.0) ═══════════════════════
+//
+// 设计报告: DESIGN_TASK_CALLBACK.md; 需求: REQ_CALLBACK_IMPL.md。
+// 触发点 = task_inbox 内嵌 runner 收尾处(终态 done/error/cancelled 收敛后), void 异步发射,
+// 绝不阻塞 taskQueue/主任务收尾; 投递失败仅 console.warn, 严禁抛错拖垮主进程。
+// 安全: 仅 http/https; SSRF 私网/链路本地拦截(allowedCallbackHosts 显式放行内网端点);
+//       secret → X-DSH-Signature: sha256=<hex(HMAC_SHA256(secret, ts.body))> 防伪造;
+//       X-DSH-Timestamp(epoch ms, performance.timeOrigin+performance.now())供接收方做重放窗口判定。
+// 兼容: 不传 callback 时 TaskItem 无 callback/notify 字段, runner 收尾路径与 v0.7.0 逐字节一致。
+
+/** 回调 URL 端口显式白名单: 仅 http/https 的默认端口可省略; 其他端口必须显式写出(拒绝奇 scheme 借默认端口伪装) */
+const CALLBACK_ALLOWED_SCHEMES = new Set(['http:', 'https:'])
+
+/** 云 metadata / 链路本地地址: 无合法回调用途, standard 档恒拒(即使部署在云上也应走白名单显式放行) */
+const CALLBACK_METADATA_HOSTS = new Set(['169.254.169.254', 'metadata.google.internal'])
+
+/** 私网/回环判定(CIDR 掩码按位比较; IPv6 只做常见形式前缀判断) */
+const CALLBACK_PRIVATE_RANGES: { net: string; bits: number }[] = [
+  { net: '10.0.0.0', bits: 8 },
+  { net: '172.16.0.0', bits: 12 },
+  { net: '192.168.0.0', bits: 16 },
+  { net: '127.0.0.0', bits: 8 },
+  { net: '169.254.0.0', bits: 16 },
+  { net: '0.0.0.0', bits: 8 },
+  { net: '100.64.0.0', bits: 10 },
+  { net: 'fc00::', bits: 7 },
+  { net: 'fe80::', bits: 10 },
+]
+
+/** IPv4 字符串 → 32 位整数(非法返回 null) */
+function ipv4ToInt(s: string): number | null {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(s)
+  if (!m) return null
+  let n = 0
+  for (let i = 1; i <= 4; i++) {
+    const oct = Number(m[i])
+    if (!Number.isInteger(oct) || oct < 0 || oct > 255) return null
+    n = n * 256 + oct
+  }
+  return n
+}
+
+/** 目标 IP 是否落在私网/回环/链路本地/CGNAT 段 */
+function isPrivateIp(ip: string): boolean {
+  const v4 = ipv4ToInt(ip)
+  if (v4 !== null) {
+    return CALLBACK_PRIVATE_RANGES.some(({ net, bits }) => {
+      const base = ipv4ToInt(net)
+      if (base === null) return false
+      const mask = bits === 0 ? 0 : (0xFFFFFFFF << (32 - bits)) >>> 0
+      return ((v4 >>> 0) & mask) === ((base >>> 0) & mask)
+    })
+  }
+  const low = ip.toLowerCase()
+  return low.startsWith('fc') || low.startsWith('fd') || low.startsWith('fe80')
+}
+
+/**
+ * [P0 回调] SSRF 防护判定(P0 口径, 同步纯函数)。
+ * 返回 undefined = 允许; 字符串 = 拒绝原因(不含原始 url, 防泄漏)。
+ * 规则(REQ §3): 仅 http/https; 私网/回环/链路本地(含 169.254.169.254 云 metadata)默认拒绝;
+ * allowedCallbackHosts(部署配置)显式放行(精确 'host' / 'host:port' / 通配 '*.suffix')。
+ * P0 限制(已知): 域名解析后指向私网的 DNS rebinding 不在此拦截(DNS 解析在 http.request 内部,
+ * 同步入口拿不到解析结果); 需要更强保证的部署请用 allowedCallbackHosts 白名单。
+ */
+function ssrfGuardCheck(rawUrl: string, allowedHosts: readonly string[]): string | undefined {
+  let u: URL
+  try {
+    u = new URL(rawUrl)
+  } catch {
+    return 'callback.url is not a valid absolute URL'
+  }
+  if (!CALLBACK_ALLOWED_SCHEMES.has(u.protocol)) return `callback.url scheme "${u.protocol}" not allowed (http/https only)`
+  const host = (u.hostname || '').toLowerCase()
+  if (!host) return 'callback.url has no host'
+  const port = u.port
+  // 白名单命中 → 直接放行(部署方显式声明的内网端点)
+  if (matchesCallbackAllowlist(host, port, allowedHosts)) return undefined
+  if (CALLBACK_METADATA_HOSTS.has(host)) return `callback host "${host}" is a cloud metadata endpoint (denied; add to allowedCallbackHosts only if intentional)`
+  const ip = ipv4ToInt(host) // 仅字面量 IP 可同步判定; 域名走 http.request 的系统解析(P0 已知限制)
+  if (ip !== null && isPrivateIp(host)) {
+    return `callback host "${host}" is a private/loopback address (denied; use allowedCallbackHosts to allow an internal gateway)`
+  }
+  // 0.0.0.0 / [::] 等未指定地址
+  if (host === '0.0.0.0' || host === '[::]' || host === '::') return 'callback host "0.0.0.0" is not a routable callback target'
+  return undefined
+}
+
+/** [P0 回调] 白名单匹配: 'host' / 'host:port' / '*.suffix'(大小写不敏感; *.suffix 匹配任意子域, 不含 suffix 本身) */
+function matchesCallbackAllowlist(host: string, port: string, allowedHosts: readonly string[]): boolean {
+  for (const raw of allowedHosts) {
+    if (typeof raw !== 'string' || !raw.trim()) continue
+    const entry = raw.trim().toLowerCase()
+    const eHost = entry.includes(':') ? entry.slice(0, entry.indexOf(':')) : entry
+    const ePort = entry.includes(':') ? entry.slice(entry.indexOf(':') + 1) : ''
+    if (eHost.startsWith('*.')) {
+      const suffix = eHost.slice(1) // ".suffix"
+      if (host.endsWith(suffix) && host.length > suffix.length && (!ePort || ePort === port)) return true
+      continue
+    }
+    if (eHost !== host) continue
+    if (ePort && ePort !== port) continue
+    return true
+  }
+  return false
+}
+
+/**
+ * [P0 回调] 解析 task_inbox.callback → 运行时配置(入口一次性完成: schema 已过, 这里只做
+ * SSRF 判定 + secret 缺省回填 + 保留头剔除 + replyContext 序列化体积上限)。
+ * 成功返回 { config, signed }, 失败返回 { error }(文案走 errText 统一句式)。
+ */
+function resolveCallback(raw: unknown): { config?: TaskCallbackConfig; signed?: boolean; error?: string } {
+  if (raw === undefined || raw === null) return {}
+  if (typeof raw !== 'object' || Array.isArray(raw)) return { error: errText('invalid parameter type', 'task_inbox.callback', 'expected object, got ' + (Array.isArray(raw) ? 'array' : typeof raw), 'callback 需为对象 {url, method?, headers?, events?, secret?, replyContext?, timeoutMs?}') }
+  const rec = raw as Record<string, unknown>
+  const url = typeof rec.url === 'string' ? rec.url.trim() : ''
+  if (!url) return { error: errText('missing required parameter', 'task_inbox.callback.url', 'expected string url (http/https), got nothing', '补上 callback.url 后重试') }
+  const ssrf = ssrfGuardCheck(url, runtimeConfig.allowedCallbackHosts)
+  if (ssrf !== undefined) return { error: errText('callback.url rejected by ssrf guard', url.split('?')[0] ?? url, ssrf, '如目标确为内网可信端点, 在部署配置 allowedCallbackHosts 中显式放行') }
+  const method = rec.method === 'PUT' ? 'PUT' : 'POST'
+  const events: Array<'done' | 'error' | 'cancelled'> = Array.isArray(rec.events) && rec.events.length > 0
+    ? (rec.events as unknown[]).filter((e): e is 'done' | 'error' | 'cancelled' => e === 'done' || e === 'error' || e === 'cancelled')
+    : ['done', 'error']
+  if (events.length === 0) return { error: errText('invalid parameter value', 'task_inbox.callback.events', 'no valid event in list (valid: done|error|cancelled)', '从 ["done","error","cancelled"] 里挑选要订阅的终态事件') }
+  // headers: 仅接受 string→string 平面映射; 保留头(host/content-length/connection/transfer-encoding)由运行时固定, 这里剔除
+  let headers: Record<string, string> | undefined
+  if (rec.headers !== undefined && rec.headers !== null) {
+    if (typeof rec.headers !== 'object' || Array.isArray(rec.headers)) return { error: errText('invalid parameter type', 'task_inbox.callback.headers', 'expected object, got ' + (Array.isArray(rec.headers) ? 'array' : typeof rec.headers), 'headers 需为 { "头名": "值" } 的平面对象') }
+    headers = {}
+    for (const [k, v] of Object.entries(rec.headers as Record<string, unknown>)) {
+      if (typeof v !== 'string') continue
+      const name = k.trim()
+      if (!name) continue
+      if (['host', 'content-length', 'connection', 'transfer-encoding'].includes(name.toLowerCase())) continue // 保留头剔除
+      headers[name] = v
+    }
+    if (Object.keys(headers).length === 0) headers = undefined
+  }
+  // secret: 任务级优先, 缺省回填部署级 defaultCallbackSecret
+  const secret = typeof rec.secret === 'string' && rec.secret.length > 0 ? rec.secret : (runtimeConfig.defaultCallbackSecret || undefined)
+  // replyContext: opaque; 序列化体积上限 4KB(序列化失败或超限 → 明确报错, 不静默裁剪)
+  let replyContext: unknown
+  if (rec.replyContext !== undefined) {
+    try {
+      const s = JSON.stringify(rec.replyContext)
+      if (s !== undefined && s.length > 4096) return { error: errText('invalid parameter value', 'task_inbox.callback.replyContext', `serialized size ${s.length} > 4096`, '精简 replyContext 内容后重试(会话路由只需 id 类字段, 无需整段上下文)') }
+    } catch {
+      return { error: errText('invalid parameter value', 'task_inbox.callback.replyContext', 'not JSON-serializable (circular?)', 'replyContext 必须可 JSON 序列化(去掉循环引用后重试)') }
+    }
+    replyContext = rec.replyContext
+  }
+  let timeoutMs = 5000
+  if (rec.timeoutMs !== undefined && rec.timeoutMs !== null) {
+    const t = Number(rec.timeoutMs)
+    if (!Number.isInteger(t) || t < 1000 || t > 30000) return { error: errText('invalid parameter value', 'task_inbox.callback.timeoutMs', `expected int in [1000,30000], got ${String(rec.timeoutMs)}`, 'timeoutMs 取 1000~30000 之间的整数毫秒') }
+    timeoutMs = t
+  }
+  return { config: { url, method, headers, secret, events, replyContext, timeoutMs }, signed: secret !== undefined }
+}
+
+/**
+ * [P0 回调] 组装标准回调 Envelope 载荷(REQ §2 字段逐一对应)。
+ * result 仅 done 且存在时携带(经 truncateResult 裁剪); cancelled 不携带 result/error(收尾时已删);
+ * replyContext opaque 原样回传。
+ */
+function buildCallbackPayload(item: TaskItem): Record<string, unknown> {
+  return {
+    event: `task:${item.status}`,
+    taskId: item.id,
+    sessionId: item.sessionId,
+    title: item.title,
+    status: item.status,
+    createdAt: item.createdAt,
+    finishedAt: item.finishedAt,
+    durationMs: (item.finishedAt ?? Date.now()) - item.createdAt,
+    replyContext: item.callback?.replyContext,
+    // done 的结果经 truncateResult 裁剪(assistantText 8000/toolCalls 50×2000/toolResults 20×2000), 防 payload 超大
+    result: item.status === 'done' && item.result ? truncateResult(item.result) : undefined,
+    error: item.status === 'error' ? item.error : undefined,
+  }
+}
+
+/**
+ * [P0 回调] HMAC-SHA256 签名(secret 存在时)。
+ * 签名材料 = `${timestamp}.${rawBody}`; 时间戳入签 → 接收方校验 X-DSH-Timestamp 窗口即可防重放。
+ */
+function signCallbackPayload(secret: string, timestamp: number, rawBody: string): string {
+  return createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex')
+}
+
+/** [P0 回调] 恒时字符串比较(验签用; 长度不等时直接 false, 不比较) */
+function safeEqualStr(a: string, b: string): boolean {
+  if (a.length !== b.length) return false
+  try {
+    return timingSafeEqual(Buffer.from(a, 'utf8'), Buffer.from(b, 'utf8'))
+  } catch {
+    return false
+  }
+}
+
+/**
+ * [P0 回调] 投递一次回调(http → https): REQ §2 的 sendCallback。
+ * - 2xx 即成功(响应体丢弃式消费, 不解析内容, 防恶意端点借响应注入);
+ * - 超时/网络失败/非 2xx → { delivered:false, error } —— **绝不抛错**;
+ * - 超时实现: req.setTimeout(timeoutMs) + destroy(整体超时, 含连接与响应窗口)。
+ */
+function sendCallback(url: string, method: 'POST' | 'PUT', headers: Record<string, string> | undefined, body: string, timeoutMs: number): Promise<{ delivered: boolean; status?: number; error?: string }> {
+  return new Promise((resolve) => {
+    let settled = false
+    const finish = (r: { delivered: boolean; status?: number; error?: string }) => {
+      if (settled) return
+      settled = true
+      resolve(r)
+    }
+    let u: URL
+    try {
+      u = new URL(url)
+    } catch (e) {
+      finish({ delivered: false, error: `invalid url: ${(e as Error)?.message ?? 'parse failed'}` })
+      return
+    }
+    const req = (u.protocol === 'https:' ? https : http).request(u, {
+      method,
+      headers: {
+        'content-type': 'application/json',
+        'content-length': Buffer.byteLength(body).toString(),
+        ...CALLBACK_BASE_HEADERS,
+        ...(headers ?? {}),
+      },
+      timeout: timeoutMs,
+    }, (res) => {
+      res.resume() // ACK 语义只看状态码; body 丢弃不解析
+      const code = res.statusCode ?? 0
+      const ok = code >= 200 && code < 300
+      finish(ok ? { delivered: true, status: code } : { delivered: false, status: code, error: `non-2xx status ${code}` })
+    })
+    req.on('timeout', () => {
+      req.destroy(new Error(`callback timeout after ${timeoutMs}ms`))
+    })
+    req.on('error', (e) => {
+      finish({ delivered: false, error: (e as Error)?.message ?? 'request failed' })
+    })
+    req.end(body, 'utf8')
+  })
+}
+
+/** 回调投递的固定附加头(集中定义防散落) */
+const CALLBACK_BASE_HEADERS = { 'user-agent': 'hermes-dsh-bridge-task-callback' }
+
+/** [P0 回调] 提取回调 URL 的 host(:port)(日志/回显脱敏用, 不含 path/query) */
+function hostOfCallbackUrl(url: string): string {
+  try {
+    const u = new URL(url)
+    return u.host
+  } catch {
+    return '(invalid-url)'
+  }
+}
+
+/**
+ * [P0 回调] 任务终态回调发射器(runner 收尾处调用; 语义 = REQ §2 的 void sendCallback 非阻塞发射)。
+ * - 未配置/未订阅该终态/全局开关关闭 → item.notify = skipped(或不动);
+ * - 组装 Envelope(REQ §2 字段逐一对应) → 签名(secret 存在时) → sendCallback;
+ * - 结果写回 item.notify(delivered/failed + lastError); **全程 try/catch, 严禁抛错拖垮主进程**。
+ */
+function dispatchTaskCallback(item: TaskItem): void {
+  const cb = item.callback
+  if (!cb) return // 不传 callback 的任务: 收尾路径零改动
+  if (runtimeConfig.notifyEnabled === false) {
+    item.notify = { state: 'skipped', attempts: 0, notifiedAt: Date.now() }
+    return
+  }
+  if (!cb.events.includes(item.status as 'done' | 'error' | 'cancelled')) {
+    item.notify = { state: 'skipped', attempts: 0, notifiedAt: Date.now() }
+    return
+  }
+  let body: string
+  try {
+    body = JSON.stringify(buildCallbackPayload(item))
+  } catch (e) {
+    item.notify = { state: 'failed', attempts: 1, notifiedAt: Date.now(), lastError: `payload serialize failed: ${(e as Error)?.message ?? '?'}` }
+    return
+  }
+  const ts = Math.floor(performance.timeOrigin + performance.now())
+  const signature = cb.secret !== undefined ? signCallbackPayload(cb.secret, ts, body) : undefined
+  // 非阻塞发射(detached async; 网络行为绝不阻塞 runner 与 taskQueue)
+  void (async () => {
+    let outcome: { delivered: boolean; status?: number; error?: string }
+    try {
+      outcome = await sendCallback(cb.url, cb.method, { ...(cb.headers ?? {}), ...(signature !== undefined ? { 'x-dsh-signature': `sha256=${signature}`, 'x-dsh-timestamp': String(ts) } : {}) }, body, cb.timeoutMs)
+    } catch (e) {
+      outcome = { delivered: false, error: (e as Error)?.message ?? 'callback dispatch threw' }
+    }
+    item.notify = outcome.delivered
+      ? { state: 'delivered', attempts: 1, notifiedAt: Date.now() }
+      : { state: 'failed', attempts: 1, notifiedAt: Date.now(), ...(outcome.error !== undefined ? { lastError: outcome.error.slice(0, 200) } : {}) }
+    if (outcome.delivered) {
+      console.log(`[harness-mcp-server] task callback delivered (taskId=${item.id}, event=task:${item.status}, urlHost=${hostOfCallbackUrl(cb.url)})`)
+    } else {
+      console.warn(`[harness-mcp-server] task callback failed (taskId=${item.id}, event=task:${item.status}): ${outcome.error ?? `status ${outcome.status}`}`)
+    }
+  })()
+}
 /** B: 执行中任务 → agent 会话 id(task_cancel 用它定位要中止的 Agent; executeTask onSessionStart 登记) */
 const taskRunSessions = new Map<string, string>()
 
@@ -2166,7 +2550,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
     return out(JSON.stringify(names))
   })
 
-  mcp.tool('status_get', '看服务器现在活着吗、在用什么模型、有没有卡住的活。什么时候用: ① 调工具前先确认 server 健康 ② agent_run 长时间没返回时查 queueActive/activeSessionsCount 看是不是真在忙 ③ 想知道有没有待审的权限申请(pendingApprovals>0 就去 approval_list)。返回 {version,uptimeSec,uptime,startedAt(ISO8601),startedAt_epoch,provider,model,preset,activeSessionsCount,agentsLive,queueActive,sandboxPolicy:{defaultMode,bridge,pendingApprovals},node,pid}。', {}, async () => {
+  mcp.tool('status_get', '看服务器现在活着吗、在用什么模型、有没有卡住的活。什么时候用: ① 调工具前先确认 server 健康 ② agent_run 长时间没返回时查 queueActive/activeSessionsCount 看是不是真在忙 ③ 想知道有没有待审的权限申请(pendingApprovals>0 就去 approval_list)。返回 {version,uptimeSec,uptime,startedAt(ISO8601),startedAt_epoch,provider,model,preset,activeSessionsCount,agentsLive,queueActive,sandboxPolicy:{defaultMode,bridge,pendingApprovals},notify:{enabled,deliveredTotal,failedTotal},node,pid}。', {}, async () => {
     let queueActive = 0
     for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') queueActive++
     let agentsLive = 0
@@ -2174,6 +2558,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       agentsLive = ctx.agents.list().length
     } catch {
       agentsLive = 0
+    }
+    // [P0 回调] 回调投递汇总(仅统计配置了 callback 的任务; deliveredTotal/failedTotal 为运行期累计)
+    let deliveredTotal = 0
+    let failedTotal = 0
+    for (const t of taskQueue.values()) {
+      if (t.notify?.state === 'delivered') deliveredTotal++
+      else if (t.notify?.state === 'failed') failedTotal++
     }
     const uptimeMs = Math.round(process.uptime() * 1000)
     return out(JSON.stringify({
@@ -2193,6 +2584,12 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         defaultMode: runtimeConfig.defaultSandbox,
         bridge: activeBridgeKind,
         pendingApprovals: pendingApprovals.size,
+      },
+      // [P0 回调] 任务终态主动回调运行态(全局开关 + 投递累计; 细节看 task_result/task_list 的 notify)
+      notify: {
+        enabled: runtimeConfig.notifyEnabled !== false,
+        deliveredTotal,
+        failedTotal,
       },
       node: process.version,
       pid: process.pid,
@@ -2222,6 +2619,12 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       approvalsBridge: runtimeConfig.approvalsBridge,
       approvalTimeoutMs: runtimeConfig.approvalTimeoutMs,
       approvalFileDir: runtimeConfig.approvalFileDir,
+      // [P0 回调] 回调通道配置摘要(secret 只回显是否配置, 不泄露值)
+      notify: {
+        enabled: runtimeConfig.notifyEnabled !== false,
+        defaultCallbackSecretSet: Boolean(runtimeConfig.defaultCallbackSecret),
+        allowedCallbackHosts: runtimeConfig.allowedCallbackHosts,
+      },
     }, null, 2))
   })
 
@@ -3214,7 +3617,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 异步 push 任务到队列(Hermes → Harness 任务入口)
   mcp.tool(
     'task_inbox',
-    '【异步队列】把任务丢进队列立刻返回 taskId(不阻塞), 之后自己轮询取结果。适合长任务、或可能需要中途取消的任务。什么时候选它而不是 agent_run: ① 任务可能跑超过 5 分钟(避免 HTTP 调用超时) ② 你想同时推多个任务并行跑 ③ 你希望保留随时取消的能力(task_cancel)。典型流程: task_inbox 拿 taskId → 用 task_result(taskId=...) 轮询 status/result(建议 5~15s 一次, 别高频空转) → done 后取 changes/verification; 中途想停用 task_cancel。返回 {taskId,status:"queued",createdAt(ISO8601),createdAt_epoch,retain,retainMs,pollAdvice,next}——结果默认保留 10 分钟(见 retain), 逾期清理后 task_result 会报 task not found。注意: 不返回结果本身, 只是"已收下"。看队列全貌用 task_list; 任务卡在审批上时用 approval_list → approval_respond 放行。',
+    '【异步队列】把任务丢进队列立刻返回 taskId(不阻塞), 之后自己轮询取结果。适合长任务、或可能需要中途取消的任务。什么时候选它而不是 agent_run: ① 任务可能跑超过 5 分钟(避免 HTTP 调用超时) ② 你想同时推多个任务并行跑 ③ 你希望保留随时取消的能力(task_cancel)。典型流程: task_inbox 拿 taskId → 用 task_result(taskId=...) 轮询 status/result(建议 5~15s 一次, 别高频空转) → done 后取 changes/verification; 中途想停用 task_cancel。v0.8.0 新增主动回调: 传可选 callback{url, secret?, replyContext?, events?, method?, headers?, timeoutMs?} 后, 任务进入终态(done/error/cancelled)时会向你指定的端点 HTTP POST 一条 JSON 回执(event=task:<status>, 含 result 与 replyContext 原样透传), 带 X-DSH-Signature(HMAC-SHA256, 签名材料 "<X-DSH-Timestamp>.<body>")与 X-DSH-Timestamp 头供验签防伪造; 2xx 视为已投递, 失败/超时仅记录不重试、绝不影响任务本身。目标只允许 http/https, 私网/回环/云 metadata 地址默认拒绝(内网网关用部署配置 allowedCallbackHosts 放行)。不传 callback = 与旧版完全一致(纯轮询模式)。返回 {taskId,status:"queued",createdAt(ISO8601),createdAt_epoch,retain,retainMs,notify?,pollAdvice,next}。看队列全貌用 task_list; 任务卡在审批上时用 approval_list → approval_respond 放行。',
     {
       task: z.string().describe('要执行的任务内容(写清楚目标与验收标准)'),
       context: z.string().optional().describe('记忆/上下文, 随任务注入给 agent(这是喂记忆的主入口)'),
@@ -3223,13 +3626,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       title: z.string().optional().describe('新会话的标题(只对新建会话生效, 便于 session_list 归档识别)'),
       preset: z.string().optional().describe('本次任务的 preset 覆盖(合法 id 见 preset_list); 只影响新建/resume'),
       sandbox: z.enum(SANDBOX_MODES).optional().describe('本次任务的文件权限档: read-only | workspace-write(默认) | danger-full-access(仅限可信环境); 只影响新建/resume'),
+      callback: callbackSchema.optional().describe('任务终态主动回调(可选): 任务 done/error/cancelled 后向 url POST 签名 JSON 回执(replyContext 原样透传, X-DSH-Signature HMAC-SHA256 防伪造); 仅 http/https, 私网/metadata 默认拒绝; 不传 = 纯轮询模式, 行为与旧版完全一致'),
     },
-    async ({ task, context, cwd, sessionId, title, preset, sandbox }) => {
+    async ({ task, context, cwd, sessionId, title, preset, sandbox, callback }) => {
       // [r3] C8: 入口参数预校验(必填/类型), 入队前即拒, 不占队列容量
-      const badArgs = validateArgs('task_inbox', { task, context, cwd, sessionId, title, preset, sandbox }, [
+      const badArgs = validateArgs('task_inbox', { task, context, cwd, sessionId, title, preset, sandbox, callback }, [
         { name: 'task', type: 'string', required: true },
         { name: 'context', type: 'string' }, { name: 'cwd', type: 'string' }, { name: 'sessionId', type: 'string' },
         { name: 'title', type: 'string' }, { name: 'preset', type: 'string' }, { name: 'sandbox', type: 'string' },
+        { name: 'callback', type: 'object' },
       ])
       if (badArgs) return out(JSON.stringify({ error: badArgs }))
       // A/P3: 请求级参数预检(入队前即拒, 不占队列容量)
@@ -3240,6 +3645,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
       if (sandbox !== undefined && !(SANDBOX_MODES as readonly string[]).includes(sandbox)) {
         return out(JSON.stringify({ error: `invalid sandbox "${sandbox}"; valid modes: ${SANDBOX_MODES.join('|')}` }))
       }
+      // [P0 回调] 解析 callback(SSRF/保留头/secret 回填/replyContext 4KB 上限; 入队前即拒, 不占队列容量)
+      const cbResolved = resolveCallback(callback)
+      if (cbResolved.error) return out(JSON.stringify({ error: cbResolved.error }))
       const now = Date.now()
       // TTL 清理: 删除已完成/失败/已取消且超时的任务
       for (const [tid, t] of taskQueue) {
@@ -3260,6 +3668,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         ...(title ? { title } : {}),
         ...(preset ? { preset } : {}),
         ...(sandbox !== undefined ? { sandbox } : {}),
+        // [P0 回调] 仅当调用方传入且解析成功时携带; 不传 = 该字段不存在, 收尾路径与 v0.7.0 完全一致
+        ...(cbResolved.config !== undefined ? { callback: cbResolved.config } : {}),
       }
       taskQueue.set(id, item)
       // 异步执行(不阻塞 Hermes)
@@ -3286,6 +3696,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           delete item.error
         }
         item.finishedAt = Date.now()
+        // [P0 回调] 唯一权威触发点(REQ §2): 终态收敛完成后发射; void 非阻塞, 失败仅告警绝不抛错
+        dispatchTaskCallback(item)
       })()
       return out(JSON.stringify({
         taskId: id,
@@ -3295,6 +3707,18 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         retain: formatDuration(runtimeConfig.taskTtlMs),
         createdAt: humanTime(now)?.at,
         createdAt_epoch: now,
+        // [P0 回调] 仅传了 callback 才追加 notify 摘要(不传 = 返回体与 v0.7.0 逐字节一致)
+        ...(cbResolved.config !== undefined
+          ? {
+              notify: {
+                enabled: true,
+                urlHost: hostOfCallbackUrl(cbResolved.config.url),
+                events: cbResolved.config.events,
+                signed: cbResolved.signed === true,
+                ...(cbResolved.signed !== true ? { unsignedReason: 'no secret provided (callback.secret 与部署级 defaultCallbackSecret 均未配置); 接收方无法验签, 建议配置 secret' } : {}),
+              },
+            }
+          : {}),
         pollAdvice: `建议每 5~15s 轮询一次, 别高频空转; 完成后 ${formatDuration(runtimeConfig.taskTtlMs) ?? '10m'} 内取走结果, 过期会被清理`,
         // [r2] B/A: 拿到 id 立刻告诉 agent 怎么取结果(链路自解释)
         next: `用 task_result(taskId="${id}") 轮询结果(建议 5~15s 一次); 队列全貌用 task_list; 想中途取消用 task_cancel(taskId="${id}")`,
@@ -3305,7 +3729,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // 取回任务结果(结构化 changes/verification/leftovers)
   mcp.tool(
     'task_result',
-    '取回 task_inbox 提交的任务当前结果(这是异步链路的第二半: task_inbox 拿 taskId → 用本工具轮询)。什么时候用: task_inbox 返回 taskId 之后; 或 agent_run 场景外想确认某个后台任务好了没。返回 {taskId,status,error,result,createdAt(ISO8601),createdAt_epoch,finishedAt(ISO8601),finishedAt_epoch,waited,landing?}(status ∈ queued|running|done|error|cancelled; result 仅 done 时有, 含 changes/verification/leftovers/assistantText/toolCalls 等)。若结果提到写入了文件却没给绝对路径, 会额外附 landing.hint 指向沙箱 cwd(常见落点)。轮询建议: running 时等几秒再问, 别高频空转; status=done 即可停。任务不见了(task not found)通常是已过期(默认保留 10 分钟)或被取消。看队列全貌用 task_list。',
+    '取回 task_inbox 提交的任务当前结果(这是异步链路的第二半: task_inbox 拿 taskId → 用本工具轮询)。什么时候用: task_inbox 返回 taskId 之后; 或 agent_run 场景外想确认某个后台任务好了没。返回 {taskId,status,error,result,createdAt(ISO8601),createdAt_epoch,finishedAt(ISO8601),finishedAt_epoch,waited,notify?,landing?}(status ∈ queued|running|done|error|cancelled; result 仅 done 时有, 含 changes/verification/leftovers/assistantText/toolCalls 等)。若结果提到写入了文件却没给绝对路径, 会额外附 landing.hint 指向沙箱 cwd(常见落点)。notify 是任务终态主动回调的投递状态(仅提交时传了 callback 才有): delivered=回执已被接收端 2xx 确认; failed=投递失败(看 lastError, 不影响任务本身); skipped=未订阅该事件或回调被部署配置关闭。轮询建议: running 时等几秒再问, 别高频空转; status=done 即可停。任务不见了(task not found)通常是已过期(默认保留 10 分钟)或被取消。看队列全貌用 task_list。',
     { taskId: z.string().describe('task_inbox 返回的 taskId(也可从 task_list 的 tasks[].id 取)') },
     async ({ taskId }) => {
       try {
@@ -3326,6 +3750,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           ...(item.finishedAt !== undefined ? timeFields('finishedAt', item.finishedAt) : {}),
           ...(item.finishedAt !== undefined ? { waitedMs: item.finishedAt - item.createdAt, waited: formatDuration(item.finishedAt - item.createdAt) } : {}),
           result: item.result ? truncateResult(item.result) : undefined,
+          // [P0 回调] 投递状态回显(仅配置了 callback 的任务才有; 未配置 = 不追加该字段, 输出与 v0.7.0 一致)
+          ...(item.callback !== undefined ? { notify: { ...item.notify } } : {}),
           ...(landing !== undefined ? { landing } : {}),
           // [r2] A + [r3] B4: 按状态给下一步, 免得 agent 无脑轮询或误以为失败
           ...(done
@@ -3345,7 +3771,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P1: 任务队列快照(task_list) ──
   mcp.tool(
     'task_list',
-    '看异步任务队列的全貌(有哪些排队/在跑/已完成的)。什么时候用: ① task_result 报 task not found, 来这里确认是不是已过期 ② 不记得 taskId 了, 按标题/cwd 找 ③ 确认没有僵尸任务在跑。与 status_get 的区别: 这里列出每一条任务明细, status_get 只给一个 queueActive 总数。返回 {total,active,count,offset,limit,truncated,next?,tasks:[{id,status,createdAt(ISO8601),createdAt_epoch,finishedAt(ISO8601),finishedAt_epoch,waited?,error?,title?,preset?,sandbox?,cwd,sessionId?,hasResult}]}(新任务在前, 默认最多 20 条, 超 20 条用 offset/limit 翻页; status ∈ queued|running|done|error|cancelled)。取具体结果用 task_result(taskId=...)。',
+    '看异步任务队列的全貌(有哪些排队/在跑/已完成的)。什么时候用: ① task_result 报 task not found, 来这里确认是不是已过期 ② 不记得 taskId 了, 按标题/cwd 找 ③ 确认没有僵尸任务在跑。与 status_get 的区别: 这里列出每一条任务明细, status_get 只给一个 queueActive 总数。返回 {total,active,count,offset,limit,truncated,next?,tasks:[{id,status,createdAt(ISO8601),createdAt_epoch,finishedAt(ISO8601),finishedAt_epoch,waited?,error?,title?,preset?,sandbox?,cwd,sessionId?,hasResult,notify?}]}(新任务在前, 默认最多 20 条, 超 20 条用 offset/limit 翻页; status ∈ queued|running|done|error|cancelled; notify 仅提交时传了 callback 的任务才有, 见 task_result 说明)。取具体结果用 task_result(taskId=...)。',
     { ...pageArgSchema },
     async ({ offset, limit }) => {
       try {
@@ -3374,6 +3800,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           cwd: t.cwd,
           ...(t.sessionId ? { sessionId: t.sessionId } : {}),
           hasResult: Boolean(t.result),
+          // [P0 回调] 投递状态回显(仅配置了 callback 的任务才有; 未配置 = 不追加该字段)
+          ...(t.callback !== undefined ? { notify: { ...t.notify } } : {}),
         }))
         return out(JSON.stringify({
           total: meta.total,
@@ -3549,6 +3977,28 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   if (config.approvalFileDir !== undefined && typeof config.approvalFileDir === 'string' && config.approvalFileDir.trim()) {
     runtimeConfig.approvalFileDir = config.approvalFileDir
   }
+  // [P0 回调] 回调通道配置(非法值告警回落默认, 不阻断启动)
+  if (config.notifyEnabled !== undefined) {
+    if (typeof config.notifyEnabled === 'boolean') {
+      runtimeConfig.notifyEnabled = config.notifyEnabled
+    } else {
+      console.warn(`[harness-mcp-server] invalid notifyEnabled ${String(config.notifyEnabled)}, keep default true (expected boolean)`)
+    }
+  }
+  if (config.defaultCallbackSecret !== undefined) {
+    if (typeof config.defaultCallbackSecret === 'string') {
+      runtimeConfig.defaultCallbackSecret = config.defaultCallbackSecret
+    } else {
+      console.warn('[harness-mcp-server] invalid defaultCallbackSecret, keep default "" (expected string)')
+    }
+  }
+  if (config.allowedCallbackHosts !== undefined) {
+    if (Array.isArray(config.allowedCallbackHosts) && config.allowedCallbackHosts.every((h) => typeof h === 'string')) {
+      runtimeConfig.allowedCallbackHosts = [...config.allowedCallbackHosts]
+    } else {
+      console.warn('[harness-mcp-server] invalid allowedCallbackHosts, keep default [] (expected string[])')
+    }
+  }
 
   const port = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
@@ -3668,4 +4118,7 @@ export const __internals = {
   humanTime, timeFields, formatBytes, formatDuration, parsePage, pageEnvelope,
   fileLandingHint, extractAbsPaths,
   SESSION_LOG_MAX_EVENTS, LIST_PAGE_DEFAULT, LIST_PAGE_MAX,
+  // [P0 回调] 纯函数通道: SSRF/解析/签名/载荷可被单测直接断言, 不依赖网络时序
+  ssrfGuardCheck, resolveCallback, buildCallbackPayload, signCallbackPayload, safeEqualStr, hostOfCallbackUrl,
+  VERSION: PLUGIN_VERSION,
 }

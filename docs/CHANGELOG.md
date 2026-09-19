@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-09-19
+
+### Added
+- **Task Callback System (P0 & P1)**:
+  - `task_inbox` supports optional `notifyUrl` and `replyContext` parameters for event-driven wakeups.
+  - Asynchronous HTTP Webhook notification with HMAC-SHA256 signature verification (`X-Signature-256`, `X-Timestamp`).
+  - Strict SSRF protection and DNS pin caching to prevent rebinding attacks.
+  - File beacon push mechanism (`notify_<taskId>.json`) for local environments.
+  - 100% backward compatible for users without callback configs.
+
 ## [0.7.0] - 2026-09-13 — R4: 安装体验与文档 (开箱即用)
 
 R4 目标：用户拿到包之后 **README 5 分钟内跑通、每个报错都能自查、AI agent 装也能一次成功**。

@@ -7,3 +7,8 @@ dist/
 *.tsbuildinfo
 __pycache__/
 *.pyc
+*.bak*
+DESIGN_TASK_CALLBACK.md
+DISCUSS_CALLBACK_DESIGN.md
+REQ_CALLBACK_IMPL.md
+tests/
