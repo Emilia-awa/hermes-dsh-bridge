@@ -17,7 +17,7 @@ Hermes (MCP client, 大脑)  ──HTTP──▶  harness-mcp-server (:8090)
                                    Harness agent（bash / fs / todo / web… 完整工具集）
 ```
 
-**当前版本 0.8.0**：兼容 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 实测）；26 个工具。新增 `task_inbox` 终态主动回调（Webhooks / HMAC-SHA256 / SSRF 防护）。
+**当前版本 0.8.1**：兼容 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 实测）；26 个工具。新增 `task_inbox` 终态主动回调（Webhooks / HMAC-SHA256 / SSRF 防护）。
 
 ---
 

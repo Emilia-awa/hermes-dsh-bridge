@@ -4,6 +4,11 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-09-19
+
+### Fixed
+- Sync version string in README, docs and index to 0.8.1.
+
 ## [0.8.0] - 2026-09-19
 
 ### Added
