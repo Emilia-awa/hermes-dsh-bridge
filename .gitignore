@@ -12,3 +12,14 @@ DESIGN_TASK_CALLBACK.md
 DISCUSS_CALLBACK_DESIGN.md
 REQ_CALLBACK_IMPL.md
 tests/
+
+# 内部工作文件（需求书/报告/探针，不随包发布）
+REQ_*.md
+RESEARCH_*.md
+REPORT_*.md
+PLAN_*.md
+README_DOCS_REQ.md
+.probe_r1/
+.mutation_backup.*
+evidence_*.txt
+*.tgz

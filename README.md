@@ -17,7 +17,11 @@ Hermes (MCP client, 大脑)  ──HTTP──▶  harness-mcp-server (:8090)
                                    Harness agent（bash / fs / todo / web… 完整工具集）
 ```
 
-**当前版本 0.8.1**：兼容 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.5-rc.2** 实测）；26 个工具。新增 `task_inbox` 终态主动回调（Webhooks / HMAC-SHA256 / SSRF 防护）。
+**当前版本 `0.9.0`**：兼容 **dsh ≥ 0.1.2-rc.1**（已在 **0.1.7-rc.2** 与 **0.1.5-rc.2** 实测）；
+**25 个工具**（`enableFsWrite: true` 时为 26 个）。
+本版重点：**会话列表快 20–100 倍**（见[性能](#性能会话列表提速)）、
+`task_inbox` 终态主动回调（Webhooks / HMAC-SHA256 / SSRF 防护）、
+**`callbackPreset` 部署级回调预设**（配一次，之后一行派发）。
 
 ---
 
@@ -64,7 +68,8 @@ node scripts/doctor.mjs --profile <PROFILE>
 curl -s -X POST http://127.0.0.1:8090/mcp \
   -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"quickstart","version":"1.0"}}}'
-# 期望：data: {... "serverInfo":{"name":"harness","version":"0.8.0"}}
+# 期望：data: {... "serverInfo":{"name":"harness","version":"0.9.0"}}
+#       version 应等于你安装的插件版本（`npm ls hermes-dsh-bridge` 或 README 顶部的当前版本）
 
 python3 examples/hermes_dsh_mcp.py list                 # 应列出 25 个工具
 python3 examples/hermes_dsh_mcp.py call echo '{"text":"hi"}'
@@ -80,11 +85,34 @@ python3 examples/hermes_dsh_mcp.py run '回复:安装成功'   # 真跑一次 ag
 | 依赖 | 要求 | 检查命令 | 不满足会怎样 |
 |---|---|---|---|
 | **Node.js** | **≥ 22.18** | `node --version` | 缺 `zstd` / `stripTypeScriptTypes`，dsh 或插件直接启动失败 |
-| **dsh** | **≥ 0.1.2-rc.1**（实测 0.1.5-rc.2） | `dsh --version` | 旧 API：会话存储契约不符、`session_list` 崩溃；v0.5.0 及更早只兼容 dsh ≤ 0.1.1-rc.2 |
+| **dsh** | **≥ 0.1.2-rc.1**（已在 **0.1.7-rc.2** 与 0.1.5-rc.2 实测） | `dsh --version` | 旧 API：会话存储契约不符、`session_list` 崩溃；v0.5.0 及更早只兼容 dsh ≤ 0.1.1-rc.2。**0.1.7 有 MessageSourceMap 变更**，见下方兼容性说明 |
 | **Harness profile** | 已用 `dsh --profile <name>` 启动过一次 | `ls ~/.dsh/profiles/` | 没有 profile 目录可装 |
 | **Harness 全局树** | 含 `@deepseek-ai/*` 包 | `npm root -g` | symlink 修复无从下手 → dual-package hazard |
 | **LLM provider** | profile 的 `cordis.patch.yml` 里已配好 `llm-*` 段 | `grep -n 'llm-' ~/.dsh/profiles/<PROFILE>/cordis.patch.yml` | agent 组装崩：`prompt variable "{{model}}" has no value` 或 `MISSING_CREDENTIAL` |
 | **bubblewrap**（可选） | 宿主机装了才能跑受限 bash | `which bwrap` | `workspace-write` 档下写命令被拒（读命令仍可用） |
+
+### dsh 0.1.7 兼容性（重要）
+
+本版已在 **dsh 0.1.7-rc.2** 上完整验证（25 个工具实测全通），同时保持对 0.1.2 / 0.1.5 的兼容。
+0.1.7 有两处需要知道的变化：
+
+**① `MessageSourceMap` 收紧了 message source 的合法取值。**
+0.1.7 只接受 `user | model | tool | system-prompt`（官方注释明写 *"there is no shared
+catch-all `plugin` kind"*）。旧代码用 `source: { kind: 'plugin', plugin: '...' }` 构造
+user message，在 0.1.7 下被判非法、**静默丢弃** —— 结果是 **agent 秒退、0 token、完全没有任何报错**
+（异常被 loop 的 `kick()` 里 `catch (_error) {}` 吞掉）。本版已改为官方的
+`source: { kind: 'user' }`（与 `dsh-headless` / `dsh-acp` 的调用点一致）。
+
+> ⚠️ **如果你 fork 了本插件并保留了自己的 `kind: 'plugin'`**，升级 dsh 到 0.1.7 后会遇到上述
+> 静默空跑。症状与排查步骤见
+> [docs/TROUBLESHOOTING.md → agent 秒退 + 0 token + 零报错](docs/TROUBLESHOOTING.md#agent-秒退--0-token--无任何报错--messagesourcemap)。
+
+**② 会话查询新增了官方服务，本版会优先使用它。**
+0.1.7 提供 `ctx.sessionQuery`（`dsh-session-query` / `-sqlite`）。插件在运行时**探测**该服务：
+拿得到就用它做会话列表（只读 header，快很多），拿不到就自动回退到 0.1.2/0.1.5 的
+`sessionPersistence` 路径 —— **不做版本号硬判断，旧版不会因此报错**。
+官方全文索引默认是关闭的（`openAt: "never"`），所以 `session_search` 默认仍走内置扫描；
+详见[性能](#性能会话列表提速)与 [docs/CONFIG.md](docs/CONFIG.md)。
 
 ### Hermes 端配置片段
 
@@ -199,7 +227,8 @@ DSH_MCP_TOKEN=xxx node scripts/doctor.mjs    # 开了 authToken 的部署
 
 ### 本机真实运行输出（作为预期输出示例）
 
-以下是在本机（Node v22.22.3 / dsh 0.1.5-rc.2，插件确实装在该 profile）实际跑出来的原文：
+以下是在本机（Node v22.22.3 / dsh 0.1.7-rc.2，插件确实装在该 profile）实际跑出来的原文
+（版本号随发版变化，`version=` 应等于你装的插件版本）：
 
 ```console
 $ node scripts/doctor.mjs --profile web
@@ -207,7 +236,7 @@ $ node scripts/doctor.mjs --profile web
   ✓ Node 版本 — v22.22.3 (需要 >= v22.18.0)
 
 dsh
-  ✓ dsh 可执行 + 版本 — dsh 0.1.5-rc.2 (本插件需要 >= 0.1.2-rc.1; 已在 0.1.5-rc.2 实测)
+  ✓ dsh 可执行 + 版本 — dsh 0.1.7-rc.2 (本插件需要 >= 0.1.2-rc.1; 已在 0.1.7-rc.2 实测)
   ✓ dsh profile 存在 — /root/.dsh/profiles/web (--profile 指定)
   ✓ dsh settings 文件 — /root/.dsh/settings.yaml
   ✓ profile patch 已配置插件 — /root/.dsh/profiles/web/cordis.patch.yml → - id: harness-mcp-server
@@ -216,7 +245,7 @@ dsh
 
 运行时
   ✓ 8090 端口监听 — 127.0.0.1:8090 已监听
-  ✓ MCP 握手 — serverInfo.name=harness version=0.5.0
+  ✓ MCP 握手 — serverInfo.name=harness version=0.9.0
   ✓ tools/list 工具可用 — 25 个工具(期望 25~26; 含 agent_run, session_stats, preset_set, fs_read, approval_respond)
 
 ────────────────────────────────────────────────────────────
@@ -241,9 +270,9 @@ dsh
 
 ---
 
-## 工具（26 个）
+## 工具（默认 25 个，开 fs_write 后 26 个）
 
-默认注册 **25 个**；`enableFsWrite: true` 时多一个 `fs_write`。
+默认注册 **25 个**（`tools/list` 实测 25）；`enableFsWrite: true` 时多一个 `fs_write`，共 26 个。
 
 | 分类 | 工具 |
 |---|---|
@@ -256,6 +285,12 @@ dsh
 | 元 | `echo`、`harness_list_tools` |
 
 完整的入参表 / 返回字段 / 错误码见 **[docs/TOOLS.md](docs/TOOLS.md)**。
+
+> **`session_list` 的 `detail` 参数**：默认 `detail: "brief"`，只回
+> `id / title / cwd / createdAt / updatedAt / sizeBytes / live`，**不读会话日志**（所以快）。
+> 需要 `messageCount` / `inputTokens` / `outputTokens` / `llmTime` / `sandboxMode` 时传
+> `detail: "full"`（会逐行读日志，较慢）。`brief` 下行里带 `tokensAvailable: false`，
+> 表示"统计未计算"，**不要当成 0**。
 
 ### 典型闭环
 
@@ -287,6 +322,117 @@ Hermes 记忆 ──context──▶ task_inbox ──▶ Harness agent 执行 �
   }
 }
 ```
+
+### 免轮询：`callbackPreset` 部署级回调预设
+
+`task_inbox` 支持任务终态回调（HTTP POST + HMAC-SHA256 签名），但**每次调用都手写整坨
+callback 很容易漏字段 —— 而漏了不会报错，回调就是静默不到**。所以本版提供部署级预设：
+**在配置里配一次，之后派发只传每次都变的那点东西。**
+
+**第一步：部署配置里配一次**（`cordis.patch.yml`）：
+
+```yaml
+- insert:
+    - id: hermes-dsh-bridge
+      name: 'hermes-dsh-bridge'
+      config:
+        allowedCallbackHosts: ["127.0.0.1:8644"]   # 回调是回环地址，必须在白名单里放行
+        defaultCallbackSecret: "<与接收方共用的 HMAC 密钥>"
+        callbackPreset:
+          url: "http://127.0.0.1:8644/webhooks/dsh-task-done"
+          headers:
+            X-Gitlab-Token: "<同一个共用密钥>"        # 接收方要求的鉴权头
+          events: []                                 # [] = 订阅全部终态事件
+          replyContext:
+            origin: hermes                           # 静态路由字段放这里
+            platform: qqbot
+          requireReplyRoute: true                    # 回调无法路由时直接报错，而不是投错地方
+```
+
+**第二步：之后派发就一行。**
+
+```jsonc
+// 以前：url / secret / headers / events / replyContext 一个都不能漏
+// 现在：
+{"task": "把 README 的安装章节改好", "callback": {"replyContext": {"replyChatId": "123456789"}}}
+```
+
+甚至**什么都不传**也会自动套用预设（`autoApply` 默认 `true`）：
+
+```jsonc
+{"task": "跑一遍回归测试"}
+```
+
+**合并语义**（每个字段都是 `任务级 → 预设 → 内置默认`）：
+
+| 字段 | 合并方式 |
+|---|---|
+| `url` / `method` / `timeoutMs` | 任务级优先，缺省用预设，再缺省用内置默认 |
+| `headers` | **浅合并**：任务级同名键覆盖预设，其余保留 |
+| `events` | 任务级优先。**显式 `[]` = 订阅全部**；不传才用预设的值 |
+| `replyContext` | **深合并一层**：静态键（`origin`/`platform`）留在预设里，每次变的键（`replyChatId`）由任务传，两边自动合到一起 |
+| `secret` | **不在预设里** —— 唯一来源是 `defaultCallbackSecret` 或任务级 `callback.secret` |
+
+`requireReplyRoute: true` 时，若合并后的 `replyContext` 里没有任何 `*ChatId` 字段，
+调用会被**明确拒绝**并告诉你怎么补。建议开启：接收方按 `replyContext` 路由时
+（Hermes 就是渲染 `deliver_extra.chat_id = "{replyContext.replyChatId}"`），
+值缺失的后果是把字面量字符串当成聊天 ID 投出去 —— 比报错更难查。
+
+> **向后兼容**：不配 `callbackPreset` 时行为与旧版**完全一致**（不传 callback 就不回调）。
+> 预设也**不放宽任何安全策略** —— SSRF 校验作用在合并之后的 URL 上，预设地址同样要在
+> `allowedCallbackHosts` 里。完整字段表见 [docs/CONFIG.md](docs/CONFIG.md#callbackpreset--configure-the-callback-once)。
+
+---
+
+## 性能：会话列表提速
+
+`session_list` / `session_search` 在**大会话库**上曾经很慢 —— 慢到会被客户端判成挂死。
+
+**旧版（0.8.1）实测**（本机 197 个会话 / 80MB / 27 个工作目录）：
+
+| 调用 | 0.8.1 耗时 |
+|---|---|
+| `session_list{limit:1}` | **≈ 13 s** |
+| `session_list{limit:10}` | ≈ 15 s |
+| `session_list{limit:50}` | **≈ 31 s** |
+| `session_search{query:"test"}` | ≈ 8 s |
+
+客户端若设 20 s 超时，`limit=50` 就是「永远不返回」。而且 `limit=1` 也要 13 s ——
+因为耗时大头在**全量扫描**，与返回条数无关。
+
+**根因**：旧实现为每一行会话调用 `sessionPersistence.stat(id)` 来取排序键，
+而 jsonl 后端的 `stat()` 是 **O(项目目录数)** 的（内部要遍历整棵树），
+197 次 × ≈50 ms ≈ 9.3 s；再加上逐行读取整条事件流算 `messageCount`/token，越翻越慢。
+
+**本版修复后**（同一台机器，200 个会话）：
+
+| 调用 | 本版耗时 | 提升 |
+|---|---|---|
+| `session_list{limit:1}` | **< 1.5 s**（实测 ~0.3 s） | **约 40×** |
+| `session_list{limit:50}` | **< 3 s**（实测 ~0.3 s） | **约 100×** |
+| `session_search{query:"test"}` | 实测 ~0.6 s | 约 14× |
+
+**关键变化：耗时不再随会话库规模增长。** `limit=1` 与 `limit=50` 现在是同一量级 ——
+下面这张表就是老用户升级后最直观的差别：
+
+| 会话库规模 | 0.8.1 `limit=1` | 本版 `limit=1` |
+|---|---|---|
+| ~50 会话 | 数秒 | < 1 s |
+| ~100 会话 | 约 7–10 s | < 1.5 s |
+| ~200 会话 | 约 13 s | < 1.5 s |
+| > 500 会话 | 数十秒（客户端多半已超时） | 仍在秒级 |
+
+怎么做到的（想深入了解再看）：
+
+1. **一次拿全量 header**：dsh 0.1.7 上走官方 `ctx.sessionQuery.listSessions()`（只读 header），
+   拿不到就回退 `sessionPersistence.list()` —— 两者都是"读元数据"，不读事件流。
+2. **排序键不再逐条 `stat()`**：改成整批解析落盘 mtime，找不到就用 `createdAt` 兜底。
+3. **行级字段按需**：默认 `detail: "brief"` **完全不读事件流**；要 `messageCount`/token
+   统计才传 `detail: "full"`，且只对当前这一页做，并发 4、单会话 3 s 超时。
+
+> **升级提示**：如果你之前的代码依赖 `session_list` 默认返回 `messageCount` / `inputTokens` /
+> `outputTokens`，请改传 `detail: "full"`（或接受默认 `brief` 下的 `tokensAvailable: false`）。
+> 详见 [docs/TOOLS.md → session_list](docs/TOOLS.md#session_list)。
 
 ---
 
@@ -358,9 +504,21 @@ Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allo
 | `sessionId mismatch: <approvalId>` | `approval_respond` 的 `sessionId` 与该审批不匹配 | 用 `approval_list` 里**同一行**的 `sessionId` 重试 |
 | 审批一直挂起不返回 | 没人在回答；超时前会一直等 | `approval_list` 看 `pending`（>0 就回答）；`status_get.sandboxPolicy.pendingApprovals` 也能一眼看到 |
 | `TRANSPORT: terminated` 中途断流 | LLM provider 抖了一下，流断 | **用同一个 `sessionId` 续接**，不要新开会话（新会话会重读所有代码） |
+| **agent 秒退 + 0 token + 零报错** | dsh 0.1.7 起 message source 只收 `user\|model\|tool\|system-prompt`；自改代码里若仍是 `kind:'plugin'` 会被静默丢弃 | 改用 `source: { kind: 'user' }`。详见 [TROUBLESHOOTING](docs/TROUBLESHOOTING.md#agent-秒退--0-token--无任何报错--messagesourcemap) |
+| `session_list` 没有 `messageCount`/token 字段 | 本版默认 `detail: "brief"`，不读会话日志（所以快） | 需要统计就传 `detail: "full"`；`brief` 行的 `tokensAvailable: false` 表示"未计算"，不是 0 |
 | `assistantText` 只到 ~8000 字符 | 结果字段有意限长（`assistantText` ≤ 8000，`toolCalls` ≤ 50×2000，`toolResults` ≤ 20×2000） | 用 `session_log(sessionId=..., preset="dialog")` 取完整文本 |
 | `rename_session` 报 `sessionTitle service unavailable` | 该部署没加载会话标题服务 | 不影响其他功能；改用 `agent_run(title=...)` 在创建时命名 |
 | `workspaceRegistry unavailable` | 该部署没加载工作区注册表服务 | 不影响任务执行；`attach_session`（纯整理）不可用而已 |
+
+### dsh 0.1.7 用户升级注意
+
+dsh 自身从 0.1.5 升到 0.1.7 **不需要迁移会话数据**，插件侧也不需要你做任何配置改动。
+只有两点变化值得知道：
+
+| 变化 | 影响 | 你要做什么 |
+|---|---|---|
+| **`MessageSourceMap` 只收 `user\|model\|tool\|system-prompt`** | 官方插件若仍用 `kind: 'plugin'` 构造 message，会被静默丢弃 → **agent 秒退、0 token、零报错** | 用官方发行版则无需处理（本版已改用 `kind: 'user'`）。**自己 fork 改过代码**的请看 [TROUBLESHOOTING](docs/TROUBLESHOOTING.md#agent-秒退--0-token--无任何报错--messagesourcemap) |
+| **新增 `ctx.sessionQuery` 会话查询服务** | 插件运行时探测：有就用（会话列表更快），没有就回退旧路径 | 无需处理。若想启用官方全文索引搜索，见 [docs/CONFIG.md](docs/CONFIG.md) 的 `session-query-sqlite` 说明（默认关闭） |
 
 ### 0.1.5 用户从旧版升级特别注意
 
@@ -376,6 +534,31 @@ Hermes: approval_list() 轮询 → approval_respond(approvalId, sessionId, 'allo
 ---
 
 ## 升级指南
+
+### 0.8.1 → `0.9.0`
+
+**破坏性变更：无（但有一处默认行为变化，见下）。** 升级后建议看一眼：
+
+**① `session_list` 默认变快，但默认字段变少。**
+默认 `detail: "brief"` 不再返回 `messageCount` / `inputTokens` / `outputTokens` /
+`llmTime` / `sandboxMode`（这些字段要读整条会话日志，正是旧版慢的原因）。
+如果你的代码依赖它们，加一个参数即可：
+
+```diff
+- session_list(cwd="/root")
++ session_list(cwd="/root", detail="full")
+```
+
+`brief` 模式下每行会带 `tokensAvailable: false`，明确表示"统计未计算"，不会伪造成 0。
+同时新增 `source`（实际用了哪个后端）与 `skippedNoCwd`（因缺 `cwd` 未参与过滤的行数）。
+
+**② 老的 callback 写法不变，但有了更省事的选项。**
+`callback.events: []` 以前会被拒绝，现在表示**订阅全部终态事件**（与接收方 webhook 语义一致）。
+新增 `callbackPreset` 部署级预设：配一次之后 `task_inbox` 可以只传
+`{"callback": {"replyContext": {"replyChatId": "..."}}}`，甚至完全不传 callback。
+**不配 `callbackPreset` 时行为与旧版逐字节一致。**
+
+**③ 兼容性**：dsh 0.1.2 / 0.1.5 / 0.1.7 都可继续用，无需改配置。
 
 ### 0.7.0 → 0.8.0
 
@@ -436,7 +619,7 @@ python3 examples/hermes_dsh_mcp.py call status_get '{}'   # version 应为 0.7.0
 ## 文档
 
 - [docs/CONFIG.md](docs/CONFIG.md) — 全部配置字段（与代码逐字段核对）、安全默认值、可复制示例
-- [docs/TOOLS.md](docs/TOOLS.md) — 26 个工具的完整参考（入参表 / 返回字段 / 错误码）
+- [docs/TOOLS.md](docs/TOOLS.md) — 25/26 个工具的完整参考（入参表 / 返回字段 / 错误码）
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 深度排障（SSE 解析、8KB 截断、dual-package hazard…）
 - [docs/KNOWN_ISSUES.md](docs/KNOWN_ISSUES.md) — 已发现但本轮不修的缺陷（含真实默认值口径）
 - [docs/SECURITY.md](docs/SECURITY.md) — 威胁模型

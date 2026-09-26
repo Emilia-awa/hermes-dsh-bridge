@@ -91,7 +91,7 @@ import { join as joinPath, resolve, dirname, basename } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(status_get 上报; 与 package.json 保持同步) */
-const PLUGIN_VERSION = '0.8.1'
+const PLUGIN_VERSION = '0.9.0'
 
 /**
  * 会话文件权限三档(与 dsh-sandbox 的 SandboxMode 一一对应; 不直接 import 该包, 免新增运行时依赖):
@@ -165,6 +165,109 @@ export interface Config {
   defaultCallbackSecret?: string
   /** [P0 回调] 私网/回环回调目标放行名单(精确 host:port 或 host; 命中即放行 SSRF 私网拦截; 用于本机内网 Hermes 网关) */
   allowedCallbackHosts?: string[]
+  /**
+   * [r1 回调预设] 部署级默认回调(task_inbox 不传 callback, 或只传部分字段时自动套用; 任务级覆盖部署级)。
+   * 目的: 把"url/headers/events/replyContext 每次手写、漏一个就静默失效"收敛成配一次。
+   * 不配 = 与旧版完全一致(零行为变化)。
+   */
+  callbackPreset?: CallbackPresetConfig
+}
+
+/**
+ * [r1] 部署级回调预设(PLAN_r1 §2.3)。
+ * 注意: **不设 secret 字段**(裁决 D7) —— secret 是安全凭据, 唯一权威来源是 defaultCallbackSecret;
+ * 需要自定义头(如 Hermes 只认的 X-Gitlab-Token)时用 headers 显式承载。
+ * 预设**不放宽任何安全策略**(裁决 D9): SSRF 守卫在合并之后照常执行。
+ */
+export interface CallbackPresetConfig {
+  /** 默认回调接收地址(有了它, 调用方可以完全不传 callback) */
+  url?: string
+  /** 默认 HTTP 方法(默认 POST) */
+  method?: 'POST' | 'PUT'
+  /** 默认请求头(与任务级 headers 浅合并, 任务级同名覆盖; 保留头一律剔除) */
+  headers?: Record<string, string>
+  /** 默认订阅事件(缺省 = ['done','error']; 显式 [] = 订阅全部, 对齐 Hermes 桥侧语义) */
+  events?: Array<'done' | 'error' | 'cancelled'>
+  /** 默认 replyContext(与任务级 replyContext 深合并一层, 任务级优先; 静态字段放这里) */
+  replyContext?: Record<string, unknown>
+  /** 默认投递超时毫秒(默认 5000, 范围 [1000,30000]) */
+  timeoutMs?: number
+  /** 是否允许"不传 callback"也自动套用预设(默认 true) */
+  autoApply?: boolean
+  /**
+   * (可选, 默认 false)是否强制要求本次回调能解析出路由字段。
+   * 背景: Hermes 侧已按 replyContext 路由(deliver_extra.chat_id = {replyContext.replyChatId}),
+   * 而 Hermes 模板取不到值时会**原样返回字面量串**当 chat_id → 静默误投。开启本项后,
+   * 若合并结果里没有任何 *ChatId/chatId 字段则直接报错, 用一次配置换掉一整类静默故障。
+   */
+  requireReplyRoute?: boolean
+}
+
+/** [r1] config_get 用的预设摘要(只回显结构, 绝不回显 secret / header 值) */
+function describeCallbackPreset(): Record<string, unknown> {
+  const p = runtimeConfig.callbackPreset
+  if (!p || p.url === undefined) return { configured: false }
+  return {
+    configured: true,
+    url: p.url,
+    method: p.method ?? 'POST',
+    // [r1] 头名走与投递同款的净化(保留头会被剔除), 避免回显与实际投递不一致
+    headerNames: Object.keys(sanitizeCallbackHeaders(p.headers) ?? {}),
+    events: p.events ?? ['done', 'error'],
+    timeoutMs: p.timeoutMs ?? 5000,
+    hasReplyContext: p.replyContext !== undefined,
+    replyContextKeys: Object.keys(p.replyContext ?? {}),
+    autoApply: p.autoApply !== false,
+    requireReplyRoute: p.requireReplyRoute === true,
+  }
+}
+
+/**
+ * [r1] 部署配置校验: 非法 callbackPreset 一律回落到"未配置"(并告警), 不阻断启动。
+ * 逐字段校验, 任何一项类型不对就整体判非法 —— 回调配置错配会导致静默失效, 宁可显式告警。
+ * @returns 规范化后的预设; undefined = 非法
+ */
+function normalizeCallbackPreset(raw: unknown): CallbackPresetConfig | undefined {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return undefined
+  const r = raw as Record<string, unknown>
+  const out: CallbackPresetConfig = {}
+  if (r.url !== undefined) {
+    if (typeof r.url !== 'string' || !r.url.trim()) return undefined
+    out.url = r.url.trim()
+  }
+  if (r.method !== undefined) {
+    if (r.method !== 'POST' && r.method !== 'PUT') return undefined
+    out.method = r.method
+  }
+  if (r.headers !== undefined) {
+    if (typeof r.headers !== 'object' || r.headers === null || Array.isArray(r.headers)) return undefined
+    if (!Object.values(r.headers as Record<string, unknown>).every((v) => typeof v === 'string')) return undefined
+    out.headers = { ...(r.headers as Record<string, string>) }
+  }
+  if (r.events !== undefined) {
+    if (!Array.isArray(r.events) || !r.events.every((e) => e === 'done' || e === 'error' || e === 'cancelled')) return undefined
+    out.events = [...(r.events as Array<'done' | 'error' | 'cancelled'>)]
+  }
+  if (r.replyContext !== undefined) {
+    if (typeof r.replyContext !== 'object' || r.replyContext === null || Array.isArray(r.replyContext)) return undefined
+    out.replyContext = { ...(r.replyContext as Record<string, unknown>) }
+  }
+  if (r.timeoutMs !== undefined) {
+    const t = Number(r.timeoutMs)
+    if (!Number.isInteger(t) || t < 1000 || t > 30000) return undefined
+    out.timeoutMs = t
+  }
+  if (r.autoApply !== undefined) {
+    if (typeof r.autoApply !== 'boolean') return undefined
+    out.autoApply = r.autoApply
+  }
+  if (r.requireReplyRoute !== undefined) {
+    if (typeof r.requireReplyRoute !== 'boolean') return undefined
+    out.requireReplyRoute = r.requireReplyRoute
+  }
+  // 完全不配 url 的预设没有任何意义(不会触发任何回调), 视为"未配置"
+  if (out.url === undefined) return undefined
+  return out
 }
 
 /** 运行时配置默认值(apply 时重置再叠加 config, 保证重复 apply 幂等不残留上一次的状态) */
@@ -187,6 +290,8 @@ const runtimeConfigDefaults = () => ({
   notifyEnabled: true,
   defaultCallbackSecret: '',
   allowedCallbackHosts: [] as string[],
+  // [r1] 部署级回调预设默认不配(undefined = 与旧版完全一致; 配了才生效)
+  callbackPreset: undefined as CallbackPresetConfig | undefined,
 })
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
@@ -261,6 +366,10 @@ const SESSION_LOG_MAX_CHARS = 60 * 1024 // session_log 全局输出上限
 const SESSION_LOG_MAX_EVENTS = 50 // [r3] A1: session_log 默认事件条数上限(超限返回首尾 + truncated)
 const SESSION_LOG_HEAD_EVENTS = 5 // [r3] A1: 截断时额外保留的最旧事件数
 const SESSION_LIST_MAX_ROWS = 50 // session_list 行数硬上限
+// [r1] B2: session_list detail:'full' 时逐行检视的并发度与单会话超时。
+// 并发 4 与官方 SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY 对齐(PLAN_r1 §1.7 B2)。
+const SESSION_LIST_INSPECT_CONCURRENCY = 4
+const SESSION_LIST_INSPECT_TIMEOUT_MS = 3000
 const DEFAULT_LOG_TYPES = ['user/message', 'assistant/message', 'tool/call', 'tool/result']
 
 /** 工具回调统一返回 MCP text content */
@@ -569,18 +678,24 @@ const pageArgSchema = {
 // ═══════════════════════ P0: 任务终态主动回调 schema(v0.8.0, REQ_CALLBACK_IMPL.md §1) ═══════════════════════
 //
 // 与 REQ §1 的字段逐一对应: url/method/headers/secret/events/replyContext/timeoutMs。
-// - timeoutMs 默认 5000(schema 层 default; resolveCallback 里再做 [1000,30000] 运行时复核);
-// - events 默认 ['done','error']('cancelled' 需显式订阅, 且该事件不含 result —— 收尾时结果已丢弃);
 // - replyContext 为 opaque(z.unknown), 序列化 ≤4KB 在 resolveCallback 里校验(schema 层无法表达);
 // - url 的 SSRF 防护(scheme/私网/metadata/白名单)在 resolveCallback 运行时层做, schema 只挡明显非法。
+// - [r1] **url / method / events / timeoutMs 一律不设 schema 层 .default()**:
+//   部署级回调预设(callbackPreset)必须能区分"调用方没传"(→ 用预设值)与"调用方显式传了"
+//   (→ 任务级优先, 含 events:[] 这种"显式空"), schema 的 default 会把两者压成同一个值, 必须先去掉。
+//   缺省语义统一在 resolveCallback 里按"任务级 > 预设 > 内置默认"三级回落(PLAN_r1 §2.4)。
 const callbackSchema = z.object({
-  url: z.string().url().describe('回调接收地址(仅 http/https; 私网/回环/云 metadata 地址默认拒绝, 内网端点用部署配置 allowedCallbackHosts 放行)'),
-  method: z.enum(['POST', 'PUT']).optional().default('POST').describe('回调 HTTP 方法(默认 POST)'),
-  headers: z.record(z.string(), z.string()).optional().describe('自定义请求头(host/content-length/connection/transfer-encoding 为保留头会被忽略)'),
+  // [r1] url 在 schema 层必须是 **optional**: MCP SDK 在进入 handler 之前就按 schema 校验,
+  // 若这里写 required, 那么"部署配了 callbackPreset.url、调用方只传 replyContext"这条路径
+  // 会被 SDK 直接以 -32602 拒掉, 根本走不到 resolveCallback 里的预设合并。
+  // 真正的"必须能解析出 url"约束下沉到 resolveCallback(合并后仍为空才报错)。
+  url: z.string().url().optional().describe('回调接收地址(仅 http/https; 私网/回环/云 metadata 地址默认拒绝, 内网端点用部署配置 allowedCallbackHosts 放行); 若部署配置了 callbackPreset.url 则可不传'),
+  method: z.enum(['POST', 'PUT']).optional().describe('回调 HTTP 方法(默认取部署预设, 否则 POST)'),
+  headers: z.record(z.string(), z.string()).optional().describe('自定义请求头(host/content-length/connection/transfer-encoding 为保留头会被忽略; 与部署预设浅合并, 任务级同名覆盖)'),
   secret: z.string().optional().describe('HMAC-SHA256 签名密钥(缺省用部署配置 defaultCallbackSecret; 两者皆空 = 不签名), 用于在 X-DSH-Signature 头中防伪造'),
-  events: z.array(z.enum(['done', 'error', 'cancelled'])).optional().default(['done', 'error']).describe('订阅哪些终态事件(默认 ["done","error"]; "cancelled" 需显式订阅, 且该事件不含 result)'),
-  replyContext: z.unknown().optional().describe('调用方自定义上下文(如 sessionId/platform 等), opaque 原样在回调载荷 replyContext 字段中回传(序列化后 ≤4KB), 供发起方会话路由/唤醒'),
-  timeoutMs: z.number().int().min(1000).max(30000).optional().default(5000).describe('单次投递超时毫秒(默认 5000, 上限 30000)'),
+  events: z.array(z.enum(['done', 'error', 'cancelled'])).optional().describe('订阅哪些终态事件(缺省取部署预设, 否则 ["done","error"]; 传 [] = 订阅全部, 对齐 Hermes 桥侧语义; "cancelled" 该事件不含 result)'),
+  replyContext: z.unknown().optional().describe('调用方自定义上下文(如 replyChatId/platform 等), opaque 原样在回调载荷 replyContext 字段中回传(序列化后 ≤4KB), 供发起方会话路由/唤醒; 与部署预设深合并(任务级优先)'),
+  timeoutMs: z.number().int().min(1000).max(30000).optional().describe('单次投递超时毫秒(缺省取部署预设, 否则 5000; 上限 30000)'),
 })
 
 // fs_write 专用路径 jail(P1): 只允许 workspaceRoots 内的路径(比 fs_read 的 ~/.dsh+工作区 更严),
@@ -951,7 +1066,11 @@ async function executeTask(
     ].filter(Boolean).join('\n')
 
     handle.agent.followup(
-      createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'plugin', plugin: 'harness-mcp-server' } }),
+      // dsh 0.1.7: MessageSourceMap 只剩 user|model|tool|system-prompt 四种(注释明写
+      // "there is no shared catch-all `plugin` kind"); 插件自带的 kind:'plugin' 会被判非法,
+      // message 被静默丢弃 → agent 0 token 空跑(loop 的 kick() 里 catch(_error){} 吞掉异常)。
+      // 官方调用点(dsh-headless / dsh-acp)全部用 source:{kind:'user'}。
+      createUserMessage({ content: [{ type: 'text', text: fullTask }], source: { kind: 'user' } }),
     )
     await handle.agent.whenIdle()
 
@@ -1065,7 +1184,11 @@ interface TaskCallbackConfig {
   headers?: Record<string, string>
   /** HMAC-SHA256 签名密钥(缺省回填部署级 defaultCallbackSecret; 两者皆空 = 不签名并在返回体提示) */
   secret?: string
-  /** 订阅的终态事件(默认 ['done','error']; 'cancelled' 需显式订阅且不含 result) */
+  /**
+   * 订阅的终态事件。缺省 ['done','error']; 'cancelled' 需显式订阅且不含 result。
+   * [r1] 空数组 `[]` = **订阅全部**(对齐 Hermes 桥侧 events:[] 语义, 裁决 D6);
+   * 判定见 dispatchTaskCallback: `events.length === 0 || events.includes(status)`。
+   */
   events: Array<'done' | 'error' | 'cancelled'>
   /** 调用方自定义上下文(opaque, 原样放回 payload.replyContext; 用于发起方会话路由/唤醒) */
   replyContext?: unknown
@@ -1195,55 +1318,192 @@ function matchesCallbackAllowlist(host: string, port: string, allowedHosts: read
 /**
  * [P0 回调] 解析 task_inbox.callback → 运行时配置(入口一次性完成: schema 已过, 这里只做
  * SSRF 判定 + secret 缺省回填 + 保留头剔除 + replyContext 序列化体积上限)。
- * 成功返回 { config, signed }, 失败返回 { error }(文案走 errText 统一句式)。
+ * [r1] 增加部署级预设(callbackPreset)支持: 合并语义为"任务级 > 预设 > 内置默认"(PLAN_r1 §2.4),
+ *      SSRF 守卫**置于合并之后**(预设不放宽任何安全策略, 裁决 D9)。
+ * 成功返回 { config, signed, source }, 失败返回 { error }(文案走 errText 统一句式)。
  */
-function resolveCallback(raw: unknown): { config?: TaskCallbackConfig; signed?: boolean; error?: string } {
-  if (raw === undefined || raw === null) return {}
+function resolveCallback(raw: unknown): { config?: TaskCallbackConfig; signed?: boolean; source?: CallbackSource; error?: string } {
+  // [r1] 预设必须是"启用状态"才参与合并(autoApply === false 视为不存在)
+  const preset = runtimeConfig.callbackPreset?.autoApply === false ? undefined : runtimeConfig.callbackPreset
+
+  // [r1] 入口分支重写: 旧版是 `raw == null → {}`(直接不回调)。现在若部署配了预设 url,
+  // "不传 callback" 也应当自动套用预设 —— 这正是本议题要的"配一次, 之后一行调用"。
+  if (raw === undefined || raw === null) {
+    if (preset?.url) return finishResolvedCallback(buildPresetOnlyConfig(preset), 'preset')
+    return {}
+  }
   if (typeof raw !== 'object' || Array.isArray(raw)) return { error: errText('invalid parameter type', 'task_inbox.callback', 'expected object, got ' + (Array.isArray(raw) ? 'array' : typeof raw), 'callback 需为对象 {url, method?, headers?, events?, secret?, replyContext?, timeoutMs?}') }
   const rec = raw as Record<string, unknown>
-  const url = typeof rec.url === 'string' ? rec.url.trim() : ''
-  if (!url) return { error: errText('missing required parameter', 'task_inbox.callback.url', 'expected string url (http/https), got nothing', '补上 callback.url 后重试') }
+  // [r1] 空对象 {} 同样视为"没传" → 套预设(调用方只想用预设但 schema 要求提供 callback 对象时)
+  if (Object.keys(rec).length === 0 && preset?.url) {
+    return finishResolvedCallback(buildPresetOnlyConfig(preset), 'preset')
+  }
+
+  // ── url: 任务级 > 预设 ──
+  const taskUrl = typeof rec.url === 'string' ? rec.url.trim() : ''
+  const url = taskUrl || (preset?.url ?? '')
+  if (!url) {
+    return {
+      error: errText('missing required parameter', 'task_inbox.callback.url', 'expected string url (http/https), got nothing',
+        '补上 callback.url 后重试; 或在部署配置里设 callbackPreset.url, 之后不传 callback 也能发回调'),
+    }
+  }
+  // SSRF 判定: 用【合并后】的 url(预设的 url 同样要过守卫; 白名单仍是唯一放行手段)
   const ssrf = ssrfGuardCheck(url, runtimeConfig.allowedCallbackHosts)
   if (ssrf !== undefined) return { error: errText('callback.url rejected by ssrf guard', url.split('?')[0] ?? url, ssrf, '如目标确为内网可信端点, 在部署配置 allowedCallbackHosts 中显式放行') }
-  const method = rec.method === 'PUT' ? 'PUT' : 'POST'
-  const events: Array<'done' | 'error' | 'cancelled'> = Array.isArray(rec.events) && rec.events.length > 0
-    ? (rec.events as unknown[]).filter((e): e is 'done' | 'error' | 'cancelled' => e === 'done' || e === 'error' || e === 'cancelled')
-    : ['done', 'error']
-  if (events.length === 0) return { error: errText('invalid parameter value', 'task_inbox.callback.events', 'no valid event in list (valid: done|error|cancelled)', '从 ["done","error","cancelled"] 里挑选要订阅的终态事件') }
-  // headers: 仅接受 string→string 平面映射; 保留头(host/content-length/connection/transfer-encoding)由运行时固定, 这里剔除
-  let headers: Record<string, string> | undefined
-  if (rec.headers !== undefined && rec.headers !== null) {
-    if (typeof rec.headers !== 'object' || Array.isArray(rec.headers)) return { error: errText('invalid parameter type', 'task_inbox.callback.headers', 'expected object, got ' + (Array.isArray(rec.headers) ? 'array' : typeof rec.headers), 'headers 需为 { "头名": "值" } 的平面对象') }
-    headers = {}
-    for (const [k, v] of Object.entries(rec.headers as Record<string, unknown>)) {
-      if (typeof v !== 'string') continue
-      const name = k.trim()
-      if (!name) continue
-      if (['host', 'content-length', 'connection', 'transfer-encoding'].includes(name.toLowerCase())) continue // 保留头剔除
-      headers[name] = v
+
+  const usedPresetUrl = !taskUrl
+  // ── method: 任务级 > 预设 > POST ──
+  const method: 'POST' | 'PUT' = rec.method === 'PUT' ? 'PUT' : rec.method === 'POST' ? 'POST' : (preset?.method ?? 'POST')
+  // ── events: 任务级(含显式 []) > 预设 > ['done','error'] ──
+  // [r1] 修复现状矛盾(裁决 D6): events === [] 合法 = 订阅全部(对齐 Hermes 桥侧 events:[] 语义)。
+  // 旧实现把 [] 判成"无效列表"直接报错, 而文档/实际调用方都传 []。
+  let events: Array<'done' | 'error' | 'cancelled'>
+  if (Array.isArray(rec.events)) {
+    // 显式传了(含 []): 过滤出合法项; 过滤后为空且原数组非空 → 说明全是非法值, 报错
+    const filtered = (rec.events as unknown[]).filter((e): e is 'done' | 'error' | 'cancelled' => e === 'done' || e === 'error' || e === 'cancelled')
+    if (filtered.length === 0 && rec.events.length > 0) {
+      return { error: errText('invalid parameter value', 'task_inbox.callback.events', 'no valid event in list (valid: done|error|cancelled)', '从 ["done","error","cancelled"] 里挑选要订阅的终态事件, 或传 [] 订阅全部') }
     }
-    if (Object.keys(headers).length === 0) headers = undefined
+    events = filtered // [] 合法: 表示订阅全部
+  } else if (preset?.events !== undefined) {
+    events = [...preset.events]
+  } else {
+    events = ['done', 'error']
   }
-  // secret: 任务级优先, 缺省回填部署级 defaultCallbackSecret
+  // ── headers: 浅合并(一层 key 覆盖), 任务级优先; 合并后再整体剔除保留头 ──
+  const headers = mergeCallbackHeaders(preset?.headers, sanitizeCallbackHeaders(rec.headers))
+  if (rec.headers !== undefined && rec.headers !== null && (typeof rec.headers !== 'object' || Array.isArray(rec.headers))) {
+    return { error: errText('invalid parameter type', 'task_inbox.callback.headers', 'expected object, got ' + (Array.isArray(rec.headers) ? 'array' : typeof rec.headers), 'headers 需为 { "头名": "值" } 的平面对象') }
+  }
+  // secret: 任务级优先, 缺省回填部署级 defaultCallbackSecret(预设不参与 —— 裁决 D7: 唯一权威来源)
   const secret = typeof rec.secret === 'string' && rec.secret.length > 0 ? rec.secret : (runtimeConfig.defaultCallbackSecret || undefined)
-  // replyContext: opaque; 序列化体积上限 4KB(序列化失败或超限 → 明确报错, 不静默裁剪)
+  // replyContext: 预设与任务级**深合并一层**, 任务级优先
   let replyContext: unknown
-  if (rec.replyContext !== undefined) {
+  const merged = mergeReplyContext(preset?.replyContext, rec.replyContext)
+  if (merged !== undefined) {
+    // [r1] 防"把 Hermes 模板串直接塞进来"这类误用(取不到值时 Hermes 会原样当 chat_id → 静默误投)
+    const literalTemplate = findLiteralTemplateValue(merged)
+    if (literalTemplate !== undefined) {
+      return { error: errText('invalid parameter value', 'task_inbox.callback.replyContext', `field "${literalTemplate}" is a literal template placeholder`, '这里要填真实值, 不是 {replyContext.xxx} 模板串; 模板只在 Hermes 订阅配置里写') }
+    }
     try {
-      const s = JSON.stringify(rec.replyContext)
+      const s = JSON.stringify(merged)
       if (s !== undefined && s.length > 4096) return { error: errText('invalid parameter value', 'task_inbox.callback.replyContext', `serialized size ${s.length} > 4096`, '精简 replyContext 内容后重试(会话路由只需 id 类字段, 无需整段上下文)') }
     } catch {
       return { error: errText('invalid parameter value', 'task_inbox.callback.replyContext', 'not JSON-serializable (circular?)', 'replyContext 必须可 JSON 序列化(去掉循环引用后重试)') }
     }
-    replyContext = rec.replyContext
+    replyContext = merged
   }
-  let timeoutMs = 5000
+  // [r1] 路由字段守卫(默认关闭, 需部署显式 requireReplyRoute:true)
+  if (preset?.requireReplyRoute === true && !hasReplyRouteField(replyContext)) {
+    return { error: errText('invalid parameter value', 'task_inbox.callback.replyContext', 'no chat routing field (expected *ChatId/chatId)', '本次回调无法路由到目标会话(Hermes 侧按 replyContext.replyChatId 路由); 在 callback.replyContext 里补上 replyChatId') }
+  }
+  let timeoutMs = preset?.timeoutMs ?? 5000
   if (rec.timeoutMs !== undefined && rec.timeoutMs !== null) {
     const t = Number(rec.timeoutMs)
     if (!Number.isInteger(t) || t < 1000 || t > 30000) return { error: errText('invalid parameter value', 'task_inbox.callback.timeoutMs', `expected int in [1000,30000], got ${String(rec.timeoutMs)}`, 'timeoutMs 取 1000~30000 之间的整数毫秒') }
     timeoutMs = t
   }
-  return { config: { url, method, headers, secret, events, replyContext, timeoutMs }, signed: secret !== undefined }
+  const source: CallbackSource = preset?.url !== undefined ? (usedPresetUrl ? 'preset' : 'preset+task') : 'task'
+  return { config: { url, method, headers, secret, events, replyContext, timeoutMs }, signed: secret !== undefined, source }
+}
+
+/** [r1] 回调配置的实际来源(用于 task_inbox 返回体自解释) */
+export type CallbackSource = 'preset' | 'preset+task' | 'task'
+
+/** [r1] 只用预设构造配置(调用方完全没传 callback 的路径) */
+function buildPresetOnlyConfig(preset: CallbackPresetConfig): TaskCallbackConfig | undefined {
+  const url = preset.url
+  if (!url) return undefined
+  const secret = runtimeConfig.defaultCallbackSecret || undefined
+  return {
+    url,
+    method: preset.method ?? 'POST',
+    headers: sanitizeCallbackHeaders(preset.headers),
+    secret,
+    events: preset.events !== undefined ? [...preset.events] : ['done', 'error'],
+    replyContext: preset.replyContext,
+    timeoutMs: preset.timeoutMs ?? 5000,
+  }
+}
+
+/** [r1] 预设路径的统一收尾(SSRF 守卫 + 体积校验与任务级路径同款, 预设不放宽任何策略) */
+function finishResolvedCallback(config: TaskCallbackConfig | undefined, source: CallbackSource): { config?: TaskCallbackConfig; signed?: boolean; source?: CallbackSource; error?: string } {
+  if (!config) return {}
+  const ssrf = ssrfGuardCheck(config.url, runtimeConfig.allowedCallbackHosts)
+  if (ssrf !== undefined) return { error: errText('callback.url rejected by ssrf guard', config.url.split('?')[0] ?? config.url, ssrf, '如目标确为内网可信端点, 在部署配置 allowedCallbackHosts 中显式放行') }
+  if (config.replyContext !== undefined) {
+    const literalTemplate = findLiteralTemplateValue(config.replyContext)
+    if (literalTemplate !== undefined) {
+      return { error: errText('invalid parameter value', 'callbackPreset.replyContext', `field "${literalTemplate}" is a literal template placeholder`, '部署预设的 replyContext 要填真实值; {replyContext.xxx} 模板串只写在 Hermes 订阅配置里') }
+    }
+    try {
+      const s = JSON.stringify(config.replyContext)
+      if (s !== undefined && s.length > 4096) return { error: errText('invalid parameter value', 'callbackPreset.replyContext', `serialized size ${s.length} > 4096`, '精简部署预设的 replyContext 内容(会话路由只需 id 类字段)') }
+    } catch {
+      return { error: errText('invalid parameter value', 'callbackPreset.replyContext', 'not JSON-serializable (circular?)', '部署预设的 replyContext 必须可 JSON 序列化') }
+    }
+  }
+  if (runtimeConfig.callbackPreset?.requireReplyRoute === true && !hasReplyRouteField(config.replyContext)) {
+    return { error: errText('invalid parameter value', 'callbackPreset.replyContext', 'no chat routing field (expected *ChatId/chatId)', '本次回调无法路由到目标会话; 在 callbackPreset.replyContext 里配静态 chat id, 或每次调用时传 callback.replyContext.replyChatId') }
+  }
+  return { config, signed: config.secret !== undefined, source }
+}
+
+/** [r1] headers 净化: 仅接受 string→string 平面映射, 剔除保留头(host/content-length/connection/transfer-encoding) */
+function sanitizeCallbackHeaders(raw: unknown): Record<string, string> | undefined {
+  if (raw === undefined || raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const out: Record<string, string> = {}
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    if (typeof v !== 'string') continue
+    const name = k.trim()
+    if (!name) continue
+    if (CALLBACK_RESERVED_HEADERS.includes(name.toLowerCase())) continue // 保留头剔除
+    out[name] = v
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/** [r1] headers 浅合并: 任务级同名覆盖预设; 任一侧缺失就取另一侧(合并后再净化一次, 防预设里夹带保留头) */
+function mergeCallbackHeaders(
+  base: Record<string, string> | undefined,
+  override: Record<string, string> | undefined,
+): Record<string, string> | undefined {
+  if (base === undefined && override === undefined) return undefined
+  const merged: Record<string, string> = { ...(base ?? {}), ...(override ?? {}) }
+  return sanitizeCallbackHeaders(merged)
+}
+
+/** [r1] replyContext 深合并(一层): 两侧都是平面对象才逐键合并(任务级优先), 否则任务级整体覆盖 */
+function mergeReplyContext(base: unknown, override: unknown): unknown {
+  if (override === undefined) return base
+  if (base === undefined) return override
+  const isPlain = (v: unknown): v is Record<string, unknown> =>
+    typeof v === 'object' && v !== null && !Array.isArray(v)
+  if (!isPlain(base) || !isPlain(override)) return override
+  return { ...base, ...override }
+}
+
+/** [r1] 检测形如 "{replyContext.xxx}" 的字面量模板串(Hermes 模板取不到值时会原样当值用 → 静默误投) */
+function findLiteralTemplateValue(value: unknown): string | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof v === 'string' && /^\{[\w.]+\}$/.test(v.trim())) return k
+  }
+  return undefined
+}
+
+/** [r1] replyContext 里是否存在聊天路由字段(键名含 chatid, 大小写与分隔符不敏感; Hermes 用 replyChatId) */
+function hasReplyRouteField(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    // 归一化: chat_id / chat-id / chatId / replyChatId / REPLY_CHAT_ID 都算
+    if (!k.toLowerCase().replace(/[_-]/g, '').includes('chatid')) continue
+    if (typeof v === 'string' && v.trim() !== '') return true
+    if (typeof v === 'number' && Number.isFinite(v)) return true
+  }
+  return false
 }
 
 /**
@@ -1335,6 +1595,9 @@ function sendCallback(url: string, method: 'POST' | 'PUT', headers: Record<strin
 /** 回调投递的固定附加头(集中定义防散落) */
 const CALLBACK_BASE_HEADERS = { 'user-agent': 'hermes-dsh-bridge-task-callback' }
 
+/** [r1] 回调自定义头里的保留头(由运行时固定, 一律剔除; 部署预设与任务级都适用) */
+const CALLBACK_RESERVED_HEADERS = ['host', 'content-length', 'connection', 'transfer-encoding']
+
 /** [P0 回调] 提取回调 URL 的 host(:port)(日志/回显脱敏用, 不含 path/query) */
 function hostOfCallbackUrl(url: string): string {
   try {
@@ -1358,7 +1621,8 @@ function dispatchTaskCallback(item: TaskItem): void {
     item.notify = { state: 'skipped', attempts: 0, notifiedAt: Date.now() }
     return
   }
-  if (!cb.events.includes(item.status as 'done' | 'error' | 'cancelled')) {
+  // [r1] 事件订阅判定(D6): events === [] 表示"订阅全部"(对齐 Hermes 桥侧 events:[] 语义)
+  if (!(cb.events.length === 0 || cb.events.includes(item.status as 'done' | 'error' | 'cancelled'))) {
     item.notify = { state: 'skipped', attempts: 0, notifiedAt: Date.now() }
     return
   }
@@ -1516,6 +1780,256 @@ async function listMergedHeaders(ctx: Context): Promise<{ headers: Map<string, S
     if (!headers.has(String(row.header.id))) headers.set(String(row.header.id), row.header)
   }
   return { headers, skipped }
+}
+
+// ═══════════════════════ [r1] 会话列表快路径: listCorpus + batchUpdatedAt ═══════════════════════
+//
+// 背景(PLAN_r1 §1.2–§1.5, 主控实测): 旧路径 session_list 会逐条 roughUpdatedAt → persistedRowMeta
+// → persistence.stat(id), 而宿主 jsonl 后端的 stat() 是 **O(项目目录数)** 的(内部 findLog 遍历
+// 所有 project dir): 本机 30 个目录 × 197 个会话 = 9.3s, 仅 limit=1 就要 10.18s。
+// 且 locate() 恒用当前格式版本(4)拼文件名, 忽略会话实际落盘 generation, 本机 198 个会话里
+// 186 个(94%)返回的路径根本不存在。
+// 修法: ① 整批拿 header(0.1.7 走官方 sessionQuery.listSessions(), 否则 persistence.list());
+//       ② mtime 整批拿, 逐条 stat() 一律不调; ③ 任何失败都不能让整表崩, 兜底 header.createdAt。
+
+/** [r1] 官方 sessionQuery 的最小结构视图(运行时探测, 不做版本号硬判断 → 保 0.1.2/0.1.5 兼容) */
+interface SessionQueryView {
+  /** 官方 live 优先全量列表(只读 header, 不读事件流); 不存在时插件回退 persistence 路径 */
+  listSessions?: (signal?: AbortSignal) => Promise<readonly unknown[]>
+  /** 官方索引搜索(openAt:'never' 或索引未就绪时会抛错, 调用方必须静默回退) */
+  searchSessions?: (request: unknown, exec?: unknown) => Promise<unknown>
+}
+
+/** [r1] 取 ctx.sessionQuery(探测式; 未挂载返回 undefined —— 0.1.2/0.1.5 无此服务) */
+function sessionQueryOf(ctx: Context): SessionQueryView | undefined {
+  try {
+    const q = ctx.get('sessionQuery') as SessionQueryView | undefined
+    return q && typeof q === 'object' ? q : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** [r1] 一条会话语料行: header + 免费排序键(sizeBytes 来自 list(), mtime 来自批量探测) */
+interface CorpusRow {
+  header: SessionHeader
+  /** 该 id 当前是否存在于 ctx.sessions(live) */
+  live: boolean
+  /** 排序键: live 末事件 time > 盘上 mtime > header.createdAt */
+  updatedAt: number
+  /** 物理落盘字节数(list() 免费提供; 拿不到则缺省) */
+  sizeBytes?: number
+}
+
+/** [r1] 项目目录名编码: header.cwd → 物理目录名。
+ *  实测本机布局为 `--<cwd 去前导 / 且 / → ->--`, 且 '@' 会被编码成 '~0040'
+ *  (例: /root/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server
+ *   → --root-.dsh-profiles-web-node_modules-~0040chushixixin-dsh-harness-mcp-server--)。
+ *  这是宿主私有布局的 best-effort 推导: 推错只会让该行退回 createdAt, 不影响正确性。 */
+function projectDirNameOf(cwd: string): string | undefined {
+  try {
+    const trimmed = cwd.replace(/^\/+/, '').replace(/\/+$/, '')
+    if (!trimmed) return undefined
+    return '--' + trimmed.replace(/\//g, '-').replace(/@/g, '~0040') + '--'
+  } catch {
+    return undefined
+  }
+}
+
+/** [r1] 会话目录内取 `session.v*.jsonl.*` 最新 mtime(单目录一次 readdir + stat; 失败返回 undefined) */
+async function newestSessionFileMtime(sessionDir: string): Promise<number | undefined> {
+  let names: string[]
+  try {
+    names = await readdir(sessionDir)
+  } catch {
+    return undefined
+  }
+  let newest: number | undefined
+  for (const name of names) {
+    if (!/^session\.v\d+\.jsonl(\..+)?$/.test(name)) continue
+    try {
+      const st = await stat(joinPath(sessionDir, name))
+      if (st.isFile() && (newest === undefined || st.mtimeMs > newest)) newest = st.mtimeMs
+    } catch { /* 单个文件失败跳过 */ }
+  }
+  return newest
+}
+
+/**
+ * [r1] A2: 整批取"盘上真实 mtime"(绝不调用 persistence.stat() —— 那是 O(树) 的, 实测 47~60ms/次)。
+ * 三级策略, 全部失败不影响正确性:
+ *   ① locate(header) 命中就用(便宜, 但本机 94% 因上游 locate() bug 拿不到, 只能当优化);
+ *   ② 未命中的用 header.cwd 推导项目目录名 + readdir 该会话目录, 取 session.v*.jsonl.* 最新 mtime;
+ *   ③ 仍失败 → 不返回该 id(调用方回退 header.createdAt, 如实体现不伪造)。
+ * @param headers 需要 mtime 的 header 列表(冷会话)
+ * @returns sessionId(str) → mtimeMs
+ */
+async function batchUpdatedAt(
+  ctx: Context,
+  headers: readonly SessionHeader[],
+  sessionsRoot: string | undefined,
+): Promise<Map<string, number>> {
+  const out = new Map<string, number>()
+  const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+  for (const header of headers) {
+    const id = String(header.id)
+    if (out.has(id)) continue
+    // ① locate() 命中(路径真实存在才算命中 —— locate 本身不做存在性检查)
+    try {
+      const path = persistence?.locate?.(header)?.path
+      if (path) {
+        const st = await stat(path)
+        if (st.isFile()) { out.set(id, st.mtimeMs); continue }
+      }
+    } catch { /* → ② */ }
+    // ② cwd 推导项目目录 + readdir 会话目录
+    if (sessionsRoot && header.cwd) {
+      try {
+        const dirName = projectDirNameOf(header.cwd)
+        if (dirName) {
+          const m = await newestSessionFileMtime(joinPath(sessionsRoot, dirName, id))
+          if (m !== undefined) { out.set(id, m); continue }
+        }
+      } catch { /* → ③ */ }
+    }
+    // ③ 不回填 → 调用方用 createdAt
+  }
+  return out
+}
+
+/**
+ * [r1] A1: 一次拿到全量会话的 header 与排序键(替代 listMergedHeaders + N×roughUpdatedAt)。
+ * 数据源优先级:
+ *   ① ctx.sessionQuery.listSessions()(0.1.7 官方, live 优先 + newest-first, 只读 header; 实测 646ms/198 会话);
+ *   ② 回退 persistence.list() + live store 手工合并(0.1.2/0.1.5/0.1.7 服务缺失时同样快)。
+ * 排序键优先级: live 末事件 time(纯内存) > 批量 mtime > header.createdAt。
+ * @returns rows(未排序) / skipped(畸形条目) / skippedNoCwd(cwd 缺失) / source(实际数据源)
+ */
+async function listCorpus(ctx: Context): Promise<{
+  rows: CorpusRow[]
+  skipped: number
+  skippedNoCwd: number
+  source: 'sessionQuery' | 'persistence' | 'live-only'
+}> {
+  const rows: CorpusRow[] = []
+  const byId = new Map<string, CorpusRow>()
+  let skipped = 0
+  let skippedNoCwd = 0
+  let source: 'sessionQuery' | 'persistence' | 'live-only' = 'live-only'
+
+  // live 集合: 用于 ① 标记 live 标志 ② 取内存末事件时间(零 IO, 与旧 roughUpdatedAt 前半段同款)
+  const liveEndTime = new Map<string, number>()
+  const store = ctx.get('sessions') as SessionsStoreView | undefined
+  try {
+    for (const s of store?.list?.() ?? []) {
+      try {
+        const id = s?.header?.id
+        if (id === undefined) continue
+        liveEndTime.set(String(id), 0) // 占位: 下面若有 log 再覆盖
+      } catch { /* 单个 live 条目异常 → 跳过 */ }
+    }
+  } catch { /* live store 不可用 → 只用持久化 */ }
+
+  // ── 数据源 ①: 官方 sessionQuery.listSessions() ──
+  let usedSessionQuery = false
+  const query = sessionQueryOf(ctx)
+  if (query?.listSessions) {
+    try {
+      const records = await query.listSessions()
+      for (const raw of records ?? []) {
+        const rec = raw as { header?: SessionHeader; live?: unknown } | undefined
+        const header = rec?.header
+        if (!header || header.id === undefined) { skipped++; continue }
+        const row: CorpusRow = {
+          header,
+          live: rec?.live === true,
+          updatedAt: header.createdAt ?? 0,
+        }
+        byId.set(String(header.id), row)
+        rows.push(row)
+      }
+      usedSessionQuery = true
+      source = 'sessionQuery'
+    } catch { /* 服务异常 → 回退 ② (不留半截数据) */
+      rows.length = 0
+      byId.clear()
+      skipped = 0
+    }
+  }
+
+  // ── 数据源 ②: persistence.list() + live store 手工合并(live 优先, 按 id 去重) ──
+  if (!usedSessionQuery) {
+    for (const id of liveEndTime.keys()) {
+      const sess = store?.get?.(SessionId(id)) as { header?: SessionHeader } | undefined
+      const header = sess?.header
+      if (!header || header.id === undefined) continue
+      if (byId.has(id)) continue
+      const row: CorpusRow = { header, live: true, updatedAt: header.createdAt ?? 0 }
+      byId.set(id, row)
+      rows.push(row)
+    }
+    const persistence = ctx.get('sessionPersistence') as PersistenceView | undefined
+    let listed: readonly PersistedListEntry[] | undefined
+    try {
+      listed = await persistence?.list?.()
+    } catch { /* 列表整体失败 → 只有 live 部分 */ }
+    for (const entry of listed ?? []) {
+      const row = unwrapPersistedEntry(entry)
+      if (row === undefined || row.header.id === undefined) { skipped++; continue }
+      const id = String(row.header.id)
+      if (byId.has(id)) {
+        // live 优先: 已存在则只补 sizeBytes(持久化侧的物理大小)
+        const existing = byId.get(id)
+        if (existing && existing.sizeBytes === undefined && row.sizeBytes !== undefined) existing.sizeBytes = row.sizeBytes
+        continue
+      }
+      const item: CorpusRow = {
+        header: row.header,
+        live: false,
+        updatedAt: row.header.createdAt ?? 0,
+        ...(row.sizeBytes !== undefined ? { sizeBytes: row.sizeBytes } : {}),
+      }
+      byId.set(id, item)
+      rows.push(item)
+    }
+    // [r1] 数据源标记必须在填充之后判定: 只要持久化列表真的贡献了行才算 'persistence',
+    // 否则是 'live-only'(live store 有会话但持久化列表为空/失败)。
+    source = rows.some((r) => r.live === false) ? 'persistence' : 'live-only'
+  }
+
+  // ── 排序键 stage 1: live 内存末事件时间(零 IO) ──
+  for (const row of rows) {
+    if (!row.live) continue
+    try {
+      const sess = store?.get?.(SessionId(String(row.header.id))) as { log?: { time?: number }[] } | undefined
+      const log = sess?.log
+      if (log && log.length > 0) {
+        const t = Number(log[log.length - 1]?.time)
+        if (Number.isFinite(t) && t > 0) row.updatedAt = t
+      }
+    } catch { /* 单行失败 → 保留 createdAt */ }
+  }
+
+  // ── 排序键 stage 2: 冷会话批量 mtime(整批一次, 绝不逐条 stat()) ──
+  const cold = rows.filter((r) => !r.live)
+  if (cold.length > 0) {
+    const sessionsRoot = process.env.DSH_SESSIONS_DIR || joinPath(homedir(), '.dsh', 'sessions')
+    let mtimes: Map<string, number>
+    try {
+      mtimes = await batchUpdatedAt(ctx, cold.map((r) => r.header), sessionsRoot)
+    } catch {
+      mtimes = new Map() // 整批失败 → 全部回退 createdAt
+    }
+    for (const row of cold) {
+      const m = mtimes.get(String(row.header.id))
+      if (m !== undefined && Number.isFinite(m) && m > 0) row.updatedAt = m
+    }
+  }
+
+  // ── cwd 缺失计数(D2: 旧实现静默跳过, 会让"过滤后为空"被误诊) ──
+  for (const row of rows) if (row.header.cwd === undefined) skippedNoCwd++
+
+  return { rows, skipped, skippedNoCwd, source }
 }
 
 /**
@@ -2035,6 +2549,36 @@ async function roughUpdatedAt(ctx: Context, header: SessionHeader): Promise<numb
 }
 
 /**
+ * [r1] B2: 批量检视会话行, 并发 4 + 单会话超时。
+ * 旧实现串行 inspectSessionRow: 单会话读数约 655ms, 50 行串行 ≈ 33s。
+ * 并发度取 4 与官方 SESSION_QUERY_DEFAULT_PERSISTED_INSPECT_CONCURRENCY 对齐(最稳)。
+ * 单会话超时(默认 3000ms)超时即放弃该行(调用方计入 skipped), 不让一行拖垮整表。
+ * @returns id(str) → 检视结果; 读不到/超时的会话不在 map 里
+ */
+async function inspectRowsConcurrent(
+  ctx: Context,
+  rows: readonly CorpusRow[],
+  onSkipped: () => void,
+): Promise<Map<string, NonNullable<Awaited<ReturnType<typeof inspectSessionRow>>>>> {
+  const out = new Map<string, NonNullable<Awaited<ReturnType<typeof inspectSessionRow>>>>()
+  const queue = [...rows]
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const item = queue.shift()
+      if (!item) return
+      const id = String(item.header.id)
+      try {
+        const r = await withTimeout(inspectSessionRow(ctx, item.header), SESSION_LIST_INSPECT_TIMEOUT_MS)
+        if (r === undefined) { onSkipped(); continue }
+        out.set(id, r)
+      } catch { onSkipped() }
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(SESSION_LIST_INSPECT_CONCURRENCY, queue.length) }, worker))
+  return out
+}
+
+/**
  * 单个会话的轻量检视: 消息条数 + 标题 + 统计摘要 + 权限档。
  * [r2] persistedInspect 兼容 0.1.2 inspect 与 0.1.5 open/read; 失败回退 live log。
  * 返回 undefined = 两路都读不到(调用方应计入 skipped, 而不是伪造一行 messageCount:0 的假数据)。
@@ -2365,6 +2909,72 @@ interface SessionSearchRow {
   snippet?: string
 }
 
+// ═══════════════════════ [r1] C1/C2: 官方索引搜索(探测 + 静默回退) ═══════════════════════
+//
+// ctx.sessionQuery.searchSessions 是 0.1.7 的官方全文索引。但在本机默认部署下**不可用**:
+//   - dsh-base 默认 `openAt:'never'` → 恒抛 SESSION_QUERY_SEARCH_DISABLED;
+//   - 即使打开索引, 上游 locate() 恒按 v4 拼文件名(实际落盘 v3/legacy), 186/198 会话会让
+//     SessionCorpus.load 抛 SESSION_QUERY_PERSISTENCE_FAILED(PLAN_r1 §1.5)。
+// 因此设计为"探测成功才用, 任何 SESSION_QUERY_* 错误一律静默回退现有扫描实现"(裁决 D10),
+// 并在 status_get/config_get 如实上报 backend 与回退原因, 让部署方能看出索引没生效。
+
+/** [r1] 最近一次 session_search 实际生效的后端(供 status_get/config_get 上报) */
+let sessionSearchBackend: 'index' | 'scan' = 'scan'
+/** [r1] 最近一次回退原因(仅诊断用, 不含敏感信息) */
+let sessionSearchFallbackReason: string | undefined = '尚未调用过 session_search'
+
+/**
+ * [r1] C1: 尝试走官方索引搜索。
+ * 只有**完整成功**才返回 hits; 任何异常(SESSION_QUERY_SEARCH_DISABLED /
+ * SESSION_QUERY_PERSISTENCE_FAILED / 未挂载 / 结构不符)都返回 {hits: undefined, reason} 让调用方回退。
+ * @returns hits=undefined 表示"索引不可用, 请回退"; reason 为可上报的简短原因
+ */
+async function tryIndexSearch(
+  ctx: Context,
+  req: { query: string; cwd?: string; limit: number },
+): Promise<{ hits?: SessionSearchRow[]; reason?: string }> {
+  const query = sessionQueryOf(ctx)
+  if (typeof query?.searchSessions !== 'function') return { reason: 'ctx.sessionQuery.searchSessions 未挂载(非 0.1.7 或服务未激活)' }
+  const sessionFilters = req.cwd
+    ? [{ kind: 'cwd' as const, values: [req.cwd] }]
+    : undefined
+  let page: unknown
+  try {
+    page = await query.searchSessions({
+      query: req.query,
+      limit: Math.min(Math.max(1, req.limit), 100),
+      ...(sessionFilters ? { sessionFilters } : {}),
+    })
+  } catch (e) {
+    // 关键: 绝不把 SESSION_QUERY_* 错误抛给用户 —— 一律转成回退原因
+    const code = (e as { code?: unknown })?.code
+    return { reason: typeof code === 'string' ? `官方索引不可用: ${code}` : `官方索引不可用: ${(e as Error)?.message ?? String(e)}` }
+  }
+  // 结构校验: 拿不到 items 数组就当失败回退(不做半截解析)
+  const items = (page as { items?: unknown })?.items
+  if (!Array.isArray(items)) return { reason: '官方索引返回结构不符(缺 items 数组)' }
+  const hits: SessionSearchRow[] = []
+  for (const raw of items) {
+    const hit = raw as {
+      header?: SessionHeader
+      bestMatch?: { snippet?: unknown; time?: unknown }
+    } | undefined
+    const header = hit?.header
+    if (!header || header.id === undefined) continue
+    const snippet = typeof hit?.bestMatch?.snippet === 'string' ? hit.bestMatch.snippet : undefined
+    const t = Number(hit?.bestMatch?.time)
+    hits.push({
+      sessionId: String(header.id),
+      title: `(untitled ${String(header.id).slice(0, 8)})`,
+      ...(header.cwd !== undefined ? { cwd: header.cwd } : {}),
+      updatedAt: Number.isFinite(t) && t > 0 ? t : (header.createdAt ?? 0),
+      matched: 'content',
+      ...(snippet !== undefined ? { snippet } : {}),
+    })
+  }
+  return { hits }
+}
+
 /** 命中判定: 正则模式 re.test, 否则大小写不敏感子串 */
 function searchHit(text: string, re: RegExp | undefined, needle: string): boolean {
   if (re) return re.test(text)
@@ -2590,6 +3200,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         enabled: runtimeConfig.notifyEnabled !== false,
         deliveredTotal,
         failedTotal,
+        // [r1] B3-B8: 部署级回调预设是否生效(只回显结构, 绝不回显 secret/header 值)
+        callbackPresetConfigured: runtimeConfig.callbackPreset?.url !== undefined,
+      },
+      // [r1] C1/C2: session_search 实际后端(如实上报, 让部署方能看出官方索引没生效及原因)
+      sessionSearch: {
+        backend: sessionSearchBackend,
+        ...(sessionSearchFallbackReason !== undefined ? { fallbackReason: sessionSearchFallbackReason } : {}),
       },
       node: process.version,
       pid: process.pid,
@@ -2624,6 +3241,13 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         enabled: runtimeConfig.notifyEnabled !== false,
         defaultCallbackSecretSet: Boolean(runtimeConfig.defaultCallbackSecret),
         allowedCallbackHosts: runtimeConfig.allowedCallbackHosts,
+        // [r1] B3-B8: 部署级回调预设摘要 —— 只回显结构与头名, 绝不回显 secret / header 值
+        callbackPreset: describeCallbackPreset(),
+      },
+      // [r1] C1/C2: session_search 后端(如实上报索引是否生效及回退原因)
+      sessionSearch: {
+        backend: sessionSearchBackend,
+        ...(sessionSearchFallbackReason !== undefined ? { fallbackReason: sessionSearchFallbackReason } : {}),
       },
     }, null, 2))
   })
@@ -2836,32 +3460,34 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P0: 会话管理(session_list / session_log) ──
   mcp.tool(
     'session_list',
-    '【最先调用】列出所有会话(live+已持久化合并), 用来找会话 id / 标题 / 工作目录 / token 用量。什么时候用: 不知道 sessionId、想续接某个历史会话(拿到 id 后传给 agent_run/task_inbox 的 sessionId)、或想知道最近在哪些目录干过活。不传 cwd = 列出全部(默认); 传 cwd = 只看该工作区。返回 {total,count,offset,limit,truncated,skipped,next?,sessions:[{id,title,cwd,createdAt(ISO8601),createdAt_epoch,updatedAt(ISO8601),updatedAt_epoch,messageCount,inputTokens,outputTokens,llmTime,llmTimeHuman,...}]}(默认最多 20 条, 按 updatedAt 倒序; 超 20 条用 offset/limit 翻页)。skipped=读取失败被跳过的会话数(单行失败不影响整表)。拿到 id 后: 看对话用 session_log(sessionId=...), 续接干活用 agent_run(sessionId=...)。',
+    '【最先调用】列出所有会话(live+已持久化合并), 用来找会话 id / 标题 / 工作目录。要 messageCount/token 统计请传 detail:"full"(默认 brief 不读日志, 快; full 会逐行读日志补 messageCount/inputTokens/outputTokens/llmTime/sandboxMode, 较慢)。什么时候用: 不知道 sessionId、想续接某个历史会话(拿到 id 后传给 agent_run/task_inbox 的 sessionId)、或想知道最近在哪些目录干过活。不传 cwd = 列出全部(默认); 传 cwd = 只看该工作区。返回 {total,count,offset,limit,detail,truncated,skipped,skippedNoCwd?,source,detailHint?,next?,sessions:[...]}; brief 行含 {id,title,cwd,createdAt*,updatedAt*,tokensAvailable:false,sizeBytes?,live}, full 行改为含 {messageCount,inputTokens,outputTokens,llmTime,llmTimeHuman,sandboxMode?}(默认最多 20 条, 按 updatedAt 倒序; 超 20 条用 offset/limit 翻页)。skipped=读取失败被跳过的会话数; skippedNoCwd=header 缺 cwd 未参与过滤的会话数(单行失败不影响整表)。拿到 id 后: 看对话用 session_log(sessionId=...), 续接干活用 agent_run(sessionId=...)。',
     {
       cwd: z.string().optional().describe('按工作目录过滤(realpath 规范化后精确匹配); 不传=全部会话'),
       limit: z.number().int().min(1).max(SESSION_LIST_MAX_ROWS).optional().describe('本页最多返回条数(默认 20, 最大 50)'),
       offset: pageArgSchema.offset,
+      detail: z.enum(['brief', 'full']).optional().describe('返回详略(默认 brief)。brief=只回 header + 免费字段(id/title/cwd/createdAt/updatedAt/sizeBytes), 快; full=额外逐行读日志补 messageCount/inputTokens/outputTokens/llmTime/sandboxMode, 慢且受单会话超时限制'),
     },
-    async ({ cwd, limit, offset }) => {
+    async ({ cwd, limit, offset, detail }) => {
       try {
         // [r3] C8: 入口参数预校验
-        const bad = validateArgs('session_list', { cwd, limit, offset }, [
+        const bad = validateArgs('session_list', { cwd, limit, offset, detail }, [
           { name: 'cwd', type: 'string' }, { name: 'limit', type: 'number' }, { name: 'offset', type: 'number' },
+          { name: 'detail', type: 'string' },
         ])
         if (bad) return out(JSON.stringify({ error: bad }))
         const { offset: off, limit: lim } = parsePage(offset, limit, 20)
         const max = Math.min(Math.max(1, lim), SESSION_LIST_MAX_ROWS)
-        // live + 持久化合并(live 优先), 按 id 去重(与存量捞回/session_search 共用)
-        // [r2] 合并结果带 skipped 计数(0.1.5 snapshot/畸形条目逐行跳过, 不再整表崩塌)
-        const { headers, skipped: mergeSkipped } = await listMergedHeaders(ctx)
-        let rows = [...headers.values()]
-        // cwd 过滤: 双侧 realpath 规范化后精确比对
+        // [r1] A1/A3: 一次拿全量 header + 免费排序键(替代 listMergedHeaders + 逐条 roughUpdatedAt
+        // → stat() O(树), 实测 9.3s/197 会话)。sessionQuery 探测不到时自动回退 persistence 路径。
+        const { rows: corpus, skipped: mergeSkipped, skippedNoCwd, source } = await listCorpus(ctx)
+        let rows = corpus
+        // cwd 过滤: 双侧 realpath 规范化后精确比对(保持 [r2] 实现, 已被 28/27/46 三个数字验证)
         if (cwd) {
           const target = await canonicalCwd(resolve(cwd))
-          const filtered: SessionHeader[] = []
-          for (const h of rows) {
-            if (h.cwd === undefined) continue
-            if (await canonicalCwd(h.cwd) === target) filtered.push(h)
+          const filtered: CorpusRow[] = []
+          for (const r of rows) {
+            if (r.header.cwd === undefined) continue
+            if (await canonicalCwd(r.header.cwd) === target) filtered.push(r)
           }
           rows = filtered
         }
@@ -2871,58 +3497,74 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             error: cwd
               ? errText('session is empty', cwd, '该工作目录下没有任何会话', '去掉 cwd 参数列出全部会话, 或先用 agent_run(cwd=...) 在该目录建一个会话')
               : errText('session is empty', '(all)', '当前 live 与持久化里都没有会话', '先用 agent_run 或 task_inbox 跑一个任务即可建会话'),
+            // [r1] D2: cwd 缺失被跳过的行数(旧实现静默跳过, 会让"空"被误诊)
+            ...(skippedNoCwd > 0 ? { skippedNoCwd } : {}),
           }))
         }
-        // [r2] 逐行容错: roughUpdatedAt/inspectSessionRow 单行失败 → 跳过该行并计入 skipped
-        let skipped = mergeSkipped
-        const withRough: { h: SessionHeader; at: number }[] = []
-        for (const h of rows) {
-          try {
-            withRough.push({ h, at: await roughUpdatedAt(ctx, h) })
-          } catch {
-            skipped++
-          }
-        }
-        withRough.sort((a, b) => b.at - a.at)
+        // [r1] 排序键已是免费字段(listCorpus 内完成: live 末事件 time > 盘上 mtime > createdAt)
+        rows.sort((a, b) => b.updatedAt - a.updatedAt)
         // [r3] A1: 先分页(offset/limit)再逐行检视, 避免为被截断的行白读大日志
-        const selected = withRough.slice(off, off + max)
+        const selected = rows.slice(off, off + max)
+        let skipped = mergeSkipped
         const sessions: Record<string, unknown>[] = []
-        for (const { h, at } of selected) {
-          try {
-            const detail = await inspectSessionRow(ctx, h)
-            // [r2] 单行读不到(persisted+live 都失败) → 不计入结果, 只计入 skipped
-            if (detail === undefined) { skipped++; continue }
+        // [r1] B1(D1 裁决): 默认 brief —— 完全不读事件流, 只回免费字段;
+        // full 才逐行 inspectSessionRow(并发 4 + 单会话 3s 超时, 见 SESSION_LIST_INSPECT_CONCURRENCY)
+        if (detail === 'full') {
+          const detailById = await inspectRowsConcurrent(ctx, selected, () => { skipped++ })
+          for (const r of selected) {
+            const h = r.header
+            const d = detailById.get(String(h.id))
+            if (d === undefined) { skipped++; continue }
             sessions.push({
               id: h.id,
-              title: detail.title ?? `(untitled ${String(h.id).slice(0, 8)})`,
+              title: d.title ?? `(untitled ${String(h.id).slice(0, 8)})`,
               cwd: h.cwd,
               // [r3] A2: 时间戳人类可读 ISO8601 + 原始 epoch
               ...timeFields('createdAt', h.createdAt),
-              ...timeFields('updatedAt', at),
-              messageCount: detail.messageCount,
+              ...timeFields('updatedAt', r.updatedAt),
+              messageCount: d.messageCount,
               // P1: 统计摘要(全会话累计)
-              inputTokens: detail.inputTokens ?? 0,
-              outputTokens: detail.outputTokens ?? 0,
-              llmTime: detail.llmTimeSec ?? 0,
-              llmTimeHuman: formatDuration((detail.llmTimeSec ?? 0) * 1000),
+              inputTokens: d.inputTokens ?? 0,
+              outputTokens: d.outputTokens ?? 0,
+              llmTime: d.llmTimeSec ?? 0,
+              llmTimeHuman: formatDuration((d.llmTimeSec ?? 0) * 1000),
               // P3: 会话生效权限档(有 sandbox/mode 记录才带此字段)
-              ...(detail.sandboxMode !== undefined ? { sandboxMode: detail.sandboxMode } : {}),
+              ...(d.sandboxMode !== undefined ? { sandboxMode: d.sandboxMode } : {}),
             })
-          } catch {
-            skipped++
+          }
+        } else {
+          for (const r of selected) {
+            const h = r.header
+            sessions.push({
+              id: h.id,
+              title: `(untitled ${String(h.id).slice(0, 8)})`,
+              cwd: h.cwd,
+              ...timeFields('createdAt', h.createdAt),
+              ...timeFields('updatedAt', r.updatedAt),
+              // brief 不读事件流 → 明确告知 token/messageCount 不可用(不伪造 0)
+              tokensAvailable: false,
+              ...(r.sizeBytes !== undefined ? { sizeBytes: r.sizeBytes } : {}),
+              live: r.live,
+            })
           }
         }
-        const hasMore = off + selected.length < withRough.length
+        const hasMore = off + selected.length < rows.length
         return out(JSON.stringify({
-          total: withRough.length,
+          total: rows.length,
           count: sessions.length,
           offset: off,
           limit: max,
+          detail: detail ?? 'brief',
           truncated: hasMore,
           // [r2] 自解释字段: 有多少会话因单行容错被跳过(0 = 全部正常)
           skipped,
+          // [r1] D2: cwd 缺失未参与过滤的行数; [r1] A1: 实际数据源(sessionQuery=0.1.7 官方快路径)
+          ...(skippedNoCwd > 0 ? { skippedNoCwd } : {}),
+          source,
+          // [r1] B1: brief 下提示如何拿到 token 统计
+          ...(detail !== 'full' ? { detailHint: "messageCount/inputTokens/outputTokens/llmTime/sandboxMode 需 detail:'full'(会逐行读日志, 较慢)" } : {}),
           // [r3] A1: 截断时明示翻页参数
-          ...(hasMore ? { next: `共 ${withRough.length} 个会话, 本页 ${sessions.length} 个; 取下一页请传 offset=${off + selected.length}` } : {}),
+          ...(hasMore ? { next: `共 ${rows.length} 个会话, 本页 ${sessions.length} 个; 取下一页请传 offset=${off + selected.length}` } : {}),
           sessions,
         }))
       } catch (e) {
@@ -3105,15 +3747,54 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         }
         const needle = query.toLowerCase()
         const maxScan = Math.min(Math.max(1, Math.trunc(limit ?? 50)), 200)
-        const { headers } = await listMergedHeaders(ctx)
-        let rows = [...headers.values()]
+        // [r1] C1/C2: 优先尝试官方索引搜索(ctx.sessionQuery.searchSessions)。
+        // 本机默认 openAt:'never' → 抛 SESSION_QUERY_SEARCH_DISABLED; 且上游 locate() bug 会让
+        // 186/198 会话抛 SESSION_QUERY_PERSISTENCE_FAILED(PLAN_r1 §1.5)。两种情况都必须**静默回退**,
+        // 绝不把 SESSION_QUERY_* 错误抛给用户(裁决 D10)。
+
+        let indexFallbackReason: string | undefined
+        if (regex !== true) {
+          const idxRes = await tryIndexSearch(ctx, { query, cwd, limit: maxScan })
+          if (idxRes.hits) {
+            // 索引命中 → 直接走同一套分页/返回体, backend 标记为 index
+            sessionSearchBackend = 'index'
+            const { offset: off2, limit: lim2 } = parsePage(offset, pageSize, LIST_PAGE_DEFAULT)
+            const { page: page2, meta: meta2 } = pageEnvelope(idxRes.hits, off2, lim2, 'session_search')
+            return out(JSON.stringify({
+              query,
+              regex: false,
+              total: idxRes.hits.length,
+              count: page2.length,
+              offset: meta2.offset,
+              limit: meta2.limit,
+              truncated: meta2.truncated,
+              matched: idxRes.hits.length,
+              scanned: idxRes.hits.length,
+              content_search: true,
+              backend: 'index',
+              ...(meta2.truncated ? { next: `共 ${idxRes.hits.length} 条命中, 本页 ${page2.length} 条; 取下一页请传 offset=${meta2.offset + page2.length}` } : {}),
+              results: page2.map((r) => {
+                const { updatedAt, ...rest } = r
+                return { ...rest, ...timeFields('updatedAt', updatedAt) }
+              }),
+            }))
+          }
+          indexFallbackReason = idxRes.reason
+        } else {
+          indexFallbackReason = 'regex=true 需插件侧正则扫描, 索引后端不支持'
+        }
+        sessionSearchBackend = 'scan'
+        sessionSearchFallbackReason = indexFallbackReason
+        // [r1] C3: 排序键改用 listCorpus(免费), 不再逐条 roughUpdatedAt → stat() O(树) 全量
+        const { rows: corpus, skippedNoCwd: searchSkippedNoCwd } = await listCorpus(ctx)
+        let rows = corpus
         // cwd 过滤: 双侧 realpath 规范化后精确比对
         if (cwd) {
           const target = await canonicalCwd(resolve(cwd))
-          const filtered: SessionHeader[] = []
-          for (const h of rows) {
-            if (h.cwd === undefined) continue
-            if (await canonicalCwd(h.cwd) === target) filtered.push(h)
+          const filtered: CorpusRow[] = []
+          for (const r of rows) {
+            if (r.header.cwd === undefined) continue
+            if (await canonicalCwd(r.header.cwd) === target) filtered.push(r)
           }
           rows = filtered
         }
@@ -3123,16 +3804,17 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             error: cwd
               ? errText('session is empty', cwd, '该工作目录下没有可搜索的会话', '去掉 cwd 或换一个目录再搜; 用 session_list 看全部会话')
               : errText('session is empty', '(all)', '当前 live 与持久化里都没有会话', '先用 agent_run/task_inbox 建会话, 或用 session_list 确认服务状态'),
+            ...(searchSkippedNoCwd > 0 ? { skippedNoCwd: searchSkippedNoCwd } : {}),
           }))
         }
-        // 粗排(updatedAt desc)取最近 N 个扫描
-        const withRough = await Promise.all(rows.map(async (h) => ({ h, at: await roughUpdatedAt(ctx, h) })))
-        withRough.sort((a, b) => b.at - a.at)
-        const scanned = withRough.slice(0, maxScan)
+        // 粗排(updatedAt desc)取最近 N 个扫描(排序键已在 listCorpus 内免费取得)
+        rows.sort((a, b) => b.updatedAt - a.updatedAt)
+        const scanned = rows.slice(0, maxScan)
+        const scannedRows = scanned.map((r) => ({ h: r.header, at: r.updatedAt }))
         // 并发 8 消费; 单会话读取有 ~2s 时限, 最坏总耗时 ≈ ceil(N/8)*2s
         const hits: SessionSearchRow[] = []
         let contentSearched = false
-        const queue = [...scanned]
+        const queue = [...scannedRows]
         const worker = async (): Promise<void> => {
           for (;;) {
             const it = queue.shift()
@@ -3161,6 +3843,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           matched: hits.length,
           scanned: scanned.length,
           content_search: contentSearched,
+          // [r1] C1/C2: 实际后端(scan=插件侧扫描; index=官方索引) + 回退原因(诊断用)
+          backend: 'scan',
+          ...(indexFallbackReason !== undefined ? { indexFallbackReason } : {}),
+          ...(searchSkippedNoCwd > 0 ? { skippedNoCwd: searchSkippedNoCwd } : {}),
           results: page.map((r) => {
             const { updatedAt, ...rest } = r
             return { ...rest, ...timeFields('updatedAt', updatedAt) }
@@ -3708,6 +4394,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         createdAt: humanTime(now)?.at,
         createdAt_epoch: now,
         // [P0 回调] 仅传了 callback 才追加 notify 摘要(不传 = 返回体与 v0.7.0 逐字节一致)
+        // [r1] 额外回显 callbackSource, 让调用方一眼看出"我没传 callback 为什么发了回调"(预设生效)
         ...(cbResolved.config !== undefined
           ? {
               notify: {
@@ -3715,6 +4402,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
                 urlHost: hostOfCallbackUrl(cbResolved.config.url),
                 events: cbResolved.config.events,
                 signed: cbResolved.signed === true,
+                ...(cbResolved.source !== undefined ? { source: cbResolved.source } : {}),
                 ...(cbResolved.signed !== true ? { unsignedReason: 'no secret provided (callback.secret 与部署级 defaultCallbackSecret 均未配置); 接收方无法验签, 建议配置 secret' } : {}),
               },
             }
@@ -3999,6 +4687,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       console.warn('[harness-mcp-server] invalid allowedCallbackHosts, keep default [] (expected string[])')
     }
   }
+  // [r1] 部署级回调预设(非法值告警回落"未配置", 不阻断启动; 不配 = 与旧版完全一致)
+  if (config.callbackPreset !== undefined) {
+    const p = normalizeCallbackPreset(config.callbackPreset)
+    if (p === undefined) {
+      console.warn('[harness-mcp-server] invalid callbackPreset, keep unset (expected object {url?,method?,headers?,events?,replyContext?,timeoutMs?,autoApply?,requireReplyRoute?})')
+    } else {
+      runtimeConfig.callbackPreset = p
+    }
+  }
 
   const port = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
@@ -4120,5 +4817,11 @@ export const __internals = {
   SESSION_LOG_MAX_EVENTS, LIST_PAGE_DEFAULT, LIST_PAGE_MAX,
   // [P0 回调] 纯函数通道: SSRF/解析/签名/载荷可被单测直接断言, 不依赖网络时序
   ssrfGuardCheck, resolveCallback, buildCallbackPayload, signCallbackPayload, safeEqualStr, hostOfCallbackUrl,
+  // [r1] 回调预设合并语义纯函数(可直接单测)
+  mergeReplyContext, mergeCallbackHeaders, sanitizeCallbackHeaders, findLiteralTemplateValue, hasReplyRouteField,
+  normalizeCallbackPreset, describeCallbackPreset,
+  // [r1] 会话快路径: 供单测断言批量 mtime / 数据源选择 / cwd 目录名推导
+  listCorpus, projectDirNameOf, batchUpdatedAt,
+  SESSION_LIST_INSPECT_CONCURRENCY, SESSION_LIST_INSPECT_TIMEOUT_MS,
   VERSION: PLUGIN_VERSION,
 }

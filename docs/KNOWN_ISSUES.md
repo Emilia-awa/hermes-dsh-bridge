@@ -1,11 +1,105 @@
-# KNOWN_ISSUES — 已发现但本轮(R4)不修的缺陷
+# KNOWN_ISSUES — 已知缺陷与上游限制
 
-R4 的约束是「不改 `src/index.ts` 核心逻辑」。以下是做文档/自检对齐时**逐字段核对代码**发现的真实缺陷。
-全部**只记录、本轮不修**(修任何一条都会动核心逻辑, 须留到 R5 并配回归测试)。
-
-标注约定: 🐞 = 确认的缺陷; ⚠️ = 行为与文档/直觉不一致(可能是有意为之, 但容易误导); 📝 = 待验证。
+标注约定: 🐞 = 确认的缺陷; ⚠️ = 行为与文档/直觉不一致(可能是有意为之, 但容易误导);
+📝 = 待验证; 🅾️ = **上游(dsh 自身)的限制**, 本插件无法修复, 只能绕开。
 
 ---
+
+## 🅾️ 上游限制
+
+这一节的条目**不在本仓库内**，是 dsh 自身的行为。本插件已针对它们做了绕过（见每条的处理方式），
+记录下来是因为：① 它们解释了插件里若干"看起来绕"的实现；② 上游修复后插件可以简化。
+
+### 🅾️ A. `SessionPersistence.locate()` 恒按当前格式版本拼文件名
+
+**位置（上游）**：`@deepseek-ai/dsh-session-persistence-jsonl`，`lib/index.js`
+的 `locate(meta)` → `logPath(root, cwd, id, SESSION_FORMAT_VERSION)`。
+
+`locate()` 用**当前**格式版本常量（本机为 4）拼路径，形如 `<root>/<proj>/<id>/session.v4.jsonl.zstd`；
+但会话实际落盘的 generation 由**当初写入时**的版本决定。于是一个 v3 或 legacy 会话，
+`locate()` 返回的路径**根本不存在**。
+
+**本机实测**：200 个会话中，`locate()` 返回的路径真实存在的只有 **14 个**，
+**186 个（93%）不存在** —— 实际文件是 `session.v3.jsonl.zstd`（137 个）或 legacy
+`session.jsonl.zstd`（49 个）。
+
+**影响**：
+
+1. 任何用 `locate()` 取路径再 `stat()` 算 mtime 的代码都会拿到 ENOENT。旧版
+   `session_list` 的 `updatedAt` 因此长期退化成 `header.createdAt`（排序不准，但不报错）。
+2. **官方全文索引搜索不可用**：`ctx.sessionQuery.searchSessions` 内部走 `SessionCorpus.load`，
+   同样解析不出这些会话，直接抛 `SESSION_QUERY_PERSISTENCE_FAILED`（本机已复现）。
+   即部署方按官方注释把 `openAt` 打开后，搜索反而整体失败。
+
+**本插件的处理**：**不依赖 `locate()`**。批量取 mtime 走三级策略（`locate()` 命中就用 →
+用 `header.cwd` 推导项目目录 + `readdir` 会话目录取真实 mtime → 回退 `createdAt`）；
+`session_search` 对 `SESSION_QUERY_*` 一律**静默回退**到内置扫描，绝不把上游错误抛给用户。
+因此本机 `session_search` 默认后端是 `scan` 而非 `index`（`status_get.sessionSearch.backend` 可见）。
+
+**上游修复后**：插件可去掉 mtime 推导兜底，并在 `openAt` 打开时真正启用索引搜索。
+
+### 🅾️ B. `SessionPersistence.stat()` 在 jsonl 后端下是 O(项目目录数)
+
+**位置（上游）**：`dsh-session-persistence-jsonl` 的 `stat(id)` → `findLog(id)`，
+而 `findLog` 会 `for (project of listProjectDirs())` 遍历**全部**项目目录
+（每个目录还要 `rejectLegacyFlatArtifact` + `resolveGenerationInDirectory`）。
+
+所以 `stat(id)` 名义上是"看一个会话的元数据"，实际开销与**整棵会话树的大小**成正比，
+而不是 O(1)。
+
+**本机实测**：真实树（30 个项目目录）**≈47–60 ms/次**；
+人造小树（1 个项目目录）**2.7 ms/次**。旧版 `session_list` 对每个会话调一次
+`stat()` → 197 次 × ≈50 ms ≈ **9.3 s**，这就是 `limit=1` 也要 10 s 的原因。
+
+**本插件的处理**：**绝不逐条 `stat()`**。改用 `sessionPersistence.list()` / 官方
+`sessionQuery.listSessions()` 一次拿全量 header（两者都天然提供 `sizeBytes`，约 0.3–0.6 s），
+mtime 另走批量策略（见 A）。
+
+**上游修复后**：`stat()` 变成 O(1) 时，逐条调用不再是问题，但整批读取仍是更优解。
+
+---
+
+## 本轮 (R1) 已修的条目
+
+以下问题在 **`0.9.0`** 中已修复，保留在此仅作历史记录与口径说明。
+
+### ✅ 11. `session_list` / `session_search` 大会话库下极慢（issue #1）
+
+**原症状**：197 个会话的库上 `limit=1` ≈13 s、`limit=50` ≈31 s；客户端 20 s 超时表现为"永不返回"。
+skipped=0、无报错 —— 是**性能退化**，不是契约崩塌。
+**根因**：逐条 `stat()`（O(树)，见上方 🅾️ B）+ 逐行读整条日志算 messageCount/token。
+**修复**：`0.9.0` —— 一次拿全量 header + 整批 mtime；行级统计改为按需
+（`detail: "brief"` 默认不读日志）。实测 `limit=1`/`limit=50` 均 **< 1.5 s / < 3 s**。
+
+### ✅ 12. `session_list` 的 `updatedAt` 静默退化成 `createdAt`
+
+**原症状**：冷会话的 `updatedAt` 排序不准，但不报错。
+**根因**：`locate()` 路径 93% 不存在（见上方 🅾️ A），mtime 取不到就回退 `createdAt`。
+**修复**：`0.9.0` —— 批量 mtime 走 `cwd` 推导 + `readdir` 真实文件，而非只信 `locate()`。
+
+### ✅ 13. `callback.events: []` 被拒绝，与文档/接收方语义矛盾
+
+**原症状**：文档与 Hermes 侧都要求传 `events: []`（= 订阅全部），但插件会把它判成
+"无效事件列表"并报错；而不传时 schema 又默认成 `["done","error"]`。
+**根因**：schema 层 `.default()` 把"未提供"和"显式提供"压成同一个值，且 `[]` 被当作非法。
+**修复**：`0.9.0` —— `events: []` 合法且表示**订阅全部**；`events`/`method`/`timeoutMs`
+的 schema 层 `.default()` 移除，改由 `resolveCallback` 做"任务级 → 预设 → 内置默认"三级回落。
+
+### ✅ 14. callback 必须手写全部字段，漏一个就静默失效
+
+**原症状**：每次 `task_inbox` 都要手写 `url`/`secret`/`headers`/`events`/`replyContext`；
+漏了不报错，只是回调永远不到。
+**修复**：`0.9.0` 新增 `callbackPreset` 部署级预设（配一次，之后一行派发）。
+**注意**：实现时发现 `callbackSchema.url` 是 schema 层必填，而 MCP SDK 在进入 handler 前
+就按 schema 校验 —— 这会让"只传 replyContext、url 由预设提供"的路径被 SDK 直接以 `-32602`
+拒掉。已把 `url` 下沉为可选、校验移到 `resolveCallback`。**这是 `callbackPreset` 能生效的前提。**
+
+---
+
+## R4 遗留（仍未修）
+
+以下条目来自 R4（文档/自检对齐轮），**约束是"不改 `src/index.ts` 核心逻辑"**，故当时只记录不修。
+R1 的工作聚焦性能与回调，未涉及这些；它们仍然成立，修它们请单独立项并同步补测试。
 
 ## 🐞 1. `agent_run` 入参校验漏掉 `title` / `task_inbox` 漏掉 `head` 之外的字段
 
@@ -110,7 +204,25 @@ R2/R3 的 README 只写了 `web|builtin|off`。**本轮 R4 已补全为四值**�
 
 ## 摘要
 
-| # | 类型 | 一句话 | 本轮处理 |
+### 上游限制（本插件只能绕开）
+
+| # | 一句话 | 插件侧绕过方式 |
+|---|---|---|
+| 🅾️ A | `locate()` 恒按当前格式版本拼路径，v3/legacy 会话路径 93% 不存在 | 不依赖 `locate()`：批量 mtime 走 `readdir` 兜底；索引搜索失败静默回退 scan |
+| 🅾️ B | `stat(id)` 在 jsonl 后端是 O(项目目录数)，≈50 ms/次 | 不逐条 `stat()`：改整批读 header，约 0.3–0.6 s 拿全量 |
+
+### R1 已修（`0.9.0`）
+
+| # | 一句话 |
+|---|---|
+| 11 | `session_list`/`session_search` 大会话库极慢（issue #1）→ 修复后 <1.5 s / <3 s |
+| 12 | `session_list` 的 `updatedAt` 静默退化成 `createdAt` → 改走真实 mtime |
+| 13 | `callback.events: []` 被错误拒绝 → 现在合法且表示订阅全部 |
+| 14 | callback 必须手写全字段、漏了就静默失效 → 新增 `callbackPreset` 预设 |
+
+### R4 遗留（仍未修）
+
+| # | 类型 | 一句话 | R4 处理 |
 |---|---|---|---|
 | 1 | — | validateArgs 覆盖面已核对, 无漏检 | 无需处理 |
 | 2 | 🐞 | `fs_read` offset 越界静默返回空 | 记录 |
@@ -118,9 +230,10 @@ R2/R3 的 README 只写了 `web|builtin|off`。**本轮 R4 已补全为四值**�
 | 4 | ⚠️ | `approvalTimeoutMs` 真实默认 300000ms(文档曾写 120s) | **已在 R4 文档修正** |
 | 5 | ⚠️ | `provider` 默认 `deepseek-official`, 自定义部署易踩 | 记录 |
 | 6 | 🐞 | `rename_session` 错误串破坏统一句式 | 记录 |
-| 7 | 📝 | `session_search.total` = 扫描数而非命中数 | 记录 |
+| 7 | 📝 | `session_search.total` = 扫描数而非命中数 | 记录（R1 未改此口径，保持兼容） |
 | 8 | 🐞 | `set_policy` 冷会话错误串前缀不在统一家族 | 记录 |
 | 9 | 🐞 | `fs_write create-new` TOCTOU | 记录 |
 | 10 | ⚠️ | `file-push`/`approvalFileDir` 曾漏文档 | **已在 R4 文档补全** |
 
-> 本轮所有 🐞/⚠️ 均**只改文档**, 未触碰 `src/index.ts`。修缺陷请开 R5 并同步补 `tests/unit_mock_p3.mjs` 断言。
+> R4 遗留条目均**只改文档**, 未触碰 `src/index.ts`。修缺陷请单独立项并同步补
+> `tests/unit_mock_p3.mjs` 断言。

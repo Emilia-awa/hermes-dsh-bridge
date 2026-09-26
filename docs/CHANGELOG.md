@@ -4,6 +4,95 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [`0.9.0`] — 会话列表提速 + callback 预设
+
+**升级收益一眼看**：`session_list` 在大会话库上从 **13 s 降到 < 1.5 s**（`limit=50` 从 31 s 降到 < 3 s），
+且**耗时不再随会话库增长**；`task_inbox` 回调可以**配一次、之后一行派发**。
+无破坏性变更（有一处默认行为变化，见 Changed）。
+
+### Fixed
+- **dsh 0.1.7: user messages are no longer silently dropped.** 0.1.7 tightened
+  `MessageSourceMap` to `user | model | tool | system-prompt` (there is no catch-all `plugin`
+  kind). The plugin built its injected task message with `source: { kind: 'plugin', ... }`,
+  which 0.1.7 rejects as invalid — and the message was dropped **without any error**, because
+  the rejection is swallowed by `catch (_error) {}` inside the loop's `kick()`. The visible
+  symptom was an agent that returned instantly with **0 input/output tokens and no error
+  anywhere**; the session existed but contained no events. Now uses the same
+  `source: { kind: 'user' }` as the official `dsh-headless` / `dsh-acp` call sites. See
+  `docs/TROUBLESHOOTING.md` for the diagnosis recipe (only affects forks that kept the old
+  kind).
+- **`session_list` / `session_search` were extremely slow on a large history** (issue #1:
+  ~13 s at `limit:1`, ~31 s at `limit:50` — clients with a 20 s timeout saw it as a hang).
+  Root causes and fixes:
+  - The sort key was obtained via `sessionPersistence.stat(id)` for **every** session. In the
+    JSONL backend `stat()` is O(number of project directories) — it re-scans the whole tree
+    per call (measured ≈47–60 ms × 197 sessions ≈ **9.3 s**). A new `listCorpus()` now reads
+    all headers in one pass (`ctx.sessionQuery.listSessions()` on dsh 0.1.7, else
+    `sessionPersistence.list()`) and resolves disk mtimes in one batch (`batchUpdatedAt`),
+    **never calling `stat()` per session**.
+  - `session_search` used the same per-session `stat()` sweep for its rough ordering; it now
+    reuses `listCorpus()`.
+  - `persistedRowMeta` relied on `locate()`, but `locate()` builds the filename from the
+    *current* format version and ignores the session's actual on-disk generation — on this
+    host **186 of 200** sessions resolved to a non-existent path, so `updatedAt` silently
+    degraded to `createdAt`. `batchUpdatedAt` prefers `locate()` when it resolves, and
+    otherwise derives the project directory and reads the real artifact mtime.
+  - Measured after the fix: `limit:1` **13 s → < 1.5 s**, `limit:50` **31 s → < 3 s**,
+    and cost is now independent of history size.
+
+### Added
+- **`session_list` gained `detail: "brief" | "full"` (default `"brief"`).** `brief` returns
+  only header-derived fields plus `sizeBytes` and **never reads an event log** — it reports
+  `tokensAvailable: false` so an absent count is never mistaken for a real `0`. `full` adds
+  `messageCount` / `inputTokens` / `outputTokens` / `llmTime` / `sandboxMode` for the selected
+  page only, using concurrency 4 with a 3 s per-session timeout.
+- `session_list` / `session_search` now report `skippedNoCwd` for sessions excluded from a
+  `cwd` filter because their header carries no `cwd` (previously those rows were dropped
+  silently, so an empty result could be misdiagnosed).
+- `session_list` reports `source` (`sessionQuery` | `persistence` | `live-only`), so the
+  backend actually used is visible.
+- `session_search` reports `backend` (`index` | `scan`) and, when it falls back,
+  `indexFallbackReason`. On dsh 0.1.7 it will use the official full-text index
+  (`ctx.sessionQuery.searchSessions`) when that index is usable. Any `SESSION_QUERY_*` failure
+  (including the default `openAt: "never"` deployment and the `locate()` issue above) is
+  swallowed and the built-in scan path runs instead — **an unavailable index can never make
+  `session_search` fail**.
+- `status_get.sessionSearch` and `config_get.sessionSearch` report the effective search backend
+  and the last fallback reason.
+- **`callbackPreset`: deployment-wide default task callback.** Configure `url` / `method` /
+  `headers` / `events` / `replyContext` / `timeoutMs` once, then `task_inbox` may omit
+  `callback` entirely or pass only the per-task parts, e.g.
+  `{"callback": {"replyContext": {"replyChatId": "..."}}}`. Merge order per field is
+  task → preset → built-in. `headers` shallow-merge; `replyContext` deep-merges one level;
+  `secret` is deliberately **not** part of the preset (single source of truth remains
+  `defaultCallbackSecret`). The SSRF guard runs on the merged URL, so a preset target still
+  has to be in `allowedCallbackHosts`.
+  - `callbackPreset.requireReplyRoute` (default `false`) rejects a callback whose merged
+    `replyContext` has no `*ChatId`/`chatId` field. Recommended when the receiver routes by
+    `replyContext` (e.g. Hermes renders `deliver_extra.chat_id = "{replyContext.replyChatId}"`,
+    and renders the *literal* template string when the value is missing).
+  - `task_inbox`'s response now includes `notify.source` (`preset` | `preset+task` | `task`).
+  - `config_get` echoes the preset's structure only (`notify.callbackPreset`) — never header
+    or secret values.
+
+### Changed
+- **`session_list` rows are now `brief` by default**, so `messageCount` / token fields are
+  absent unless you pass `detail: "full"` (they are expensive: each requires reading the whole
+  session log). `title` in `brief` mode falls back to `(untitled <id8>)`.
+- **`callback.events: []` is now valid and means "subscribe to all terminal events"**,
+  matching the receiver-side webhook semantics. Previously the schema defaulted an omitted
+  `events` to `["done","error"]` while explicitly passing `[]` was rejected as an invalid
+  list. The schema-level `.default()` on `events` / `method` / `timeoutMs` was removed so that
+  "not provided" (→ use the preset) is distinguishable from "explicitly provided" — the
+  defaults are now applied in `resolveCallback` in the documented task → preset → built-in
+  order.
+
+### Compatibility
+- **dsh 0.1.7-rc.2 verified end-to-end** (all 25 tools exercised); 0.1.5-rc.2 remains supported.
+- With no `callbackPreset` configured, callback behaviour is unchanged.
+- dsh 0.1.2 / 0.1.5 are unaffected: `ctx.sessionQuery` is probed at runtime and the
+  `sessionPersistence` / live-store path is used when it is absent.
+
 ## [0.8.1] - 2026-09-19
 
 ### Fixed

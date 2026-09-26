@@ -30,6 +30,62 @@ supply are overlaid (so re-applying is idempotent and never leaks state from a p
 | `approvalsBridge` | `'web' \| 'builtin' \| 'off' \| 'file-push'` | `'web'` | no | Approval bridge mode. Invalid values warn and keep `'web'`. See the mode table below. |
 | `approvalTimeoutMs` | `number` | **`300000`** (5 min) | no | How long a pending approval is waited for. Must be a finite number `> 0` (otherwise the config value is ignored and the default kept). On expiry it settles **cancelled** (builtin/file-push) or **rejected** (web — the protocol has no `cancelled`) — **never auto-allows**. |
 | `approvalFileDir` | `string` | `~/.dsh/approvals` | no | Directory for the `file-push` bridge. The plugin writes `pending_<id>.json` there and polls for `response_<id>.json` (poll interval 500 ms). Only accepts a non-blank string. |
+| `notifyEnabled` | `boolean` | `true` | no | Global kill switch for task callbacks. `false` makes every `callback` argument `skipped`. |
+| `defaultCallbackSecret` | `string` | `''` (unsigned) | no | HMAC-SHA256 key used when a task does not pass `callback.secret`. Empty = no signature. **This is the single authoritative source for the callback secret** — `callbackPreset` deliberately has no `secret` field. |
+| `allowedCallbackHosts` | `string[]` | `[]` | no | SSRF allowlist for callback targets (`host`, `host:port`, or `*.suffix`). Loopback/private/metadata addresses are refused unless listed here. |
+| `callbackPreset` | `object` | unset | no | Deployment-wide default callback. See below. |
+
+### `callbackPreset` — configure the callback once
+
+Without a preset, every `task_inbox` call must hand-write the whole callback, and one missing
+field fails **silently** (no error — the callback simply never arrives). A preset moves that
+into deployment config: configure it once, then pass only what varies per task.
+
+```yaml
+- insert:
+    - id: hermes-dsh-bridge
+      name: 'hermes-dsh-bridge'
+      config:
+        allowedCallbackHosts: ["127.0.0.1:8644"]        # required: callback URL is loopback
+        defaultCallbackSecret: "<shared HMAC secret>"
+        callbackPreset:
+          url: "http://127.0.0.1:8644/webhooks/dsh-task-done"
+          headers:
+            X-Gitlab-Token: "<same shared secret>"      # receiver-specific auth header
+          events: []                                    # [] = subscribe to ALL terminal events
+          replyContext:
+            origin: hermes                              # static routing context
+            platform: qqbot
+          requireReplyRoute: true                       # refuse callbacks that cannot be routed
+```
+
+After this, a dispatch is one line:
+
+```jsonc
+{"task": "...", "callback": {"replyContext": {"replyChatId": "123456789"}}}
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `url` | `string` | — | Default callback URL. When set, callers may omit `callback` entirely. |
+| `method` | `'POST' \| 'PUT'` | `'POST'` | Default HTTP method. |
+| `headers` | `Record<string,string>` | — | Default headers. **Shallow-merged** with task `headers` (task wins per key). Reserved headers (`host`, `content-length`, `connection`, `transfer-encoding`) are stripped. |
+| `events` | `('done'\|'error'\|'cancelled')[]` | `['done','error']` | Default subscriptions. **`[]` means "all events"** (matching the Hermes webhook side). |
+| `replyContext` | `object` | — | Default reply context. **Deep-merged one level** with the task's `replyContext` (task wins per key) — so static keys live here and per-dispatch keys like `replyChatId` come from the caller. |
+| `timeoutMs` | `number` | `5000` | Default delivery timeout, `1000..30000`. |
+| `autoApply` | `boolean` | `true` | When `false`, the preset is ignored unless the caller passes a `callback` object. |
+| `requireReplyRoute` | `boolean` | `false` | When `true`, a callback whose merged `replyContext` has no `*ChatId`/`chatId` field is **rejected with an error**. Recommended: receivers that route by `replyContext` (e.g. Hermes renders `deliver_extra.chat_id = "{replyContext.replyChatId}"`) will otherwise address a *literal* `{replyContext.replyChatId}` string instead of your chat. |
+
+**Merge order (per field):** task value → preset value → built-in default. `url`/`method`/
+`timeoutMs` take the task value when present; `headers` shallow-merge; `replyContext`
+deep-merges; `secret` never comes from the preset (task `secret` → `defaultCallbackSecret`).
+
+**Setting a preset does not weaken security.** The SSRF guard runs on the *merged* URL, so a
+preset target still has to be listed in `allowedCallbackHosts`.
+
+**Backward compatible:** with no `callbackPreset` configured, behaviour is byte-for-byte
+unchanged from before (no callback unless the caller passes one). `config_get` reports the
+preset's *structure* only (`notify.callbackPreset`) and never echoes header or secret values.
 
 ### `approvalsBridge` modes
 
@@ -130,4 +186,18 @@ python3 examples/hermes_dsh_mcp.py call config_get '{}'   # full runtime config;
 ```
 
 `config_get` is the fastest way to confirm what the running process actually believes its
-configuration is — it echoes every runtime field above (with `authToken` reduced to a boolean).
+configuration is — it echoes every runtime field above (with `authToken` reduced to a boolean,
+and `notify.callbackPreset` reduced to structure + header *names* only).
+
+Two newer fields worth checking after an upgrade:
+
+- `notify.callbackPreset` — `{configured, url, method, headerNames, events, timeoutMs,
+  hasReplyContext, replyContextKeys, autoApply, requireReplyRoute}`. If you configured a preset
+  and `configured` is `false`, your `callbackPreset` was rejected as invalid (the startup log
+  has a `invalid callbackPreset, keep unset` warning). `headerNames` is post-sanitization, so
+  reserved headers like `host` will not appear there — that is correct, they are always
+  stripped at delivery.
+- `sessionSearch` — `{backend, fallbackReason?}`. `backend: "scan"` means the built-in scan
+  path is in use; on dsh 0.1.7 that is the expected default because dsh ships
+  `openAt: "never"`. If you enabled the official index and still see `"scan"`, `fallbackReason`
+  names the failure (see `docs/KNOWN_ISSUES.md`, upstream limitation A).

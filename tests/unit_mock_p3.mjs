@@ -426,7 +426,7 @@ let S1
   const pgAfter = await callTool(PW, 'policy_get', { sessionId: S1 })
   check('A set_policy 后 policy_get 反映新档(override)', pgAfter.sandboxMode === 'read-only' && pgAfter.source === 'override', pgAfter)
 
-  const sl = await callTool(PW, 'session_list', { cwd: WS_REAL })
+  const sl = await callTool(PW, 'session_list', { cwd: WS_REAL, detail: 'full' })
   const ovrRow = sl.sessions?.find((s) => s.id === 'sess-live-ovr')
   check('C session_list 行携带 sandboxMode', ovrRow?.sandboxMode === 'read-only', ovrRow)
   const plainRow = sl.sessions?.find((s) => s.id === 'sess-plain')
@@ -689,7 +689,7 @@ check('C实例 initialize', await initMcp(PC, 'mock-p3c'))
   await rpcD('notifications/initialized', {})
 
   // D1: 无参 session_list —— R1 崩溃路径, 必须不崩且解出 v3 会话
-  const dl = await callD('session_list', {})
+  const dl = await callD('session_list', { detail: 'full' })
   check('[r2] 无参 session_list 对 0.1.5 snapshot 不崩(无 error)', dl.error === undefined, dl)
   check('[r2] session_list 返回 skipped 计数字段', typeof dl.skipped === 'number', dl)
   const v3Row = (dl.sessions ?? []).find((s) => s.id === V3)
@@ -711,7 +711,7 @@ check('C实例 initialize', await initMcp(PC, 'mock-p3c'))
     { revision: 'r2' },                               // 既无 header 也无 id → skipped
     snapOf(V3, '/tmp', 14110),                        // 正常行
   ]
-  const dl2 = await callD('session_list', {})
+  const dl2 = await callD('session_list', { detail: 'full' })
   check('[r2] 畸形持久化条目整体不崩', dl2.error === undefined, dl2)
   check('[r2] 畸形条目计入 skipped=3', dl2.skipped === 3, dl2)
   check('[r2] 正常行仍被列出(逐行容错)', (dl2.sessions ?? []).some((s) => s.id === V3), dl2.sessions)
@@ -723,7 +723,7 @@ check('C实例 initialize', await initMcp(PC, 'mock-p3c'))
     if (String(sid) === V3_B) throw new Error('simulated per-row read failure')
     return goodOpen(sid)
   }
-  const dl3 = await callD('session_list', {})
+  const dl3 = await callD('session_list', { detail: 'full' })
   check('[r2] 单行读取失败不外抛(整体仍成功)', dl3.error === undefined, dl3)
   check('[r2] 失败行未进入结果', !(dl3.sessions ?? []).some((s) => s.id === V3_B), dl3.sessions)
   check('[r2] 其余行正常返回(证明是逐行容错而非整表放弃)', (dl3.sessions ?? []).some((s) => s.id === V3), dl3.sessions)

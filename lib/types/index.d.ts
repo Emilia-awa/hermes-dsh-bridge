@@ -57,6 +57,7 @@
  */
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval';
 import type { Context } from '@deepseek-ai/cordis';
+import type { SessionHeader } from '@deepseek-ai/dsh-session';
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /**
@@ -113,7 +114,50 @@ export interface Config {
     defaultCallbackSecret?: string;
     /** [P0 回调] 私网/回环回调目标放行名单(精确 host:port 或 host; 命中即放行 SSRF 私网拦截; 用于本机内网 Hermes 网关) */
     allowedCallbackHosts?: string[];
+    /**
+     * [r1 回调预设] 部署级默认回调(task_inbox 不传 callback, 或只传部分字段时自动套用; 任务级覆盖部署级)。
+     * 目的: 把"url/headers/events/replyContext 每次手写、漏一个就静默失效"收敛成配一次。
+     * 不配 = 与旧版完全一致(零行为变化)。
+     */
+    callbackPreset?: CallbackPresetConfig;
 }
+/**
+ * [r1] 部署级回调预设(PLAN_r1 §2.3)。
+ * 注意: **不设 secret 字段**(裁决 D7) —— secret 是安全凭据, 唯一权威来源是 defaultCallbackSecret;
+ * 需要自定义头(如 Hermes 只认的 X-Gitlab-Token)时用 headers 显式承载。
+ * 预设**不放宽任何安全策略**(裁决 D9): SSRF 守卫在合并之后照常执行。
+ */
+export interface CallbackPresetConfig {
+    /** 默认回调接收地址(有了它, 调用方可以完全不传 callback) */
+    url?: string;
+    /** 默认 HTTP 方法(默认 POST) */
+    method?: 'POST' | 'PUT';
+    /** 默认请求头(与任务级 headers 浅合并, 任务级同名覆盖; 保留头一律剔除) */
+    headers?: Record<string, string>;
+    /** 默认订阅事件(缺省 = ['done','error']; 显式 [] = 订阅全部, 对齐 Hermes 桥侧语义) */
+    events?: Array<'done' | 'error' | 'cancelled'>;
+    /** 默认 replyContext(与任务级 replyContext 深合并一层, 任务级优先; 静态字段放这里) */
+    replyContext?: Record<string, unknown>;
+    /** 默认投递超时毫秒(默认 5000, 范围 [1000,30000]) */
+    timeoutMs?: number;
+    /** 是否允许"不传 callback"也自动套用预设(默认 true) */
+    autoApply?: boolean;
+    /**
+     * (可选, 默认 false)是否强制要求本次回调能解析出路由字段。
+     * 背景: Hermes 侧已按 replyContext 路由(deliver_extra.chat_id = {replyContext.replyChatId}),
+     * 而 Hermes 模板取不到值时会**原样返回字面量串**当 chat_id → 静默误投。开启本项后,
+     * 若合并结果里没有任何 *ChatId/chatId 字段则直接报错, 用一次配置换掉一整类静默故障。
+     */
+    requireReplyRoute?: boolean;
+}
+/** [r1] config_get 用的预设摘要(只回显结构, 绝不回显 secret / header 值) */
+declare function describeCallbackPreset(): Record<string, unknown>;
+/**
+ * [r1] 部署配置校验: 非法 callbackPreset 一律回落到"未配置"(并告警), 不阻断启动。
+ * 逐字段校验, 任何一项类型不对就整体判非法 —— 回调配置错配会导致静默失效, 宁可显式告警。
+ * @returns 规范化后的预设; undefined = 非法
+ */
+declare function normalizeCallbackPreset(raw: unknown): CallbackPresetConfig | undefined;
 /**
  * [r3] C: 三类错误统一文案构造器 —— `<错误>: <关键值> (<原因一句话>; <下一步动作>)`。
  * 所有工具的错误串都经此拼装(不再各自手写后缀), 保证 agent 每次都能读到"下一步动作"。
@@ -240,7 +284,11 @@ interface TaskCallbackConfig {
     headers?: Record<string, string>;
     /** HMAC-SHA256 签名密钥(缺省回填部署级 defaultCallbackSecret; 两者皆空 = 不签名并在返回体提示) */
     secret?: string;
-    /** 订阅的终态事件(默认 ['done','error']; 'cancelled' 需显式订阅且不含 result) */
+    /**
+     * 订阅的终态事件。缺省 ['done','error']; 'cancelled' 需显式订阅且不含 result。
+     * [r1] 空数组 `[]` = **订阅全部**(对齐 Hermes 桥侧 events:[] 语义, 裁决 D6);
+     * 判定见 dispatchTaskCallback: `events.length === 0 || events.includes(status)`。
+     */
     events: Array<'done' | 'error' | 'cancelled'>;
     /** 调用方自定义上下文(opaque, 原样放回 payload.replyContext; 用于发起方会话路由/唤醒) */
     replyContext?: unknown;
@@ -270,13 +318,28 @@ declare function ssrfGuardCheck(rawUrl: string, allowedHosts: readonly string[])
 /**
  * [P0 回调] 解析 task_inbox.callback → 运行时配置(入口一次性完成: schema 已过, 这里只做
  * SSRF 判定 + secret 缺省回填 + 保留头剔除 + replyContext 序列化体积上限)。
- * 成功返回 { config, signed }, 失败返回 { error }(文案走 errText 统一句式)。
+ * [r1] 增加部署级预设(callbackPreset)支持: 合并语义为"任务级 > 预设 > 内置默认"(PLAN_r1 §2.4),
+ *      SSRF 守卫**置于合并之后**(预设不放宽任何安全策略, 裁决 D9)。
+ * 成功返回 { config, signed, source }, 失败返回 { error }(文案走 errText 统一句式)。
  */
 declare function resolveCallback(raw: unknown): {
     config?: TaskCallbackConfig;
     signed?: boolean;
+    source?: CallbackSource;
     error?: string;
 };
+/** [r1] 回调配置的实际来源(用于 task_inbox 返回体自解释) */
+export type CallbackSource = 'preset' | 'preset+task' | 'task';
+/** [r1] headers 净化: 仅接受 string→string 平面映射, 剔除保留头(host/content-length/connection/transfer-encoding) */
+declare function sanitizeCallbackHeaders(raw: unknown): Record<string, string> | undefined;
+/** [r1] headers 浅合并: 任务级同名覆盖预设; 任一侧缺失就取另一侧(合并后再净化一次, 防预设里夹带保留头) */
+declare function mergeCallbackHeaders(base: Record<string, string> | undefined, override: Record<string, string> | undefined): Record<string, string> | undefined;
+/** [r1] replyContext 深合并(一层): 两侧都是平面对象才逐键合并(任务级优先), 否则任务级整体覆盖 */
+declare function mergeReplyContext(base: unknown, override: unknown): unknown;
+/** [r1] 检测形如 "{replyContext.xxx}" 的字面量模板串(Hermes 模板取不到值时会原样当值用 → 静默误投) */
+declare function findLiteralTemplateValue(value: unknown): string | undefined;
+/** [r1] replyContext 里是否存在聊天路由字段(键名含 chatid, 大小写与分隔符不敏感; Hermes 用 replyChatId) */
+declare function hasReplyRouteField(value: unknown): boolean;
 /**
  * [P0 回调] 组装标准回调 Envelope 载荷(REQ §2 字段逐一对应)。
  * result 仅 done 且存在时携带(经 truncateResult 裁剪); cancelled 不携带 result/error(收尾时已删);
@@ -292,6 +355,46 @@ declare function signCallbackPayload(secret: string, timestamp: number, rawBody:
 declare function safeEqualStr(a: string, b: string): boolean;
 /** [P0 回调] 提取回调 URL 的 host(:port)(日志/回显脱敏用, 不含 path/query) */
 declare function hostOfCallbackUrl(url: string): string;
+/** [r1] 一条会话语料行: header + 免费排序键(sizeBytes 来自 list(), mtime 来自批量探测) */
+interface CorpusRow {
+    header: SessionHeader;
+    /** 该 id 当前是否存在于 ctx.sessions(live) */
+    live: boolean;
+    /** 排序键: live 末事件 time > 盘上 mtime > header.createdAt */
+    updatedAt: number;
+    /** 物理落盘字节数(list() 免费提供; 拿不到则缺省) */
+    sizeBytes?: number;
+}
+/** [r1] 项目目录名编码: header.cwd → 物理目录名。
+ *  实测本机布局为 `--<cwd 去前导 / 且 / → ->--`, 且 '@' 会被编码成 '~0040'
+ *  (例: /root/.dsh/profiles/web/node_modules/@chushixixin/dsh-harness-mcp-server
+ *   → --root-.dsh-profiles-web-node_modules-~0040chushixixin-dsh-harness-mcp-server--)。
+ *  这是宿主私有布局的 best-effort 推导: 推错只会让该行退回 createdAt, 不影响正确性。 */
+declare function projectDirNameOf(cwd: string): string | undefined;
+/**
+ * [r1] A2: 整批取"盘上真实 mtime"(绝不调用 persistence.stat() —— 那是 O(树) 的, 实测 47~60ms/次)。
+ * 三级策略, 全部失败不影响正确性:
+ *   ① locate(header) 命中就用(便宜, 但本机 94% 因上游 locate() bug 拿不到, 只能当优化);
+ *   ② 未命中的用 header.cwd 推导项目目录名 + readdir 该会话目录, 取 session.v*.jsonl.* 最新 mtime;
+ *   ③ 仍失败 → 不返回该 id(调用方回退 header.createdAt, 如实体现不伪造)。
+ * @param headers 需要 mtime 的 header 列表(冷会话)
+ * @returns sessionId(str) → mtimeMs
+ */
+declare function batchUpdatedAt(ctx: Context, headers: readonly SessionHeader[], sessionsRoot: string | undefined): Promise<Map<string, number>>;
+/**
+ * [r1] A1: 一次拿到全量会话的 header 与排序键(替代 listMergedHeaders + N×roughUpdatedAt)。
+ * 数据源优先级:
+ *   ① ctx.sessionQuery.listSessions()(0.1.7 官方, live 优先 + newest-first, 只读 header; 实测 646ms/198 会话);
+ *   ② 回退 persistence.list() + live store 手工合并(0.1.2/0.1.5/0.1.7 服务缺失时同样快)。
+ * 排序键优先级: live 末事件 time(纯内存) > 批量 mtime > header.createdAt。
+ * @returns rows(未排序) / skipped(畸形条目) / skippedNoCwd(cwd 缺失) / source(实际数据源)
+ */
+declare function listCorpus(ctx: Context): Promise<{
+    rows: CorpusRow[];
+    skipped: number;
+    skippedNoCwd: number;
+    source: 'sessionQuery' | 'persistence' | 'live-only';
+}>;
 /** 挂起审批条目(web 桥来自 mux 帧, 带 rpcId; builtin 桥来自 answerer 直收, 带 settle) */
 interface PendingApproval {
     approvalId: string;
@@ -341,6 +444,18 @@ export declare const __internals: {
     signCallbackPayload: typeof signCallbackPayload;
     safeEqualStr: typeof safeEqualStr;
     hostOfCallbackUrl: typeof hostOfCallbackUrl;
+    mergeReplyContext: typeof mergeReplyContext;
+    mergeCallbackHeaders: typeof mergeCallbackHeaders;
+    sanitizeCallbackHeaders: typeof sanitizeCallbackHeaders;
+    findLiteralTemplateValue: typeof findLiteralTemplateValue;
+    hasReplyRouteField: typeof hasReplyRouteField;
+    normalizeCallbackPreset: typeof normalizeCallbackPreset;
+    describeCallbackPreset: typeof describeCallbackPreset;
+    listCorpus: typeof listCorpus;
+    projectDirNameOf: typeof projectDirNameOf;
+    batchUpdatedAt: typeof batchUpdatedAt;
+    SESSION_LIST_INSPECT_CONCURRENCY: number;
+    SESSION_LIST_INSPECT_TIMEOUT_MS: number;
     VERSION: string;
 };
 export {};

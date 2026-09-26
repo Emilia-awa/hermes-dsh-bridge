@@ -1,9 +1,9 @@
-# TOOLS — Full Reference (26 tools)
+# TOOLS — Full Reference (25 tools by default, 26 with fs_write)
 
 > **Ground truth**: every parameter table below was checked against the tool's actual
 > `zod` schema and its `validateArgs` spec in `src/index.ts`, and the live `tools/list`
-> output of a running 0.8.0 server. 25 tools are registered by default; `fs_write` is the
-> 26th and only appears when the deployment sets `enableFsWrite: true`.
+> output of a running server (`tools/list` returns **25** on a default deployment;
+> `fs_write` is the 26th and only appears when the deployment sets `enableFsWrite: true`).
 
 All tools are MCP tools on the StreamableHTTP server (default `http://127.0.0.1:8090/mcp`).
 Every response is JSON; because tool results are returned as MCP text content, the object
@@ -137,14 +137,33 @@ aborting `running` tasks.
 | `cwd` | string | — | Filter by working directory (realpath-normalized exact match). Omit = all sessions. |
 | `limit` | number | — | Page size, `1..50`, default 20. |
 | `offset` | number | — | Skip the first N rows (default 0). |
+| `detail` | enum | — | `brief` (default) \| `full`. See below. |
 
-**Returns**: `{ total, count, offset, limit, truncated, skipped, next?, sessions: [...] }`,
-newest first. Each row:
-`{ id, title, cwd, createdAt, createdAt_epoch, updatedAt, updatedAt_epoch, messageCount, inputTokens, outputTokens, llmTime, llmTimeHuman, sandboxMode? }`.
+**Returns**: `{ total, count, offset, limit, detail, truncated, skipped, skippedNoCwd?, source, detailHint?, next?, sessions: [...] }`,
+newest first.
 
-- Live + persisted sessions are merged and deduped by id.
+**`detail` — why there are two modes.** Computing `messageCount` / token totals / `title`
+requires reading each session's *entire* event log (zstd decompress + JSON parse). Doing that
+for every row is what made this call take 10s+ on a large history. So:
+
+- **`detail: "brief"` (default)** — returns only fields that are free to obtain, and **never
+  reads an event log**:
+  `{ id, title, cwd, createdAt, createdAt_epoch, updatedAt, updatedAt_epoch, tokensAvailable: false, sizeBytes?, live }`
+  `title` falls back to `(untitled <id8>)`; `tokensAvailable: false` is explicit so an absent
+  count is never mistaken for a real `0`. Cost is independent of history size.
+- **`detail: "full"`** — additionally returns
+  `{ messageCount, inputTokens, outputTokens, llmTime, llmTimeHuman, sandboxMode? }`
+  by reading the logs of the **selected page only** (concurrency 4, 3s per-session timeout;
+  a timed-out session is counted in `skipped` rather than stalling the call).
+
+Use `brief` to find a session id; ask for `full` only when you actually need the numbers.
+
+- `source` reports which backend produced the listing: `sessionQuery` (dsh 0.1.7 official
+  fast path) \| `persistence` \| `live-only`.
 - `skipped` counts sessions dropped by per-row fault isolation (`0` = everything read); one
   unreadable/malformed entry never fails the whole listing.
+- `skippedNoCwd` counts sessions excluded from a `cwd` filter because their header has no
+  `cwd` (reported instead of silently ignored, so "empty" is never misdiagnosed).
 - `sandboxMode` appears only when the session has at least one `sandbox/mode` event.
 - If nothing matches, this returns the unified `session is empty: <key> (...)` error rather
   than an empty array.
@@ -196,7 +215,7 @@ token accounting; `tokensPerSec` is `null` when no decode time was recorded.
 | `pageSize` | number | — | Hits per page, `1..100`, default 20. |
 
 **Returns** (pretty-printed):
-`{ query, regex, total, count, offset, limit, truncated, matched, scanned, content_search, results: [...], next?, hint }`.
+`{ query, regex, total, count, offset, limit, truncated, matched, scanned, content_search, backend, indexFallbackReason?, skippedNoCwd?, results: [...], next?, hint }`.
 
 ⚠️ `total` means **sessions scanned**, not matches — `matched` is the hit count and `scanned`
 is an equivalent alias. `content_search: false` means only titles were searched (content scan
@@ -204,6 +223,18 @@ was impossible/skipped). Each result:
 `{ sessionId, title, cwd, updatedAt, updatedAt_epoch, matched: "title"|"content", snippet? }`.
 Titles are matched first; content matching is best-effort with a per-session 2 s timeout and
 concurrency 8. `hint` tells you what to do next (use the id, or how to widen the search).
+
+**`backend` — which search engine actually ran:**
+
+- `"index"` — dsh 0.1.7's official full-text session index (`ctx.sessionQuery.searchSessions`)
+  was available and used. Fast, and returns `snippet`s from the index.
+- `"scan"` — the built-in scan path (list sessions → newest 200 → read each log).
+
+The official index is **opt-in in dsh itself**: its default profile config ships
+`openAt: "never"`, so search is disabled and this tool transparently falls back to `"scan"`.
+Any `SESSION_QUERY_*` failure (disabled index, or sessions whose on-disk log cannot be
+resolved) is likewise swallowed and reported as `indexFallbackReason` rather than surfaced as
+an error — a broken index never breaks `session_search`. `regex: true` always uses `"scan"`.
 
 ### `rename_session`
 
@@ -215,7 +246,7 @@ concurrency 8. `hint` tells you what to do next (use the id, or how to widen the
 **Returns**: `{ ok: true, sessionId, title }`. **Only live sessions can be renamed** — a cold
 session returns `session not found: <id> (...)` plus a note to wake it with `agent_run` first.
 If the deployment has no `sessionTitle` service it returns
-`sessionTitle service unavailable (...)`. See [KNOWN_ISSUES.md](./KNOWN_ISSUES.md#-6-rename_session-错误文案里的分号拼接)
+`sessionTitle service unavailable (...)`. See [KNOWN_ISSUES.md item 6](./KNOWN_ISSUES.md#6-rename_session-错误文案里的分号拼接)
 for a cosmetic shape issue in this tool's error string.
 
 ### `attach_session`
