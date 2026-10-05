@@ -97,20 +97,13 @@ agent 需要提权时走审批桥（`web` / `builtin` / `file-push` / `off` 四�
 ```bash
 PROFILE=<你的 profile 名>          # 例: web
 
-# ① 装插件
+# ① 装插件（dual-package hazard 修复已由 postinstall 自动完成）
 cd ~/.dsh/profiles/$PROFILE/node_modules && npm install hermes-dsh-bridge
 
-# ② 修 dual-package hazard（必做 —— 不做 agent 会「嘴炮」，有工具却不执行）
-GLOBAL_TREE=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
-for pkg in cordis cosmokit dsh-agent dsh-llm dsh-session dsh-tools dsh-scope \
-           dsh-agent-presets dsh-code-runtime dsh-system-prompt dsh-typert-protocol \
-           dsh-attachment dsh-brand dsh-invariants dsh-timeout dsh-settings \
-           dsh-home-paths dsh-atomic-write dsh-user-approval \
-           cordis-plugin-include cordis-plugin-loader; do
-  rm -rf "@deepseek-ai/$pkg" 2>/dev/null; ln -sfn "$GLOBAL_TREE/$pkg" "@deepseek-ai/$pkg"
-done
+# 装完可以核对一下（应显示 symlink 20 / 保留本地副本 2）：
+node node_modules/hermes-dsh-bridge/scripts/link-host-deps.mjs --dry-run
 
-# ③ 在 profile 的 cordis.patch.yml 末尾追加配置
+# ② 在 profile 的 cordis.patch.yml 末尾追加配置
 cat >> ~/.dsh/profiles/$PROFILE/cordis.patch.yml <<'EOF'
 - insert:
     - id: hermes-dsh-bridge
@@ -123,7 +116,7 @@ cat >> ~/.dsh/profiles/$PROFILE/cordis.patch.yml <<'EOF'
         model: <你的 model id>          # ← 同上
 EOF
 
-# ④ 重启 + 自检
+# ③ 重启 + 自检
 systemctl restart dsh.service
 node scripts/doctor.mjs --profile $PROFILE     # 逐项告诉你哪里没配好
 ```
@@ -241,7 +234,7 @@ dsh
 
 运行时
   ✓ 8090 端口监听 — 127.0.0.1:8090 已监听
-  ✓ MCP 握手 — serverInfo.name=harness version=0.11.0
+  ✓ MCP 握手 — serverInfo.name=harness version=0.11.1
   ✓ tools/list 工具可用 — 25 个工具(含 agent_run, session_stats, preset_set, fs_read)
 
 ────────────────────────────────────────────────────────────

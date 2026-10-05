@@ -34,8 +34,32 @@ import { dirname, join, resolve } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SCOPE = '@deepseek-ai'
-const LOCAL_SCOPE_DIR = join(ROOT, 'node_modules', SCOPE)
 const HOST_REL = join(SCOPE, 'dsh', 'node_modules', SCOPE)
+
+/**
+ * 定位本插件依赖的 scope 目录。
+ *
+ * ⚠️ 不能只看 `<插件根>/node_modules/@deepseek-ai` —— npm 会把依赖 **hoist 到上层**
+ * `node_modules`（实测：插件装在 `<项目>/node_modules/hermes-dsh-bridge` 时，
+ * `@deepseek-ai/*` 落在 `<项目>/node_modules/@deepseek-ai`，插件内那个目录**根本不存在**）。
+ * 所以按 Node 的解析顺序自下而上找第一个存在的，与运行时 `import` 的解析结果一致。
+ */
+function detectLocalScopeDir() {
+  const starts = [ROOT]
+  // postinstall 时 cwd 可能是上层项目根；也纳入搜索起点（npm 从项目根跑脚本）
+  if (process.cwd() !== ROOT) starts.push(process.cwd())
+  for (const start of starts) {
+    let dir = start
+    for (let i = 0; i < 12; i++) {
+      const candidate = join(dir, 'node_modules', SCOPE)
+      if (existsSync(candidate)) return candidate
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+  }
+  return undefined
+}
 
 const args = process.argv.slice(2)
 const DRY_RUN = args.includes('--dry-run')
@@ -87,10 +111,15 @@ function entryState(path) {
 }
 
 function main() {
-  console.log(`[link-host-deps] 插件本地 scope 目录: ${LOCAL_SCOPE_DIR}`)
-  if (!existsSync(LOCAL_SCOPE_DIR)) {
-    console.error(`[link-host-deps] ✗ 本地 ${SCOPE} 目录不存在 —— 先在该插件目录跑 npm install`)
+  const LOCAL_SCOPE_DIR = detectLocalScopeDir()
+  console.log(`[link-host-deps] 插件本地 scope 目录: ${LOCAL_SCOPE_DIR ?? '(未找到)'}`)
+  if (!LOCAL_SCOPE_DIR) {
+    console.error(`[link-host-deps] ✗ 向上找不到 ${SCOPE} 目录 —— 该插件还没装依赖。`)
+    console.error('  正常安装流程下这一步由 npm 自动完成；手动跑请先在插件所在项目根执行 npm install。')
     process.exit(1)
+  }
+  if (LOCAL_SCOPE_DIR !== join(ROOT, 'node_modules', SCOPE)) {
+    console.log(`[link-host-deps]   （依赖被 npm hoist 到上层，与运行时解析一致）`)
   }
 
   const hostTree = detectHostTree()

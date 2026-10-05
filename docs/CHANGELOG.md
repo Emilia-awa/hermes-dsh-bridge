@@ -4,6 +4,32 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [`0.11.1`] — 安装自动化（dual-package hazard 修复不再手写）
+
+**升级收益一眼看**：过去装完插件必须手写一段 22 行的 symlink 命令，**不做 agent 就变成
+「嘴炮」**（有工具却不执行，且没有任何报错）。现在 `npm install` 时由 `postinstall` 自动完成，
+安装从 4 步降到 3 步。忘了手动修的那种静默故障，从根上不会再发生。
+
+### Added
+- **`postinstall` 自动对齐宿主依赖**：调用 `scripts/link-host-deps.mjs` 把插件
+  `@deepseek-ai/*` 本地副本换成指向宿主全局树的 symlink，消除 dual-package hazard。
+  脚本本身幂等、有 `--dry-run`，找不到宿主树时**只警告不阻断安装**（Harness 还没装的人
+  依然能装好这个包，之后再手动跑）。
+
+### Fixed
+- **`link-host-deps` 在真实安装布局下失效（本版核心）**：npm 会把依赖 **hoist 到上层**
+  `node_modules` —— 用户装 `<项目>/node_modules/hermes-dsh-bridge` 时，`@deepseek-ai/*`
+  落在 `<项目>/node_modules/@deepseek-ai`，**插件内那个目录根本不存在**。旧脚本只看插件内一层，
+  于是 postinstall 永远报「本地目录不存在」并 exit 1，自动化形同虚设（实测：装完 0 个 symlink）。
+  现在按 Node 的解析顺序**自下而上查找**第一个存在的 scope 目录，与运行时 `import` 的解析结果
+  一致；输出里也会说明「依赖被 hoist 到上层」，不让人误以为装错了。
+  实测：修前 `symlink=0`，修后 `symlink=23 / 真实目录=2`（剩下 2 个是宿主树本就没有的孤儿包）。
+
+### Tests
+- `tests/link_host_deps_r10.mjs`：**14 项**，用真实文件系统造出 hoist / 自包含 / 未安装三种布局，
+  跑真脚本断言定位结果、报错行为与幂等性。变异验证：把「向上查找」改回「只看插件内」→ 6 项变红。
+- 全量 `npm test`：**687 项全绿**（R9 基线 673 + R10 新增 14）。
+
 ## [`0.11.0`] — `session_search` 参数语义修复（**破坏性变更**）
 
 **升级收益一眼看**：`session_search` 的 `limit` 过去**同时**控制「扫多少个会话」和「返回多少条」，

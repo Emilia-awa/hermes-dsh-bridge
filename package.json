@@ -1,6 +1,6 @@
 {
   "name": "hermes-dsh-bridge",
-  "version": "0.11.0",
+  "version": "0.11.1",
   "description": "Expose DeepSeek Harness agent capabilities as an MCP server, so an external MCP client (e.g. Hermes) can drive Harness to execute coding tasks. Hermes = brain, Harness = arms.",
   "type": "module",
   "main": "lib/index.js",
@@ -20,10 +20,11 @@
     "docs/TROUBLESHOOTING.md"
   ],
   "scripts": {
+    "postinstall": "node scripts/link-host-deps.mjs || echo \"[hermes-dsh-bridge] postinstall: link-host-deps 未成功（多半是找不到 Harness 全局树）—— 请手动跑 `node scripts/link-host-deps.mjs`，或看 README「dual-package hazard」一节。这不影响安装完成。\"",
     "build": "tsdown --env.DSH_BUILD_FACE host && tsc -b && node scripts/check-build-artifacts.mjs",
     "build:clean": "rm -rf lib && npm run build",
     "doctor": "node scripts/doctor.mjs",
-    "test": "node tests/unit_mock_p1.mjs && node tests/unit_mock_p2.mjs && node tests/unit_mock_p3.mjs && node tests/unit_callback_p0.mjs && node tests/unit_mock_r1.mjs && node tests/unit_contract_p0.mjs && node tests/unit_r7.mjs && node tests/unit_r8.mjs && node tests/unit_r9.mjs",
+    "test": "node tests/unit_mock_p1.mjs && node tests/unit_mock_p2.mjs && node tests/unit_mock_p3.mjs && node tests/unit_callback_p0.mjs && node tests/unit_mock_r1.mjs && node tests/unit_contract_p0.mjs && node tests/unit_r7.mjs && node tests/unit_r8.mjs && node tests/unit_r9.mjs && node tests/link_host_deps_r10.mjs",
     "test:e2e": "node scripts/e2e_r7.mjs",
     "test:mutation": "node scripts/mutation_check_r1.mjs && node scripts/mutation_check_r7.mjs && node scripts/mutation_check_r8.mjs && node scripts/mutation_check_r9.mjs",
     "contract": "node scripts/contract_probe.mjs",
