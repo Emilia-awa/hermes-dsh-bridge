@@ -417,7 +417,10 @@ let S1
 
 {
   const coldSet = await callTool(PW, 'set_policy', { sessionId: 'sess-cold', mode: 'read-only' })
-  check('A 冷会话 set_policy 明确报错(需先 resume)', coldSet.ok === undefined && /not live/.test(String(coldSet.error)) && /resume/.test(String(coldSet.error)), coldSet)
+  // [R7 P2-1] 句式收口: 不再是 `session <id> is not live; ...` 外挂形态, 改为家族统一句式
+  // `<错误>: <关键值> (<原因>; <下一步>)` —— 见下方新增的句式正则断言。
+  check('A 冷会话 set_policy 明确报错(需先 resume)', coldSet.ok === undefined && /not live/.test(String(coldSet.error)) && /resume|唤醒/.test(String(coldSet.error)), coldSet)
+  check('A 冷会话 set_policy 错误串匹配家族句式正则', /^session is not live: .+ \(.+; .+\)$/.test(String(coldSet.error)), coldSet.error)
 
   const liveSet = await callTool(PW, 'set_policy', { sessionId: S1, mode: 'read-only' })
   check('A live 会话 set_policy ok 并回显档位', liveSet.ok === true && liveSet.sandboxMode === 'read-only' && liveSet.source === 'live', liveSet)

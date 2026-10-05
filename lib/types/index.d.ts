@@ -58,6 +58,7 @@
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval';
 import type { Context } from '@deepseek-ai/cordis';
 import type { SessionHeader } from '@deepseek-ai/dsh-session';
+import { probeHostContract, type ContractReport } from './contract.js';
 /** Cordis 插件名 */
 export declare const name = "harness-mcp-server";
 /**
@@ -120,6 +121,14 @@ export interface Config {
      * 不配 = 与旧版完全一致(零行为变化)。
      */
     callbackPreset?: CallbackPresetConfig;
+    /**
+     * [r8] `ask_user_question` 挂起时的通知回调。
+     * 不配 = 保持旧行为(无 answerer, 上游按 NO_PROVIDER/挂起处理)。
+     * 配上后, 桥注册一个 user-questions answerer: 问题一到就**立刻**回调通知发起方,
+     * 并写 `question_<id>.json` 等 `question_answer_<id>.json` 回答案。
+     * 目的: 终结「dsh 卡在等回答、而发起方毫不知情、白等一整夜」这个最阴的静默挂起。
+     */
+    questionCallback?: CallbackPresetConfig;
 }
 /**
  * [r1] 部署级回调预设(PLAN_r1 §2.3)。
@@ -158,6 +167,60 @@ declare function describeCallbackPreset(): Record<string, unknown>;
  * @returns 规范化后的预设; undefined = 非法
  */
 declare function normalizeCallbackPreset(raw: unknown): CallbackPresetConfig | undefined;
+/** 单条降级留痕 */
+interface DegradationRecord {
+    /** 降级发生的范围(如 'sessionQuery'、'apiProxy') */
+    scope: string;
+    /** 人类可读的原因 */
+    reason: string;
+    /** 发生时刻(ms epoch) */
+    at: number;
+    /** 发生次数(同 scope+reason 累加, 便于看出「一直坏」还是「偶发一次」) */
+    count: number;
+    /** 错误摘要(仅首条记录时截取; 不长期持有 error 对象引用) */
+    error?: string;
+}
+/**
+ * 统一降级通道: 留痕 + 计数 + 首次告警。
+ *
+ * - 契约/服务相关的静默 catch 一律改走这里(不允许完全静默);
+ * - 首次出现时 warn(含 scope/reason/error 摘要), 之后只累加计数 —— 拿得到「坏了多少次」又不刷屏;
+ * - 结果通过 `status_get.degradations` 暴露给 Hermes 侧。
+ *
+ * @param scope  降级范围(建议用服务 key 或功能名, 便于 grep 定位)
+ * @param reason 人类可读原因(会出现在日志与 status_get 里)
+ * @param err    原始异常(可选; 只取 message 摘要, 长时间持有对象会阻碍 GC)
+ */
+export declare function degrade(scope: string, reason: string, err?: unknown): void;
+/** 最近 N 条降级留痕(最近发生的在前; 供 status_get 序列化) */
+declare function degradationsSnapshot(): DegradationRecord[];
+/** 清空降级留痕(apply 时重置, 保证重复 apply 幂等不残留上一次的状态) */
+declare function resetDegradations(): void;
+/** provider 默认值引导的探测结果(暴露给 status_get.providerCheck) */
+interface ProviderCheck {
+    /** 本次是否做过探测(false = ctx.llm 不可用, 探测不了) */
+    probed: boolean;
+    /** 当前生效的 provider id */
+    provider: string;
+    /** 该 provider 是否在宿主注册(probed=false 时为 null = 未知) */
+    registered: boolean | null;
+    /** 用户是否在任何一层显式配置过 provider(从未配置 = 用默认值, 才值得提示) */
+    explicit: boolean;
+    /** 宿主实际注册的 provider id 列表(探测失败为空数组) */
+    available: string[];
+}
+/**
+ * [R7 P1-1] 探测「默认 provider 是否在宿主注册」并给出可操作的引导。
+ *
+ * 只在**用户从未显式配置 provider**(即仍在用默认值)且该 provider 未注册时告警 ——
+ * 否则会骚扰那些明确知道自己配了什么的部署方。
+ * 全程 try/catch: 探测本身任何异常都不得影响插件启动(与 contract.ts 同款哲学)。
+ */
+declare function probeProviderDefault(ctx: Context): void;
+/** [r2] A: 会话类错误的统一后缀(下一步动作) */
+/** [r3] C7: 会话不存在 —— 走统一句式 `<错误>: <关键值> (<原因>; <下一步>)` */
+/** [R7 P2-1]: 可选 `next` 覆盖 —— 供调用方把**附加说明**并进 next 参数, 而不是外挂拼接破坏句式 */
+declare function sessionNotFoundError(sessionId: string, next?: string): string;
 /**
  * [r3] C: 三类错误统一文案构造器 —— `<错误>: <关键值> (<原因一句话>; <下一步动作>)`。
  * 所有工具的错误串都经此拼装(不再各自手写后缀), 保证 agent 每次都能读到"下一步动作"。
@@ -169,6 +232,20 @@ declare function missingParamError(tool: string, param: string, expected: string
 declare function idNotFoundError(kind: 'session' | 'task' | 'preset', id: string, next: string): string;
 /** [r3] C: 会话为空(存在但没有任何事件) */
 declare function emptySessionError(sessionId: string): string;
+/**
+ * [R7 P1-2] `fs_read` 的 offset 越界判定(纯函数, 便于单测覆盖全部边界)。
+ *
+ * 背景(R6 §B-3): `off > totalLines` 时 `lines.slice()` 返回空数组 →
+ * 返回体是 `content: ""` + `truncated: false`, **agent 会据此误判「文件是空的」**。
+ *
+ * 边界口径(REQ §3 P1-2 明确规定):
+ *   - `off === totalLines`     → **不算越界**(能读到最后一行, 正常返回);
+ *   - `off === totalLines + 1` → 算越界(确实一行也读不到);
+ *   - 更大值 / 极大值          → 算越界。
+ *
+ * @returns 越界时返回可直接塞进返回体的 `note` 文案; 未越界返回 undefined(不改动正常路径结构)。
+ */
+declare function fsReadOffsetNote(off: number, totalLines: number): string | undefined;
 /**
  * [r3] C: dsh 服务未启动/连接拒绝的判定(错误串或 error.code 命中即算)。
  * 命中后统一附「检查 dsh.service 状态」指引, 避免 agent 只看到裸 ECONNREFUSED。
@@ -250,6 +327,30 @@ declare function fileLandingHint(result: TaskResult, cwd: string): {
     mentionedWrite: boolean;
     pathsInResult: string[];
 } | undefined;
+/** 核心执行: 组装任务(注入记忆上下文+结构化要求) → agent 执行 → 读结构化结果。
+ *  P2 opts: preset=请求级覆盖; onSessionStart=拿到 agent 会话后回调(B 登记 taskRunSessions);
+ *  isCancelled=协作取消探测(B: 锁内/followup 前两个检查点)。
+ *  P3 opts: sandbox=请求级权限三档覆盖(透传 getAgent; 仅影响新建/resume 组合)。 */
+/**
+ * [P0-1] 0-token 显式告警(定向防御 0.1.7 那类静默失效)。
+ *
+ * 判据(与 DISCUSS_20261003 §3.3 落地物 6 一致): `inputTokens === 0 && 会话事件数 === 0`。
+ *   - 0.1.7 事故: `MessageSourceMap` 收紧后插件自带的 `kind:'plugin'` 被判非法, message 被
+ *     上游 `catch(_error){}` 静默吞掉 → agent 秒退、inTok=0、会话零事件、零报错。
+ *   - 正常一次 run 至少会产生一条 `user/message` 事件, 因此「零事件」是强信号;
+ *     仅 inTok=0 但有事件(如只有 system-prompt)不告警, 避免误报。
+ *
+ * 只告警、不改行为: 仍然把结果原样返回给调用方。
+ *
+ * @param result   executeTask 已折叠好的结果(stats.inputTokens 取自 assistant/message.usage)
+ * @param baseline followup 之前的日志长度(事件数 = 本次新增的日志条数)
+ * @param handle   agent 句柄(读 session.log)
+ */
+declare function warnOnEmptyRun(result: TaskResult, baseline: number, handle: {
+    agent: {
+        session: unknown;
+    };
+}): void;
 /** 异步任务队列条目 */
 interface TaskItem {
     id: string;
@@ -353,6 +454,64 @@ declare function buildCallbackPayload(item: TaskItem): Record<string, unknown>;
 declare function signCallbackPayload(secret: string, timestamp: number, rawBody: string): string;
 /** [P0 回调] 恒时字符串比较(验签用; 长度不等时直接 false, 不比较) */
 declare function safeEqualStr(a: string, b: string): boolean;
+/** 待答问题表: questionId → 挂起中的等待项 */
+interface PendingQuestion {
+    questionId: string;
+    sessionId: string;
+    questions: Array<{
+        id: string;
+        question: string;
+        header?: string;
+        options?: Array<{
+            label: string;
+            description?: string;
+        }>;
+        multiSelect?: boolean;
+    }>;
+    requestedAt: number;
+    settle: (answer: AskUserQuestionAnswer) => void;
+    fail: (err: Error) => void;
+    timer?: ReturnType<typeof setTimeout>;
+}
+/**
+ * [r8] 注册 user-questions 应答器。
+ * 返回 true 表示本应答器接管了该请求(并已进入等待), 由 waterfall 语义决定是否继续 next。
+ */
+type AskUserQuestionOption = {
+    label: string;
+    description?: string;
+};
+type AskUserQuestionItem = {
+    id: string;
+    question: string;
+    header?: string;
+    options?: AskUserQuestionOption[];
+    multiSelect?: boolean;
+};
+type AskUserQuestionAnswer = {
+    answers: Array<{
+        id: string;
+        selected: string[];
+        custom?: string;
+    }>;
+};
+declare function makeUserQuestionAnswerer(ctx: Context): (req: {
+    questions?: AskUserQuestionItem[];
+    agent?: {
+        session?: unknown;
+    };
+    signal?: {
+        aborted: boolean;
+    };
+}, next: () => Promise<AskUserQuestionAnswer>) => Promise<AskUserQuestionAnswer>;
+/** 问题应答的文件目录(复用审批桥的目录; 未启用时静默跳过) */
+declare function questionFileDir(): string | null;
+declare function cleanupQuestionFiles(questionId: string): Promise<void>;
+/**
+ * [r8] 消费一个问题应答文件: 内容有效且问题仍挂起 → settle。
+ * 与 handleApprovalResponseFile 同款: 无论结果如何都消费该文件, 防堆积; 半写文件留待下轮。
+ */
+declare function handleQuestionAnswerFile(filePath: string, questionId: string): Promise<void>;
 /** [P0 回调] 提取回调 URL 的 host(:port)(日志/回显脱敏用, 不含 path/query) */
 declare function hostOfCallbackUrl(url: string): string;
 /** [r1] 一条会话语料行: header + 免费排序键(sizeBytes 来自 list(), mtime 来自批量探测) */
@@ -410,6 +569,29 @@ interface PendingApproval {
     /** 超时定时器(approvalTimeoutMs 后收尾, 绝不超时放行) */
     timer?: ReturnType<typeof setTimeout>;
 }
+/** session_search 结果行 */
+interface SessionSearchRow {
+    sessionId: string;
+    title: string;
+    cwd?: string;
+    updatedAt: number;
+    matched: 'title' | 'content';
+    snippet?: string;
+    /** [R9 P3] 该命中被判为"几乎每个会话都命中的样板文字"(已降权沉底); 仅标注, 不删除 */
+    boilerplate?: boolean;
+}
+declare function noiseKey(snippet: string): string;
+/**
+ * 统计本次命中的 snippet 频次, 返回"疑似模板"的 key 集合。
+ *
+ * 判定分两步:
+ *   1. **前缀同簇**: 若一个 key 是另一个 key 的前缀(短的那个更短), 归入同一簇
+ *      —— 处理"窗口起点相同、后段因上下文不同而分叉"的样板;
+ *   2. **簇占比 ≥ 阈值**(且样本 ≥ 门槛)→ 簇内全部 key 标记为噪音。
+ *
+ * 只在样本足够(≥ NOISE_MIN_SAMPLE)时才判定, 避免小样本误杀。
+ */
+declare function detectBoilerplateKeys(rows: readonly SessionSearchRow[]): Set<string>;
 /**
  * 插件入口: 启动 MCP server(StreamableHTTP, 跨网), 通过 ctx 桥接 Harness 能力。
  */
@@ -424,6 +606,7 @@ export declare const __internals: {
     missingParamError: typeof missingParamError;
     idNotFoundError: typeof idNotFoundError;
     emptySessionError: typeof emptySessionError;
+    sessionNotFoundError: typeof sessionNotFoundError;
     isDshServiceDown: typeof isDshServiceDown;
     toolFailure: typeof toolFailure;
     validateArgs: typeof validateArgs;
@@ -456,6 +639,34 @@ export declare const __internals: {
     batchUpdatedAt: typeof batchUpdatedAt;
     SESSION_LIST_INSPECT_CONCURRENCY: number;
     SESSION_LIST_INSPECT_TIMEOUT_MS: number;
+    degrade: typeof degrade;
+    probeHostContract: typeof probeHostContract;
+    HOST_CONTRACT: {
+        readonly required: readonly import("./contract.js").RequiredSymbol[];
+        readonly services: readonly import("./contract.js").ServiceContract[];
+    };
+    degradationsSnapshot: typeof degradationsSnapshot;
+    resetDegradations: typeof resetDegradations;
+    warnOnEmptyRun: typeof warnOnEmptyRun;
+    readonly contractReport: ContractReport | undefined;
+    probeProviderDefault: typeof probeProviderDefault;
+    readonly providerCheck: ProviderCheck | undefined;
+    DEFAULT_PROVIDER_ID: string;
+    fsReadOffsetNote: typeof fsReadOffsetNote;
+    INDEX_FALLBACK_HINT: string;
+    pendingQuestions: Map<string, PendingQuestion>;
+    makeUserQuestionAnswerer: typeof makeUserQuestionAnswerer;
+    QUESTION_ANSWER_TIMEOUT_MS: number;
+    handleQuestionAnswerFile: typeof handleQuestionAnswerFile;
+    cleanupQuestionFiles: typeof cleanupQuestionFiles;
+    questionFileDir: typeof questionFileDir;
+    approvalBridgeFilesForTest: {
+        dir: string;
+    } | null;
+    detectBoilerplateKeys: typeof detectBoilerplateKeys;
+    noiseKey: typeof noiseKey;
+    NOISE_MIN_SAMPLE: number;
+    NOISE_MIN_RATIO: number;
     VERSION: string;
 };
 export {};

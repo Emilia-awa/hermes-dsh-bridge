@@ -210,25 +210,54 @@ token accounting; `tokensPerSec` is `null` when no decode time was recorded.
 | `query` | string | ✅ | Substring match (case-insensitive), or regex when `regex: true`. Whitespace-only is rejected. |
 | `cwd` | string | — | Restrict to sessions under this working directory (realpath exact match). |
 | `regex` | boolean | — | Treat `query` as a regex (default false). Invalid regex → `invalid regex: <query> (...)`. |
-| `limit` | number | — | Max **sessions to scan**, `1..200`, default 50. |
+| `scan` | number | — | Max **sessions to scan** (how *thorough*), `1..200`, default 50. Bigger = more complete but slower. |
+| `limit` | number | — | Max **hits to return** (how *many*), `1..100`, default 20. Same meaning as `limit` on `session_list` / `task_list` / `approval_list`. **Does not affect scan depth.** |
 | `offset` | number | — | Page offset into the hits (default 0). |
-| `pageSize` | number | — | Hits per page, `1..100`, default 20. |
+| `pageSize` | number | — | ⚠️ Legacy alias for `limit` (kept for old callers). `limit` wins when both are passed. |
+| `filter_noise` | boolean | — | Demote "boilerplate" hits that nearly every session matches (default `true`). Set `false` for the raw `updatedAt` order. |
+
+> ⚠️ **Breaking change in `0.11.0`** — `limit` used to mean **scan depth** (default 50, `1..200`).
+> That meaning moved to the new **`scan`** parameter. `limit` now means **hits returned** (default 20,
+> `1..100`), matching every other list tool in this server. Migration: old `limit=200` (wanted a
+> deeper scan) → `scan: 200`; to get more hits per page → `limit: 100` (impossible before).
 
 **Returns** (pretty-printed):
-`{ query, regex, total, count, offset, limit, truncated, matched, scanned, content_search, backend, indexFallbackReason?, skippedNoCwd?, results: [...], next?, hint }`.
+`{ query, regex, total, count, offset, limit, truncated, hasMore, matched, matchedTotal, scanned, scannedSessions, omitted, scan, content_search, filter_noise, boilerplate_count, backend, indexFallbackReason?, indexFallbackHint?, skippedNoCwd?, results: [...], next?, hint }`.
 
-⚠️ `total` means **sessions scanned**, not matches — `matched` is the hit count and `scanned`
-is an equivalent alias. `content_search: false` means only titles were searched (content scan
-was impossible/skipped). Each result:
-`{ sessionId, title, cwd, updatedAt, updatedAt_epoch, matched: "title"|"content", snippet? }`.
+**The three numbers — read this once and stop guessing:**
+
+| Field | Meaning |
+|---|---|
+| `total` | **Sessions scanned** this call (not the result count). Kept for backward compat; same value as `scanned` / `scannedSessions`. |
+| `matched` / `matchedTotal` | **Total hits** found inside those scanned sessions. |
+| `count` | **Hits in this page** (`results.length`). |
+
+⚠️ `total` is **not** "total results" — that would be `matchedTotal`. When `matchedTotal > count`
+the response **always** carries `omitted` (how many hits you did *not* get), `hasMore: true`, and
+`next` (how to fetch the following page, e.g. `offset=20&limit=20`). Silent dropping is impossible.
+`omitted` is `0` when everything fit. `content_search: false` means only titles were searched
+(content scan was impossible/skipped). Each result:
+`{ sessionId, title, cwd, updatedAt, updatedAt_epoch, matched: "title"|"content", snippet?, boilerplate? }`.
 Titles are matched first; content matching is best-effort with a per-session 2 s timeout and
 concurrency 8. `hint` tells you what to do next (use the id, or how to widen the search).
+
+**Boilerplate demotion (`filter_noise`, default on):** when many hits share a *byte-identical*
+snippet — e.g. a client's system prompt that every session contains — those hits are demoted to the
+end of the result list and flagged `boilerplate: true` (`boilerplate_count` in the envelope says how
+many). They are **not removed**. Detection is statistical, not a hardcoded blacklist, so it survives
+client changes: snippets are normalized and grouped into clusters (near-identical leading text —
+same prefix, or ≥ 60 % shared prefix — merges into one cluster); a cluster covering **≥ 60 %** of
+snippet-bearing hits (with ≥ 5 samples) is treated as boilerplate. The threshold is 60 % rather than
+a stricter 80 % because one system prompt can produce *several* near-identical fragments that each
+fall short of a higher bar — measured on a real 184-session corpus, one query split into 76 % / 22 %
+clusters, which an 80 % rule would have missed entirely.
+Pass `filter_noise: false` to disable and get pure `updatedAt` descending order.
 
 **`backend` — which search engine actually ran:**
 
 - `"index"` — dsh 0.1.7's official full-text session index (`ctx.sessionQuery.searchSessions`)
   was available and used. Fast, and returns `snippet`s from the index.
-- `"scan"` — the built-in scan path (list sessions → newest 200 → read each log).
+- `"scan"` — the built-in scan path (list sessions → newest `scan` of them → read each log).
 
 The official index is **opt-in in dsh itself**: its default profile config ships
 `openAt: "never"`, so search is disabled and this tool transparently falls back to `"scan"`.
@@ -474,8 +503,8 @@ call for the oldest entry.
 ### `harness_list_tools`
 
 No parameters. **Returns** a JSON array of tool names registered **inside Harness** (the
-agent's own toolset, e.g. `bash`, `fs`, `web`). This is not the same as this plugin's 26 MCP
-tools.
+agent's own toolset, e.g. `bash`, `fs`, `web`). This is not the same as this plugin's own MCP
+tools (25 registered by default, 26 when `enableFsWrite: true` adds `fs_write`).
 
 ---
 

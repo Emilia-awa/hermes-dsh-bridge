@@ -1,6 +1,6 @@
 {
   "name": "hermes-dsh-bridge",
-  "version": "0.9.0",
+  "version": "0.11.0",
   "description": "Expose DeepSeek Harness agent capabilities as an MCP server, so an external MCP client (e.g. Hermes) can drive Harness to execute coding tasks. Hermes = brain, Harness = arms.",
   "type": "module",
   "main": "lib/index.js",
@@ -9,16 +9,25 @@
     "lib",
     "src",
     "scripts",
-    "docs",
     "cordis.patch.yml",
     "README.md",
-    "NOTICE.md"
+    "NOTICE.md",
+    "docs/CHANGELOG.md",
+    "docs/CONFIG.md",
+    "docs/KNOWN_ISSUES.md",
+    "docs/SECURITY.md",
+    "docs/TOOLS.md",
+    "docs/TROUBLESHOOTING.md"
   ],
   "scripts": {
-    "build": "tsc -b && tsdown --env.DSH_BUILD_FACE host",
+    "build": "tsdown --env.DSH_BUILD_FACE host && tsc -b && node scripts/check-build-artifacts.mjs",
+    "build:clean": "rm -rf lib && npm run build",
     "doctor": "node scripts/doctor.mjs",
-    "test": "node tests/unit_mock_p1.mjs && node tests/unit_mock_p2.mjs && node tests/unit_mock_p3.mjs && node tests/unit_callback_p0.mjs && node tests/unit_mock_r1.mjs",
-    "test:mutation": "node scripts/mutation_check_r1.mjs"
+    "test": "node tests/unit_mock_p1.mjs && node tests/unit_mock_p2.mjs && node tests/unit_mock_p3.mjs && node tests/unit_callback_p0.mjs && node tests/unit_mock_r1.mjs && node tests/unit_contract_p0.mjs && node tests/unit_r7.mjs && node tests/unit_r8.mjs && node tests/unit_r9.mjs",
+    "test:e2e": "node scripts/e2e_r7.mjs",
+    "test:mutation": "node scripts/mutation_check_r1.mjs && node scripts/mutation_check_r7.mjs && node scripts/mutation_check_r8.mjs && node scripts/mutation_check_r9.mjs",
+    "contract": "node scripts/contract_probe.mjs",
+    "link-deps": "node scripts/link-host-deps.mjs"
   },
   "keywords": [
     "deepseek-harness",

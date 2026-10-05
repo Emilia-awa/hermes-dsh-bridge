@@ -165,11 +165,39 @@ README/docs 在 R2/R3 期间多处写「默认 120s」, 与代码不符 —— *
 
 ---
 
-## 📝 7. `session_search.total` / `matched` / `scanned` 三字段易混
+## ✅ 7. `session_search.total` / `matched` / `scanned` 三字段易混
 
 **位置**: `session_search` 返回 `total: scanned.length`(R2 口径), 另加 `matched: hits.length` 与 `scanned`(R3 别名)。
 即 `total` **不是命中数**而是扫描数。docs/TOOLS.md 已标注, 但属于「命名误导」。
-**建议修法(R5)**: 下个大版本把 `total` 改为 `scannedTotal`(破坏性, 需先公告)。
+
+**R9 已处理(非破坏性)**:
+- 新增语义无歧义的别名 **`matchedTotal`**(= 命中总数)与 **`scannedSessions`**(= 扫描会话数),
+  调用方不必再靠 `total` 猜; `total` / `matched` / `scanned` **全部保留**(向后兼容, 不删不改)。
+- `docs/TOOLS.md` 与工具 description 里用表格把三者口径**写死**。
+
+**仍未做(留待下个大版本)**: `total` 改名 `scannedTotal` 属破坏性变更, 按 REQ_r9 §2 P2 的
+「自主裁决」条款不在本轮强行改 —— 见 `docs/plan/REPORT_r9_20261005.md` 的裁决记录 A2。
+
+---
+
+## 📝 7b. `session_search` 样板噪音的统计降权是启发式(可能误判)
+
+**位置**: `detectBoilerplateKeys()` / `noiseKey()`(R9 P3)。
+
+**现状**: 判定规则是「规范化 snippet 按近似前导文本聚簇(同前缀或共享前缀 ≥60%),
+某一簇在**有 snippet 的命中**中占比 ≥ 60%, 且样本 ≥ 5」。
+这是**统计启发式**, 不是精确识别:
+- 若某次搜索的**真命中**恰好大量共享同一段独特文字(例如搜一个被反复引用的公告原文),
+  它们会被一起判为样板并沉底。此时调用方可用 **`filter_noise: false`** 拿到原始顺序。
+- 阈值(`NOISE_MIN_SAMPLE=5` / `NOISE_MIN_RATIO=0.8`)是拍的, 没有大规模真实语料调参。
+
+**为什么仍这样做**: 相比「黑名单硬编码某段 Hermes 提示词」, 统计法换客户端不会失效
+(REQ_r9 §2 P3 明确禁止硬编码方案)。且降权**只是排序 + 标注, 不删除结果**, 误判代价可控。
+
+**影响**: 低。被误判时结果仍在(排在后面 + `boilerplate: true`), 可用开关关闭。
+
+**可能的改进**: 用跨查询的全局文档频率(multi-query DF)替代单次样本内占比 —— 需要在
+插件内维护跨调用状态, 收益/复杂度比不高, 暂不做。
 
 ---
 
@@ -237,3 +265,11 @@ R2/R3 的 README 只写了 `web|builtin|off`。**本轮 R4 已补全为四值**�
 
 > R4 遗留条目均**只改文档**, 未触碰 `src/index.ts`。修缺陷请单独立项并同步补
 > `tests/unit_mock_p3.mjs` 断言。
+
+### R9 已修（`0.11.0`）
+
+| # | 类型 | 一句话 | R9 处理 |
+|---|---|---|---|
+| P1 | 🐞 | `session_search` 的 `limit` 兼作「扫描深度」与「返回条数」，`matched > count` 时**静默丢弃**且无任何提示 | **已修**：`scan`=扫描深度 / `limit`=返回条数（**破坏性**）；`omitted`+`hasMore`+`next` 三件套保证不静默 |
+| P2 | 📝 | `total`/`matched`/`scanned` 口径易混 | **已缓解**：新增 `matchedTotal`/`scannedSessions` 别名 + 文档表格写死；`total` 改名留待大版本（见 7） |
+| P3 | 📝 | 系统提示词样板文字挤占搜索结果前排 | **已修**：统计特征降权（簇占比 ≥60% 且样本 ≥5，阈值经真实语料校准）+ `boilerplate` 标注 + `filter_noise` 开关；启发式局限见 7b |

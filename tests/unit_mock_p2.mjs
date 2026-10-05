@@ -287,8 +287,13 @@ console.log('── C: session_search ──')
   const t6aRejected = Boolean(t6a?.error) || t6a?._rpcError !== undefined || /-32602|Invalid arguments/.test(String(t6a?._raw))
   const t6ok = t6aRejected && String(t6b.error).includes('query must not be empty')
   check('C 空 query 拒绝(schema 层 + handler 层)', t6ok, { a: t6a, b: t6b })
-  const t7 = await callTool(PORT, 'session_search', { query: 'a', limit: 1 })
-  check('C limit 截取扫描范围(total=1)', t7.total === 1, t7)
+  const t7 = await callTool(PORT, 'session_search', { query: 'a', scan: 1 })
+  // [R9 P1] 破坏性变更: 旧 limit 兼作扫描深度 → 新 scan 才是扫描深度; limit = 返回条数。
+  // 本断言保留原"截取扫描范围"意图, 只把参数名换成新的 scan。
+  check('C scan 截取扫描范围(total=1)', t7.total === 1, t7)
+  // [R9 P1] limit 现在只控制返回条数, 不再影响扫描深度
+  const t7b = await callTool(PORT, 'session_search', { query: 'a', limit: 1 })
+  check('C limit 只截取返回条数(扫描深度仍为默认)', t7b.count === 1 && t7b.total >= 1 && t7b.total !== 1, t7b)
   const t8 = await callTool(PORT, 'session_search', { query: 'A2A P1' })
   check('C 多词子串按原文匹配', t8.results?.some((r) => r.sessionId === SID_TITLE), t8.results)
   const t9 = await callTool(PORT, 'session_search', { query: '不存在的词组xyzq' })

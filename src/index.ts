@@ -61,6 +61,8 @@ import type {} from '@deepseek-ai/dsh-tools'
 import type {} from '@deepseek-ai/dsh-llm'
 import type {} from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets'
+// [r8] 加载 'user-questions/request' waterfall 事件的类型声明(桥注册 answerer 用)
+import type {} from '@deepseek-ai/dsh-user-questions'
 // 加载 'approval/request' waterfall 事件与 ApprovalOutcome 的类型声明(dsh-user-approval 已是依赖)
 import type { ApprovalOutcome } from '@deepseek-ai/dsh-user-approval'
 
@@ -73,6 +75,8 @@ import { SessionId } from '@deepseek-ai/dsh-session'
 import type { SessionHeader } from '@deepseek-ai/dsh-session'
 import { scopeOf } from '@deepseek-ai/dsh-scope'
 // dsh-agent-presets 0.1.2 移除了 resolveSessionPreset 导出, presetFromEvents 改为本地实现(语义不变)
+// [P0-1] 宿主契约单一事实来源 + 运行时探测(DISCUSS_20261003 §3.1)
+import { HOST_CONTRACT, probeHostContract, type ContractReport } from './contract.js'
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js'
 import { randomUUID } from 'node:crypto'
@@ -91,7 +95,7 @@ import { join as joinPath, resolve, dirname, basename } from 'node:path'
 export const name = 'harness-mcp-server'
 
 /** 插件版本(status_get 上报; 与 package.json 保持同步) */
-const PLUGIN_VERSION = '0.9.0'
+const PLUGIN_VERSION = '0.11.0'
 
 /**
  * 会话文件权限三档(与 dsh-sandbox 的 SandboxMode 一一对应; 不直接 import 该包, 免新增运行时依赖):
@@ -171,6 +175,14 @@ export interface Config {
    * 不配 = 与旧版完全一致(零行为变化)。
    */
   callbackPreset?: CallbackPresetConfig
+  /**
+   * [r8] `ask_user_question` 挂起时的通知回调。
+   * 不配 = 保持旧行为(无 answerer, 上游按 NO_PROVIDER/挂起处理)。
+   * 配上后, 桥注册一个 user-questions answerer: 问题一到就**立刻**回调通知发起方,
+   * 并写 `question_<id>.json` 等 `question_answer_<id>.json` 回答案。
+   * 目的: 终结「dsh 卡在等回答、而发起方毫不知情、白等一整夜」这个最阴的静默挂起。
+   */
+  questionCallback?: CallbackPresetConfig
 }
 
 /**
@@ -292,10 +304,172 @@ const runtimeConfigDefaults = () => ({
   allowedCallbackHosts: [] as string[],
   // [r1] 部署级回调预设默认不配(undefined = 与旧版完全一致; 配了才生效)
   callbackPreset: undefined as CallbackPresetConfig | undefined,
+  questionCallback: undefined as CallbackPresetConfig | undefined,
+  // [P0-1] 宿主契约探测结果(apply 时写入; 未探测时为 undefined, status_get 如实返回 null)
+  contract: undefined as ContractReport | undefined,
 })
 
 /** 运行时配置(apply 时从 config 初始化, 提供安全默认值) */
 const runtimeConfig = runtimeConfigDefaults()
+
+/**
+ * [R7 P1-1] 用户是否**显式**配置过 provider(config.provider 非空)。
+ * 用来区分「部署方主动选了 deepseek-official」与「只是吃了默认值」——
+ * 只有后者才值得提示(前者是明确决策, 提示会变噪音)。apply 时随 runtimeConfig 一起重置。
+ */
+let providerExplicitlyConfigured = false
+
+// ═══════════════════════ [P0-1] 统一降级通道(可观测降级) ═══════════════════════
+//
+// 背景(DISCUSS_20261003 §3.0/§3.3): 历史两次事故都是**静默失效** —— 契约变了、功能不工作了,
+// 但没有任何日志。本通道是「契约/服务相关」降级路径的唯一出口: 留痕 + 计数 + 首次告警。
+//
+// 范围(本轮硬性约束): 只把**契约/服务相关**的静默 catch 改成走 degrade();
+// 不把全文 71 处 catch 全改(那是 A5/P1 的活)。纯预期的失败(如 ~/.dsh 不存在、文件已删)
+// 保持静默但需在源码里注释说明为何安全。
+
+/** 单条降级留痕 */
+interface DegradationRecord {
+  /** 降级发生的范围(如 'sessionQuery'、'apiProxy') */
+  scope: string
+  /** 人类可读的原因 */
+  reason: string
+  /** 发生时刻(ms epoch) */
+  at: number
+  /** 发生次数(同 scope+reason 累加, 便于看出「一直坏」还是「偶发一次」) */
+  count: number
+  /** 错误摘要(仅首条记录时截取; 不长期持有 error 对象引用) */
+  error?: string
+}
+
+// [P0] status_get 暴露最近 N 条留痕; 上限防止长跑进程内存无界增长
+const DEGRADATION_KEEP = 20
+/** 已发生的降级留痕(按 scope+reason 聚合, 最近发生的排在前面) */
+const degradations = new Map<string, DegradationRecord>()
+/** 已告警过的 scope+reason(首次告警后降为静默计数, 避免日志刷屏) */
+const degradationWarned = new Set<string>()
+
+/** 降级通道键(同一 scope+reason 视为同一条留痕) */
+function degradationKey(scope: string, reason: string): string {
+  return `${scope}\u0000${reason}`
+}
+
+/**
+ * 统一降级通道: 留痕 + 计数 + 首次告警。
+ *
+ * - 契约/服务相关的静默 catch 一律改走这里(不允许完全静默);
+ * - 首次出现时 warn(含 scope/reason/error 摘要), 之后只累加计数 —— 拿得到「坏了多少次」又不刷屏;
+ * - 结果通过 `status_get.degradations` 暴露给 Hermes 侧。
+ *
+ * @param scope  降级范围(建议用服务 key 或功能名, 便于 grep 定位)
+ * @param reason 人类可读原因(会出现在日志与 status_get 里)
+ * @param err    原始异常(可选; 只取 message 摘要, 长时间持有对象会阻碍 GC)
+ */
+export function degrade(scope: string, reason: string, err?: unknown): void {
+  const key = degradationKey(scope, reason)
+  const now = Date.now()
+  const prev = degradations.get(key)
+  if (prev) {
+    prev.count++
+    prev.at = now
+    degradations.set(key, prev)
+    return
+  }
+  const errorText = err === undefined || err === null
+    ? undefined
+    : (err instanceof Error ? err.message : String(err)).slice(0, 300)
+  degradations.set(key, { scope, reason, at: now, count: 1, ...(errorText ? { error: errorText } : {}) })
+  if (!degradationWarned.has(key)) {
+    degradationWarned.add(key)
+    console.warn(`[harness-mcp-server] 降级 ${scope}: ${reason}${errorText ? ` — ${errorText}` : ''}`)
+  }
+}
+
+/** 最近 N 条降级留痕(最近发生的在前; 供 status_get 序列化) */
+function degradationsSnapshot(): DegradationRecord[] {
+  return [...degradations.values()]
+    .sort((a, b) => b.at - a.at)
+    .slice(0, DEGRADATION_KEEP)
+}
+
+/** 清空降级留痕(apply 时重置, 保证重复 apply 幂等不残留上一次的状态) */
+function resetDegradations(): void {
+  degradations.clear()
+  degradationWarned.clear()
+}
+
+// ═══════════════════ [R7 P1-1] provider 默认值启动引导 ═══════════════════
+
+/** 默认 provider id(与 runtimeConfigDefaults().provider 逐字一致; 探测「用户是否从未显式配置」) */
+const DEFAULT_PROVIDER_ID = 'deepseek-official'
+
+/** provider 默认值引导的探测结果(暴露给 status_get.providerCheck) */
+interface ProviderCheck {
+  /** 本次是否做过探测(false = ctx.llm 不可用, 探测不了) */
+  probed: boolean
+  /** 当前生效的 provider id */
+  provider: string
+  /** 该 provider 是否在宿主注册(probed=false 时为 null = 未知) */
+  registered: boolean | null
+  /** 用户是否在任何一层显式配置过 provider(从未配置 = 用默认值, 才值得提示) */
+  explicit: boolean
+  /** 宿主实际注册的 provider id 列表(探测失败为空数组) */
+  available: string[]
+}
+
+/** provider 三态探测结果(未探测时为 undefined, status_get 如实返回 null) */
+let providerCheck: ProviderCheck | undefined
+
+/**
+ * [R7 P1-1] 探测「默认 provider 是否在宿主注册」并给出可操作的引导。
+ *
+ * 只在**用户从未显式配置 provider**(即仍在用默认值)且该 provider 未注册时告警 ——
+ * 否则会骚扰那些明确知道自己配了什么的部署方。
+ * 全程 try/catch: 探测本身任何异常都不得影响插件启动(与 contract.ts 同款哲学)。
+ */
+function probeProviderDefault(ctx: Context): void {
+  const explicit = providerExplicitlyConfigured
+  const provider = runtimeConfig.provider
+  let available: string[] = []
+  let probed = false
+  try {
+    const llm = ctx.get('llm', false) as { listProviders?: () => unknown } | undefined
+    if (llm && typeof llm.listProviders === 'function') {
+      const list = llm.listProviders()
+      if (Array.isArray(list)) {
+        available = list
+          .map((p) => (p as { id?: unknown })?.id)
+          .filter((id): id is string => typeof id === 'string' && id.length > 0)
+        probed = true
+      }
+    }
+  } catch (e) {
+    // 探测失败本身也是契约面的事: 留痕但不阻断(别静默 —— 否则"没告警"会被误读成"provider 没问题")
+    degrade('llm.listProviders', 'ctx.llm.listProviders() 抛错, 无法确认默认 provider 是否注册', e)
+  }
+  const registered = probed ? available.includes(provider) : null
+  providerCheck = { probed, provider, registered, explicit, available }
+
+  if (!probed) {
+    // listProviders 不可用(老宿主/服务未挂载) → 不做任何断言, 只记一条降级便于排查
+    if (!available.length && registered === null) {
+      degrade('provider', 'ctx.llm.listProviders() 不可用, 跳过 provider 默认值自检', undefined)
+    }
+    return
+  }
+  // 只对「用默认值 + 该默认值没注册」告警(用户显式配了 provider 就是自己的选择, 不打扰)
+  if (explicit || provider !== DEFAULT_PROVIDER_ID || registered) return
+  console.warn(
+    `[harness-mcp-server] ⚠️ 你用的是默认 provider '${DEFAULT_PROVIDER_ID}', 但宿主没注册它。` +
+    `如果你用的是自定义 provider, 请在插件 config 里显式写 provider: <你的 provider id>。` +
+    `宿主当前注册的 provider: ${available.length > 0 ? available.join(', ') : '(无)'}`,
+  )
+  degrade(
+    'provider',
+    `默认 provider '${DEFAULT_PROVIDER_ID}' 未在宿主注册, 启动/调用会报上游的凭据或组装错误(指向错误的对象); ` +
+    `请在插件 config 里显式配置 provider(宿主当前注册: ${available.length > 0 ? available.join('/') : '无'})`,
+  )
+}
 
 /** HTTP server 运行信息(apply 时记录, status_get/config_get 上报) */
 const serverRuntime = {
@@ -511,8 +685,9 @@ const HINT = {
 
 /** [r2] A: 会话类错误的统一后缀(下一步动作) */
 /** [r3] C7: 会话不存在 —— 走统一句式 `<错误>: <关键值> (<原因>; <下一步>)` */
-function sessionNotFoundError(sessionId: string): string {
-  return idNotFoundError('session', sessionId, '用 session_list 查看当前会话列表, 或先用 agent_run 建一个')
+/** [R7 P2-1]: 可选 `next` 覆盖 —— 供调用方把**附加说明**并进 next 参数, 而不是外挂拼接破坏句式 */
+function sessionNotFoundError(sessionId: string, next?: string): string {
+  return idNotFoundError('session', sessionId, next ?? '用 session_list 查看当前会话列表, 或先用 agent_run 建一个')
 }
 
 /** [r2] A / [r3] C7: 任务类错误 —— 统一句式 + 保留 TTL 提示 */
@@ -551,6 +726,39 @@ function idNotFoundError(kind: 'session' | 'task' | 'preset', id: string, next: 
 /** [r3] C: 会话为空(存在但没有任何事件) */
 function emptySessionError(sessionId: string): string {
   return errText('session is empty', sessionId, '该会话存在但还没有任何事件', '先跑一轮 agent_run/task_inbox 带上这个 sessionId, 或用 session_list 另选一个会话')
+}
+
+/**
+ * [R7 P3-2 / C-3] `session_search` 回退到 scan 时的人话解释。
+ *
+ * `indexFallbackReason` 透传的是上游原始错误码(如 `SESSION_QUERY_SEARCH_DISABLED`),
+ * Hermes 侧读不懂。这里**新增** `indexFallbackHint` 字段给解释, **不改原字段**
+ * (原始码保留, 便于按码排查; 新增字段向后兼容)。
+ */
+const INDEX_FALLBACK_HINT =
+  '官方索引不可用, 已自动回退到插件侧扫描(标题先行 + 内容尽力扫), 搜索仍可用但更慢。' +
+  '常见原因: ① 本机把索引搜索设为关闭(上游 code=SESSION_QUERY_SEARCH_DISABLED) ' +
+  '② 上游 locate() 按「当前」会话格式版本拼路径, 而多数历史会话实际落盘的是旧版本, 路径不存在(实测约 84% 落空)。' +
+  '这是上游限制, 插件侧无法修复(见 docs/KNOWN_ISSUES.md)。'
+
+/**
+ * [R7 P1-2] `fs_read` 的 offset 越界判定(纯函数, 便于单测覆盖全部边界)。
+ *
+ * 背景(R6 §B-3): `off > totalLines` 时 `lines.slice()` 返回空数组 →
+ * 返回体是 `content: ""` + `truncated: false`, **agent 会据此误判「文件是空的」**。
+ *
+ * 边界口径(REQ §3 P1-2 明确规定):
+ *   - `off === totalLines`     → **不算越界**(能读到最后一行, 正常返回);
+ *   - `off === totalLines + 1` → 算越界(确实一行也读不到);
+ *   - 更大值 / 极大值          → 算越界。
+ *
+ * @returns 越界时返回可直接塞进返回体的 `note` 文案; 未越界返回 undefined(不改动正常路径结构)。
+ */
+function fsReadOffsetNote(off: number, totalLines: number): string | undefined {
+  if (off <= totalLines) return undefined
+  // 越界: 复用既有 next 字段语义(与截断分支同字段, 调用方无需新增解析分支)
+  const lastUsable = Math.max(1, totalLines)
+  return `offset=${off} 超过总行数 ${totalLines} —— 本次没有任何内容可返回(不是文件为空); 文件共 ${totalLines} 行, 有效 offset 范围是 1~${lastUsable}`
 }
 
 /**
@@ -744,6 +952,10 @@ async function attachToWorkspace(ctx: Context, canonical: string, sessionId: Ses
     const ws = await ensureWorkspace(ctx, canonical)
     if (ws?.attachSession) await ws.attachSession(sessionId)
   } catch (e) {
+    // [R2-3] 契约/服务类: ensureWorkspace 走 ctx.get('workspaceRegistry')(契约里的 opt 服务),
+    // attachSession 是宿主方法。抛错时只有一行 warn, 会话不会被归入工作区 ——
+    // 用户看到的是「session_list 里这个会话没有工作区分组」, 不知道是契约漂移。
+    degrade('workspaceRegistry', 'ensureWorkspace/attachSession 抛错, 会话未归入工作区(分组缺失)', e)
     console.warn('[harness-mcp-server] workspace attach failed:', (e as Error)?.message ?? e)
   }
 }
@@ -755,7 +967,7 @@ async function attachSessionCwd(ctx: Context, sessionId: SessionId, cwd: string 
 }
 
 /** 常驻 agent 会话(按 cwd 复用, 省 token: 避免每次全量加载项目上下文); preset/sandbox 记录组合时所固化值 */
-const liveAgents = new Map<string, { sessionId: SessionId; handle: AgentHandle; preset: string; sandbox: SandboxMode }>()
+const liveAgents = new Map<string, { sessionId: SessionId; handle: AgentHandle; preset: string; sandbox: SandboxMode; scope?: object }>()
 
 /** sessionId → cwd 索引(支持按 session 续接: 指定 sessionId 时定位到对应 cwd 的常驻会话) */
 const sessionToCwd = new Map<string, string>()
@@ -856,6 +1068,8 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
     }
   }
   const newSessionId = SessionId(randomUUID())
+  // [r6] setup 回调里捕获的 scope key(工具注册在 scope 层, schemas() 需按 scope 查)
+  let createdScope: object | undefined
   // cwd 先 realpath 规范化: session header 的 cwd 与 workspace.path 必须精确相等,
   // 否则 attachSession 强校验 reject(只会 create 注册而 UI 仍落未分组)
   const canonical = await canonicalCwd(cwd)
@@ -878,6 +1092,9 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
         console.warn('[harness-mcp-server] agent ctx unscoped (dsh rc.6 bug); preset mount skipped — upgrade dsh for full tool support')
         return
       }
+      // [r6] 记下该 agent 的 scope key: 工具注册在 scope 层(layers.peek(scope)),
+      // harness_list_tools 必须按 scope 取 ctx.tools.schemas(scope) 才看得到, 否则恒空。
+      createdScope = scopeOf(agentCtx)
       await ctx.agentPresets.mount(agentCtx, effectivePreset)
     },
   })
@@ -888,7 +1105,7 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
   } catch (e) {
     console.warn('[harness-mcp-server] sandbox mode seed failed on create:', String(e))
   }
-  const rec = { sessionId: newSessionId, handle, preset: effectivePreset, sandbox: effectiveSandbox }
+  const rec = { sessionId: newSessionId, handle, preset: effectivePreset, sandbox: effectiveSandbox, scope: createdScope }
   // A/P3: 只有默认 preset + 默认档位的会话进 cwd 池; 任一请求级覆盖的专用会话不入池
   // (避免污染后续默认调用的复用键 —— 同 cwd 三档互不复用)
   if ((requestPreset === undefined || requestPreset === runtimeConfig.preset)
@@ -914,6 +1131,9 @@ async function getAgent(ctx: Context, cwd: string, sessionId?: string, title?: s
       const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
       st?.rename?.(session, title)
     } catch (e) {
+      // [R2-3] 契约/服务类: ctx.get('sessionTitle') 是可选的宿主服务(见 contract.ts 的 opt 项)。
+      // 缺失属预期, 但**抛错**说明服务在却不可用 —— 新会话的 title 会静默丢掉, 只留一行 warn。
+      degrade('sessionTitle', 'ctx.get(sessionTitle).rename() 抛错, 新会话标题未设置', e)
       console.warn('[harness-mcp-server] session title set failed:', String(e))
     }
   }
@@ -1023,6 +1243,44 @@ function truncateResult(result: TaskResult): TaskResult {
  *  P2 opts: preset=请求级覆盖; onSessionStart=拿到 agent 会话后回调(B 登记 taskRunSessions);
  *  isCancelled=协作取消探测(B: 锁内/followup 前两个检查点)。
  *  P3 opts: sandbox=请求级权限三档覆盖(透传 getAgent; 仅影响新建/resume 组合)。 */
+/**
+ * [P0-1] 0-token 显式告警(定向防御 0.1.7 那类静默失效)。
+ *
+ * 判据(与 DISCUSS_20261003 §3.3 落地物 6 一致): `inputTokens === 0 && 会话事件数 === 0`。
+ *   - 0.1.7 事故: `MessageSourceMap` 收紧后插件自带的 `kind:'plugin'` 被判非法, message 被
+ *     上游 `catch(_error){}` 静默吞掉 → agent 秒退、inTok=0、会话零事件、零报错。
+ *   - 正常一次 run 至少会产生一条 `user/message` 事件, 因此「零事件」是强信号;
+ *     仅 inTok=0 但有事件(如只有 system-prompt)不告警, 避免误报。
+ *
+ * 只告警、不改行为: 仍然把结果原样返回给调用方。
+ *
+ * @param result   executeTask 已折叠好的结果(stats.inputTokens 取自 assistant/message.usage)
+ * @param baseline followup 之前的日志长度(事件数 = 本次新增的日志条数)
+ * @param handle   agent 句柄(读 session.log)
+ */
+function warnOnEmptyRun(
+  result: TaskResult,
+  baseline: number,
+  handle: { agent: { session: unknown } },
+): void {
+  let eventCount = 0
+  try {
+    const log = ((handle.agent.session as unknown as { log?: unknown[] }).log ?? [])
+    eventCount = Math.max(0, log.length - baseline)
+  } catch {
+    // [P0-1] 读不到事件数 = 无法判定, 不告警(避免把「读不到」误报成「注入失败」)
+    return
+  }
+  const inputTokens = Number((result.stats as { inputTokens?: unknown } | undefined)?.inputTokens ?? 0)
+  if (eventCount !== 0 || inputTokens !== 0) return
+  console.error('[harness-mcp-server] ⛔ 注入的 prompt 未进入会话(inTok=0 且无事件)。')
+  console.error('   这几乎总是 MessageSourceMap/source.kind 契约变更的症状。')
+  console.error('   参见 docs/TROUBLESHOOTING.md#agent-秒退--0-token--无任何报错')
+  console.error(`   sessionId=${String(result.sessionId)} baseline=${baseline} events=${eventCount} inTok=${inputTokens}`)
+  // 同步进降级留痕: status_get.degradations 也能看到(无需翻日志)
+  degrade('agent_run', `prompt 未进入会话(inTok=0 且无事件; sessionId=${String(result.sessionId)})`)
+}
+
 async function executeTask(
   ctx: Context,
   task: string,
@@ -1128,12 +1386,19 @@ async function executeTask(
       console.warn('[harness-mcp-server] stats fold failed:', (e as Error)?.message ?? e)
     }
 
+    // ── [P0-1] 0-token 显式告警: 针对历史静默失效的定向防御(DISCUSS_20261003 §3.3 落地物 6) ──
+    // 0.1.7 事故的表现就是 inTok=0 且会话无事件、零报错(MessageSourceMap 收紧后 message 被静默丢弃)。
+    // 把一个曾经需要数小时人工排查的故障, 变成一条自解释的错误日志。
+    warnOnEmptyRun(result, baseline, handle)
+
     // resume 兜底分支: 尽力 flush 持久化, 再释放我们 resume 出来的句柄(不留给僵尸 live agent)
     if (disposeAfter) {
       try {
         await (ctx.get('sessions') as { flush?: (session: unknown) => Promise<unknown> } | undefined)?.flush?.(handle.agent.session)
-      } catch {
-        /* flush 失败不阻断结果返回 */
+      } catch (e) {
+        // [R7 P2-2] 契约/服务类: resume 路径静默丢持久化 —— 本轮任务结果看似成功,
+        // 但重启后会话内容缺失, 排查时无从下手(无任何线索)。必须留痕。
+        degrade('sessions.flush', 'resume 路径 flush 失败, 本次任务结果未落盘(重启后会话内容会缺失)', e)
       }
       try {
         await handle.dispose()
@@ -1514,6 +1779,11 @@ function hasReplyRouteField(value: unknown): boolean {
 function buildCallbackPayload(item: TaskItem): Record<string, unknown> {
   return {
     event: `task:${item.status}`,
+    // [r6] 兼容 Hermes webhook 平台: 它只从 X-GitHub-Event / X-GitLab-Event / payload.event_type /
+    // payload.type 四处置取事件名, **不读 payload.event**。此前只发 `event`, 于是 Hermes 侧一律落
+    // 成 "unknown"(events:[] 时不影响投递, 但任何按事件名过滤的配置都会失效)。
+    // 这里补发同值的 `type`(Hermes 读它), 保留 `event`(本插件文档与既有集成方读它)。
+    type: `task:${item.status}`,
     taskId: item.id,
     sessionId: item.sessionId,
     title: item.title,
@@ -1594,6 +1864,249 @@ function sendCallback(url: string, method: 'POST' | 'PUT', headers: Record<strin
 
 /** 回调投递的固定附加头(集中定义防散落) */
 const CALLBACK_BASE_HEADERS = { 'user-agent': 'hermes-dsh-bridge-task-callback' }
+
+// ── [r8] user-questions 应答器: 把 ask_user_question 挂起推给 Hermes, 而不是死等 ──
+//
+// 背景: dsh 的 `ask_user_question` 走 `ctx.userQuestions.ask()` → 一条 **scoped answerer waterfall**
+// (`user-questions/request`)。没有 answerer 时上游抛 NO_PROVIDER; 而 agent 会话里若无 UI 客户端
+// 应答, 该调用会**一直挂着**——task_result 恒 running、CPU 0%、零产物, 与「正常干活」肉眼无法区分,
+// 极易白等一整夜(skill 里记的「最阴的假正在跑」)。
+//
+// 本应答器的职责: 收到问题 → **立刻**回调通知发起方(异步, 不阻塞) → 等发起方回答案文件 → 喂回 agent。
+// 与审批桥(file-push)同款文件协议, 复用 `approvalBridgeFiles` 目录语义:
+//   出: question_<questionId>.json   入: question_answer_<questionId>.json
+// 超时(默认 30 分钟)未答 → 抛错结束该调用, 而不是永久挂起。
+
+/** 待答问题表: questionId → 挂起中的等待项 */
+interface PendingQuestion {
+  questionId: string
+  sessionId: string
+  questions: Array<{ id: string; question: string; header?: string; options?: Array<{ label: string; description?: string }>; multiSelect?: boolean }>
+  requestedAt: number
+  settle: (answer: AskUserQuestionAnswer) => void
+  fail: (err: Error) => void
+  timer?: ReturnType<typeof setTimeout>
+}
+const pendingQuestions = new Map<string, PendingQuestion>()
+
+/** 问题应答的超时(毫秒); 0 = 不超时(不推荐) */
+const QUESTION_ANSWER_TIMEOUT_MS = 30 * 60 * 1000
+
+function clearQuestionTimer(entry: PendingQuestion): void {
+  if (entry.timer !== undefined) {
+    clearTimeout(entry.timer)
+    entry.timer = undefined
+  }
+}
+
+/** 出队并清定时器(幂等) */
+function removePendingQuestion(questionId: string): PendingQuestion | undefined {
+  const entry = pendingQuestions.get(questionId)
+  if (entry === undefined) return undefined
+  pendingQuestions.delete(questionId)
+  clearQuestionTimer(entry)
+  return entry
+}
+
+/**
+ * [r8] 发一条「等待回答」回调, 通知发起方会话。
+ * 与任务终态回调同一条路(webhook → 唤醒发起方会话), 但 event 用 `task:question`,
+ * 载荷带 questions 全文, 让发起方(或用户)直接能答。
+ * 非阻塞: 不 await 投递结果, 应答器立刻进入等待文件状态。
+ */
+function dispatchQuestionCallback(entry: PendingQuestion): void {
+  const cb = runtimeConfig.questionCallback
+  if (cb === undefined || cb.url === '') {
+    console.warn(`[harness-mcp-server] user-question ${entry.questionId} 无 questionCallback 配置, 仅写盘等待`)
+    return
+  }
+  const url = cb.url
+  if (url === undefined || url === '') return
+  const body = JSON.stringify({
+    event: 'task:question',
+    type: 'task:question',
+    questionId: entry.questionId,
+    sessionId: entry.sessionId,
+    questions: entry.questions,
+    requestedAt: entry.requestedAt,
+    replyContext: cb.replyContext ?? {},
+  })
+  void sendCallback(url, cb.method ?? 'POST', cb.headers, body, cb.timeoutMs ?? 5000).then((r) => {
+    if (r.delivered) console.log(`[harness-mcp-server] user-question callback delivered (questionId=${entry.questionId}, urlHost=${hostOfCallbackUrl(url)})`)
+    else console.warn(`[harness-mcp-server] user-question callback failed (questionId=${entry.questionId}): ${r.error ?? `status ${r.status}`}`)
+  })
+}
+
+/**
+ * [r8] 注册 user-questions 应答器。
+ * 返回 true 表示本应答器接管了该请求(并已进入等待), 由 waterfall 语义决定是否继续 next。
+ */
+type AskUserQuestionOption = { label: string; description?: string }
+type AskUserQuestionItem = { id: string; question: string; header?: string; options?: AskUserQuestionOption[]; multiSelect?: boolean }
+type AskUserQuestionAnswer = { answers: Array<{ id: string; selected: string[]; custom?: string }> }
+
+function makeUserQuestionAnswerer(ctx: Context) {
+  return async (
+    req: {
+      questions?: AskUserQuestionItem[]
+      agent?: { session?: unknown }
+      signal?: { aborted: boolean }
+    },
+    next: () => Promise<AskUserQuestionAnswer>,
+  ): Promise<AskUserQuestionAnswer> => {
+    console.log(`[harness-mcp-server] user-questions answerer INVOKED (questions=${Array.isArray(req.questions) ? req.questions.length : 'n/a'}, aborted=${req.signal?.aborted === true})`)
+    if (req.signal?.aborted === true) return next()
+    const questions = req.questions ?? []
+    if (questions.length === 0) {
+      console.warn('[harness-mcp-server] user-questions answerer: 空 questions, 交给 next')
+      return next()
+    }
+
+    const sess = req.agent?.session as unknown as PolicySessionLike | undefined
+    const sessionId = String(sess?.id ?? '')
+    const questionId = randomUUID()
+
+    const entry: PendingQuestion = {
+      questionId,
+      sessionId,
+      questions: questions.map((q) => ({
+        id: q.id,
+        question: q.question,
+        ...(q.header !== undefined ? { header: q.header } : {}),
+        ...(q.options !== undefined ? { options: q.options } : {}),
+        ...(q.multiSelect !== undefined ? { multiSelect: q.multiSelect } : {}),
+      })),
+      requestedAt: Date.now(),
+      settle: () => {},
+      fail: () => {},
+    }
+
+    // 先写盘(与审批桥同款: 发起方也可直接读文件应答, 不依赖回调链路)
+    void writePendingQuestionFile(entry)
+
+    // 立刻通知发起方(非阻塞), 再进入等待
+    dispatchQuestionCallback(entry)
+
+    return new Promise<AskUserQuestionAnswer>((resolve, reject) => {
+      entry.settle = (answer) => {
+        removePendingQuestion(questionId)
+        void cleanupQuestionFiles(questionId)
+        resolve(answer)
+      }
+      entry.fail = (err) => {
+        removePendingQuestion(questionId)
+        void cleanupQuestionFiles(questionId)
+        reject(err)
+      }
+      pendingQuestions.set(questionId, entry)
+      if (QUESTION_ANSWER_TIMEOUT_MS > 0) {
+        entry.timer = setTimeout(() => {
+          const still = removePendingQuestion(questionId)
+          if (still === undefined) return
+          void cleanupQuestionFiles(questionId)
+          still.fail(new Error(`ask_user_question 超时未答 (${Math.round(QUESTION_ANSWER_TIMEOUT_MS / 60000)} 分钟): ${questions.map((q) => q.id).join(', ')}`))
+        }, QUESTION_ANSWER_TIMEOUT_MS)
+        // 别让定时器吊住进程退出
+        if (typeof entry.timer === 'object' && entry.timer !== null && 'unref' in entry.timer) {
+          (entry.timer as { unref?: () => void }).unref?.()
+        }
+      }
+    })
+  }
+}
+
+/** 问题应答的文件目录(复用审批桥的目录; 未启用时静默跳过) */
+function questionFileDir(): string | null {
+  return approvalBridgeFiles?.dir ?? null
+}
+
+async function writePendingQuestionFile(entry: PendingQuestion): Promise<void> {
+  const dir = questionFileDir()
+  if (dir === null) return
+  try {
+    await mkdir(dir, { recursive: true })
+    const payload = {
+      questionId: entry.questionId,
+      sessionId: entry.sessionId,
+      requestedAt: entry.requestedAt,
+      questions: entry.questions,
+      answerFile: `question_answer_${entry.questionId}.json`,
+    }
+    await writeFile(`${dir}/question_${entry.questionId}.json`, JSON.stringify(payload, null, 2), 'utf8')
+  } catch (e) {
+    console.warn(`[harness-mcp-server] 写 question 文件失败 (${entry.questionId}): ${String(e)}`)
+  }
+}
+
+async function cleanupQuestionFiles(questionId: string): Promise<void> {
+  const dir = questionFileDir()
+  if (dir === null) return
+  for (const name of [`question_${questionId}.json`, `question_answer_${questionId}.json`]) {
+    try {
+      await unlink(`${dir}/${name}`)
+    } catch {
+      /* 不存在即忽略 */
+    }
+  }
+}
+
+/**
+ * [r8] 消费一个问题应答文件: 内容有效且问题仍挂起 → settle。
+ * 与 handleApprovalResponseFile 同款: 无论结果如何都消费该文件, 防堆积; 半写文件留待下轮。
+ */
+async function handleQuestionAnswerFile(filePath: string, questionId: string): Promise<void> {
+  let payload: { questionId?: string; answers?: Array<{ id?: string; selected?: unknown; custom?: unknown }> }
+  try {
+    payload = JSON.parse(await readFile(filePath, 'utf8'))
+  } catch {
+    return // 半写文件: 留待下一轮
+  }
+  const mismatch = payload?.questionId !== undefined && payload.questionId !== questionId
+  const entry = pendingQuestions.get(questionId)
+  const answers = Array.isArray(payload?.answers) ? payload.answers : []
+  if (!mismatch && entry !== undefined && answers.length > 0) {
+    const normalized = answers
+      .filter((a) => typeof a?.id === 'string')
+      .map((a) => ({
+        id: String(a.id),
+        selected: Array.isArray(a.selected) ? a.selected.map((s) => String(s)) : [],
+        ...(typeof a.custom === 'string' ? { custom: a.custom } : {}),
+      }))
+    if (normalized.length > 0) {
+      entry.settle({ answers: normalized })
+      console.log(`[harness-mcp-server] user-question ${questionId} answered via file`)
+    } else {
+      console.warn(`[harness-mcp-server] user-question answer file ignored (${questionId}): 无有效 answers`)
+    }
+  } else {
+    console.warn(
+      `[harness-mcp-server] user-question answer file ignored (${questionId}${mismatch ? `; payload questionId=${String(payload?.questionId)} mismatch` : ''}${entry === undefined ? '; not-pending' : ''})`,
+    )
+  }
+  try {
+    await unlink(filePath)
+  } catch {
+    /* 删除失败静默, 防残留 */
+  }
+}
+
+/** [r8] 轮询 question_answer_*.json(与审批桥同款定时扫描) */
+async function scanQuestionAnswerFiles(): Promise<void> {
+  const dir = questionFileDir()
+  if (dir === null) return
+  let names: string[]
+  try {
+    names = await readdir(dir)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!name.startsWith('question_answer_') || !name.endsWith('.json')) continue
+    const questionId = name.slice('question_answer_'.length, -'.json'.length)
+    if (questionId === '') continue
+    await handleQuestionAnswerFile(`${dir}/${name}`, questionId)
+  }
+}
 
 /** [r1] 回调自定义头里的保留头(由运行时固定, 一律剔除; 部署预设与任务级都适用) */
 const CALLBACK_RESERVED_HEADERS = ['host', 'content-length', 'connection', 'transfer-encoding']
@@ -1745,7 +2258,11 @@ async function persistedInspect(
       const events = asEvents(read)
       if (!events) return undefined
       return { meta: header, events }
-    } catch {
+    } catch (e) {
+      // [R2-3] 契约/服务类: 这是 0.1.5 起的**主**持久化读路径(open + read(0))。
+      // 抛错时返回 undefined, 上层只会把它当成「这个会话读不到」——
+      // 契约漂移与「会话真不存在」因此在调用方眼里完全同形, 必须留痕区分。
+      degrade('sessionPersistence.open', 'persistence.open/read 抛错, 该会话内容读不到(与「会话不存在」在调用方看来同形)', e)
       return undefined
     } finally {
       try { await handle?.close?.() } catch { /* 释放失败不阻断 */ }
@@ -1805,7 +2322,9 @@ function sessionQueryOf(ctx: Context): SessionQueryView | undefined {
   try {
     const q = ctx.get('sessionQuery') as SessionQueryView | undefined
     return q && typeof q === 'object' ? q : undefined
-  } catch {
+  } catch (e) {
+    // [P0-1] 契约/服务相关路径不允许静默: 服务存在但读取抛错 = 宿主行为异常, 走统一降级通道
+    degrade('sessionQuery', 'ctx.get(sessionQuery) 抛错, 已回退 persistence 数据源', e)
     return undefined
   }
 }
@@ -1950,7 +2469,9 @@ async function listCorpus(ctx: Context): Promise<{
       }
       usedSessionQuery = true
       source = 'sessionQuery'
-    } catch { /* 服务异常 → 回退 ② (不留半截数据) */
+    } catch (e) { /* 服务异常 → 回退 ② (不留半截数据) */
+      // [P0-1] 契约/服务相关路径留痕(行为不变: 仍是静默回退, 但 status_get.degradations 可见)
+      degrade('sessionQuery.listSessions', 'listSessions 抛错, 已回退 sessionPersistence', e)
       rows.length = 0
       byId.clear()
       skipped = 0
@@ -1972,7 +2493,10 @@ async function listCorpus(ctx: Context): Promise<{
     let listed: readonly PersistedListEntry[] | undefined
     try {
       listed = await persistence?.list?.()
-    } catch { /* 列表整体失败 → 只有 live 部分 */ }
+    } catch (e) { /* 列表整体失败 → 只有 live 部分 */
+      // [P0-1] 契约/服务相关路径留痕(sessionPersistence.list 是 session_list 的主数据源)
+      degrade('sessionPersistence.list', 'persistence.list() 抛错, 本次只返回 live 会话', e)
+    }
     for (const entry of listed ?? []) {
       const row = unwrapPersistedEntry(entry)
       if (row === undefined || row.header.id === undefined) { skipped++; continue }
@@ -2007,7 +2531,11 @@ async function listCorpus(ctx: Context): Promise<{
         const t = Number(log[log.length - 1]?.time)
         if (Number.isFinite(t) && t > 0) row.updatedAt = t
       }
-    } catch { /* 单行失败 → 保留 createdAt */ }
+    } catch (e) {
+      // [R2-3] 契约/服务类: 读的是宿主 session.log 末事件的 `time` 字段(宿主事件形状)。
+      // 形状漂移时排序键静默退回 createdAt —— session_list 的顺序会变但没有任何报错。
+      degrade('sessionPersistence.liveLog', 'live 会话 log 末事件时间读取失败, 排序键回退 createdAt(列表顺序可能不符预期)', e)
+    }
   }
 
   // ── 排序键 stage 2: 冷会话批量 mtime(整批一次, 绝不逐条 stat()) ──
@@ -2218,7 +2746,13 @@ function apiProxyOf(ctx: Context): ApiProxyView | undefined {
   // [r2] C 项适配核查: dsh 0.1.5 已不再随包发布 dsh-host-apiproxy(实测 node_modules 里无该包),
   // 本插件也未把它写进 inject, 因此这里用 ctx.get('apiProxy', false) 宽松探测: 服务缺失返回 undefined,
   // 绝不抛错。startApprovalsBridge 据此自动降级 builtin/file-push —— 0.1.5 下审批桥仍可用(已跑通 p3)。
-  return ctx.get('apiProxy', false) as ApiProxyView | undefined
+  try {
+    return ctx.get('apiProxy', false) as ApiProxyView | undefined
+  } catch (e) {
+    // [P0-1] 契约/服务相关路径不允许静默: 宽松探测仍抛错说明组合异常, 留痕(审批桥后续自动降级 builtin)
+    degrade('apiProxy', 'ctx.get(apiProxy, false) 抛错, 审批桥将降级 builtin/file-push', e)
+    return undefined
+  }
 }
 
 /** 挂起审批条目(web 桥来自 mux 帧, 带 rpcId; builtin 桥来自 answerer 直收, 带 settle) */
@@ -2242,6 +2776,23 @@ const pendingApprovals = new Map<string, PendingApproval>()
 
 /** 当前生效的审批桥形态(status_get/approval_list 上报) */
 let activeBridgeKind: ApprovalsBridge = 'off'
+
+/**
+ * [R2-3] web 桥的 mux 流中断后被调用: 把桥标记为已死, 避免状态与事实不一致。
+ *
+ * 为什么必须做: `activeBridgeKind` 是 status_get/approval_list 上报「审批桥现在是什么形态」的依据。
+ * mux 流断了以后桥实际已不再接收任何待审帧, 但字段仍写 'web' —— 于是
+ * `approval_list` 恒报 0 条待审、`status_get` 显示桥健康, 与事实相反。
+ * 这里改成 'off'(语义见上方文档: 不做任何事, 审批回到部署默认行为), 并把原因留在 degradations 里。
+ */
+function markWebBridgeDead(reason: string): void {
+  if (activeBridgeKind !== 'web') return
+  activeBridgeKind = 'off'
+  // 流已死, 表里的挂起条目再也不会被 resolve; 清掉以免 approval_list 长期显示一批永不落地的待审
+  for (const entry of [...pendingApprovals.values()]) clearApprovalTimer(entry)
+  pendingApprovals.clear()
+  console.warn(`[harness-mcp-server] 审批桥已停止(web → off): ${reason}`)
+}
 
 /** file-push 桥活动状态({dir: 审批文件目录}); 非 file-push 形态为 null(全部文件操作 no-op) */
 let approvalBridgeFiles: { dir: string } | null = null
@@ -2285,7 +2836,11 @@ function armPendingApproval(ctx: Context, entry: PendingApproval): void {
         type: 'client-response',
         rpcId: entry.rpcId,
         result: { ok: true, value: { sessionId: entry.sessionId, approvalId: entry.approvalId, outcome: 'rejected' } },
-      }).catch(() => { /* 超时兜底回答失败不影响主流程 */ })
+      }).catch((e: unknown) => {
+        // [R7 P2-2] 契约/服务类: 审批超时兜底回答丢失 → 请求一直挂到超时被判拒绝,
+        // 用户只看到"超时", 查不出是通道坏了。必须留痕(超时兜底失败不影响主流程)。
+        degrade('apiProxy.respond', '审批超时兜底回答失败, 该请求可能一直挂到下一次超时被判拒绝', e)
+      })
     }
   }, Math.max(1, runtimeConfig.approvalTimeoutMs))
   timer.unref?.()
@@ -2316,6 +2871,9 @@ async function respondToApproval(ctx: Context, entry: PendingApproval, outcome: 
     })
     return receipt.accepted ? { accepted: true } : { accepted: false, reason: receipt.reason ?? 'not-pending' }
   } catch (e) {
+    // [R2-3] 契约/服务类: apiProxy.respond 是审批回答的唯一出口。抛错时返回值是 'not-pending',
+    // 用户看到的是「你答晚了」, 而真实原因是宿主通道坏了 —— 不留痕就会误诊(历史 0.1.5 事故形态)。
+    degrade('apiProxy.respond', 'proxy.respond() 抛错, 审批回答被当作 not-pending 返回', e)
     console.warn('[harness-mcp-server] approval respond failed:', (e as Error)?.message ?? e)
     return { accepted: false, reason: 'not-pending' }
   }
@@ -2476,7 +3034,13 @@ function startApprovalsBridge(ctx: Context): () => void {
         }
       } catch (e) {
         if (!controller.signal.aborted) {
+          // [R2-3] 契约/服务类 + 真正的盲区修复: 这条 mux 流是 web 审批桥的**唯一**待审帧来源。
+          // 流异常中断后 activeBridgeKind 仍是 'web', 但再也不会有帧被 arm ——
+          // approval_list 恒报 0 条待审, 用户只会看到 respondToApproval 的 'not-pending'(「你答晚了」),
+          // 完全指不到真因。因此除了留痕, 还必须把桥标记为已死, 让状态与事实一致。
+          degrade('apiProxy.mux', 'mux 事件流中断, 审批桥不再收到待审帧(approval_list 可能恒为 0)', e)
           console.warn('[harness-mcp-server] approvals mux stream ended:', (e as Error)?.message ?? e)
+          markWebBridgeDead(String((e as Error)?.message ?? e))
         }
       }
     })()
@@ -2505,8 +3069,22 @@ function startApprovalsBridge(ctx: Context): () => void {
     try { void mkdir(runtimeConfig.approvalFileDir, { recursive: true }).catch(() => {}) } catch { /* ignore */ }
   }
   ctx.on('approval/request', makeApprovalRequestAnswerer(ctx, filePush))
+  // [r8] user-questions 应答器: 独立于审批桥, 只要配了 questionCallback 就挂上。
+  // 作用: ask_user_question 一到就回调通知发起方 + 写盘等回答, 不再永久挂起。
+  if (runtimeConfig.questionCallback !== undefined && typeof (ctx as { on?: unknown }).on === 'function') {
+    // [r8] `{ global: true, prepend: true }` 两个都必需:
+    //  - global: 提问的 dispatch 走 scopeTarget(agent, agent) 做作用域过滤, 桥注册在插件根 ctx
+    //    (不在任何 agent 的 scope 祖先链上), 不加会**静默收不到**事件。
+    //  - prepend: `dsh-api-remotes` 也注册了 'user-questions/request', 把请求转发给远程 UI 客户端
+    //    并 await 其回答。headless 服务(无 Web UI 连接)下这个 promise 永不 settle →
+    //    waterfall 卡在它那里, 排在其后的 listener(本 answerer)永远收不到。
+    //    插到队首先认领, 才能真接管。
+    ctx.on('user-questions/request', makeUserQuestionAnswerer(ctx), { global: true, prepend: true })
+    console.log('[harness-mcp-server] user-questions answerer registered (ask_user_question 挂起将回调通知)')
+  }
   /** 启动响应文件轮询(仅 file-push; 兜底即使没有 fs.watch 也能工作, 间隔 ≥500ms) */
   let pollTimer: ReturnType<typeof setTimeout> | undefined
+  let questionPollTimer: ReturnType<typeof setTimeout> | undefined
   if (filePush) {
     const tick = () => {
       const b = approvalBridgeFiles
@@ -2518,14 +3096,31 @@ function startApprovalsBridge(ctx: Context): () => void {
       })
     }
     pollTimer = setTimeout(tick, APPROVAL_FILE_POLL_MS)
+    // [r8] 问题应答文件轮询(与审批同款节奏)
+    const qTick = () => {
+      if (approvalBridgeFiles === null) return
+      scanQuestionAnswerFiles().catch((e) => {
+        console.warn('[harness-mcp-server] question answer scan failed:', (e as Error)?.message ?? e)
+      }).finally(() => {
+        if (approvalBridgeFiles !== null) questionPollTimer = setTimeout(qTick, APPROVAL_FILE_POLL_MS)
+      })
+    }
+    questionPollTimer = setTimeout(qTick, APPROVAL_FILE_POLL_MS)
   }
   return () => {
     if (pollTimer !== undefined) clearTimeout(pollTimer)
+    if (questionPollTimer !== undefined) clearTimeout(questionPollTimer)
     for (const entry of [...pendingApprovals.values()]) {
       clearApprovalTimer(entry)
       removePendingApprovalFile(entry.approvalId)
     }
     pendingApprovals.clear()
+    // [r8] 清理挂起中的问题(避免遗留定时器)
+    for (const entry of [...pendingQuestions.values()]) {
+      clearQuestionTimer(entry)
+      entry.fail(new Error('bridge disposed'))
+    }
+    pendingQuestions.clear()
     approvalBridgeFiles = null
     activeBridgeKind = 'off'
   }
@@ -2599,7 +3194,12 @@ async function inspectSessionRow(ctx: Context, header: SessionHeader): Promise<{
       const events = insp.events
       return summarizeRow(events.length, titleFromEvents(events), events)
     }
-  } catch { /* 回退 live */ }
+  } catch (e) {
+    // [R2-3] 契约/服务类: persistedInspect 走宿主 sessionPersistence(inspect / open+read)。
+    // 它抛错时该行静默回退 live; 冷会话(无 live)于是变成 skipped —— 用户看到的只是
+    // 「session_list 少了几行/messageCount 缺省」, 完全指不到持久化契约出了问题。
+    degrade('sessionPersistence.inspect', 'persistedInspect 抛错, session_list 该行回退 live(冷会话可能被计为 skipped)', e)
+  }
   const store = ctx.get('sessions') as SessionsStoreView | undefined
   const live = store?.get?.(SessionId(String(header.id))) as { log?: unknown[] } | undefined
   if (live?.log) return summarizeRow(live.log.length, titleFromEvents(live.log), live.log)
@@ -2907,6 +3507,8 @@ interface SessionSearchRow {
   updatedAt: number
   matched: 'title' | 'content'
   snippet?: string
+  /** [R9 P3] 该命中被判为"几乎每个会话都命中的样板文字"(已降权沉底); 仅标注, 不删除 */
+  boilerplate?: boolean
 }
 
 // ═══════════════════════ [r1] C1/C2: 官方索引搜索(探测 + 静默回退) ═══════════════════════
@@ -2948,11 +3550,18 @@ async function tryIndexSearch(
   } catch (e) {
     // 关键: 绝不把 SESSION_QUERY_* 错误抛给用户 —— 一律转成回退原因
     const code = (e as { code?: unknown })?.code
-    return { reason: typeof code === 'string' ? `官方索引不可用: ${code}` : `官方索引不可用: ${(e as Error)?.message ?? String(e)}` }
+    const reason = typeof code === 'string' ? `官方索引不可用: ${code}` : `官方索引不可用: ${(e as Error)?.message ?? String(e)}`
+    // [P0-1] 契约/服务相关路径留痕(用户可见行为仍是静默回退 scan, 但 status_get.degradations 能看到)
+    degrade('sessionQuery.searchSessions', reason, e)
+    return { reason }
   }
   // 结构校验: 拿不到 items 数组就当失败回退(不做半截解析)
   const items = (page as { items?: unknown })?.items
-  if (!Array.isArray(items)) return { reason: '官方索引返回结构不符(缺 items 数组)' }
+  if (!Array.isArray(items)) {
+    // [P0-1] 结构不符 = 宿主契约漂移的典型症状, 必须留痕(恢复 0.1.7 那次静默失效的可见性)
+    degrade('sessionQuery.searchSessions', '官方索引返回结构不符(缺 items 数组)', page)
+    return { reason: '官方索引返回结构不符(缺 items 数组)' }
+  }
   const hits: SessionSearchRow[] = []
   for (const raw of items) {
     const hit = raw as {
@@ -2995,6 +3604,128 @@ function snippetAround(text: string, index: number, matchLen: number): string {
   const start = Math.max(0, index - 60)
   const end = Math.min(text.length, index + matchLen + 60)
   return text.slice(start, end).replace(/\s+/g, ' ').trim()
+}
+
+/**
+ * [R9 P3] 样板文本统计过滤 —— 判断某个 snippet 是否"几乎每个会话都命中"的噪音。
+ *
+ * 缺陷(REQ_r9 §2 P3): 搜 "dsh" 时每个会话都命中 Hermes 系统提示词里的同一段样板
+ * (`plete deliverable, including images, Office documents, spreadsheets, a...`),
+ * 导致这批"零信息量"命中占据前排, 把真正的命中挤到后面。
+ *
+ * 方案选择(为什么不做黑名单): 硬编码某段 Hermes 提示词换个客户端就失效, 脆弱。
+ * 这里用**统计特征** —— 在本次扫描的样本里, 若某个 snippet 簇占到
+ * ≥ NOISE_MIN_RATIO 比例的**命中**中(且样本量 ≥ NOISE_MIN_SAMPLE),
+ * 就认为它是"模板文字"而非区分性证据:
+ *   - 真命中因会话内容而异, 不会跨会话逐字相同;
+ *   - 系统提示词样板每个会话都逐字相同, 命中率趋近 100%。
+ *
+ * ⚠️ 阈值为什么是 0.6 而不是 0.8(实测校准, 见 REPORT_r9 真链路证据):
+ * 同一段系统提示词里的**不同片段**会各自聚成簇。本机 184 个会话搜 "policy" 时,
+ * 174 个命中分成两簇: 76.4%(`so read an existing file first (the defa`)与
+ * 22.4%(`efore overwriting it with write (the def`) —— 它们是同一段的相邻片段。
+ * 0.8 会**两簇都不判**(各自都不到 80%)→ P3 等于没修。0.6 能判中占主导的那簇。
+ * 同时保留"簇必须显著大于零散真命中"的语义: 占比 ≥0.6 意味着一半以上的命中
+ * 共享同一片段, 真实检索里几乎不可能是巧合。
+ *
+ * 只降权/标记, **不删除**(调用方仍能看到), 并且默认开启、可用 `filter_noise=false` 关闭。
+ */
+const NOISE_MIN_SAMPLE = 5
+const NOISE_MIN_RATIO = 0.6
+/** 同簇判定: 共同前缀至少这么长(字符), 且占较短 key 的比例不低于 NOISE_MIN_SHARED_RATIO */
+const NOISE_MIN_SHARED_PREFIX = 16
+const NOISE_MIN_SHARED_RATIO = 0.6
+
+/**
+ * 规范化 snippet 作为"同一段文字"的比较键(压空白 + 小写 + 截断)。
+ *
+ * ⚠️ 为什么不能只取整条 snippet 做全等比较(实测踩坑):
+ * `snippetAround` 取的是命中位置 **±60 字符**的窗口, 同一个模板片段在不同会话里
+ * 两侧上下文长度不同(例如文件沙箱策略里的 workspace 路径 `/tmp` vs `/root/.dsh/...`)，
+ * 逐字比较会把**同一段样板**算成不同 key → 判定失效。
+ * 实测本机 184 个会话里搜 "policy", 174 个都命中 `fs-observation-policy requires it`
+ * 这段系统提示词, 但 snippet 因路径差异各不相同。
+ *
+ * 因此: 取规范化后的**前 NOISE_KEY_LEN 字符**作为主键(命中点两侧的差异通常出现在窗口后段),
+ * 并把"一个 key 是另一个 key 的前缀"也视作同簇(见 detectBoilerplateKeys 的簇合并)。
+ */
+const NOISE_KEY_LEN = 40
+function noiseKey(snippet: string): string {
+  return snippet.replace(/\s+/g, ' ').trim().toLowerCase().slice(0, NOISE_KEY_LEN)
+}
+
+/**
+ * 统计本次命中的 snippet 频次, 返回"疑似模板"的 key 集合。
+ *
+ * 判定分两步:
+ *   1. **前缀同簇**: 若一个 key 是另一个 key 的前缀(短的那个更短), 归入同一簇
+ *      —— 处理"窗口起点相同、后段因上下文不同而分叉"的样板;
+ *   2. **簇占比 ≥ 阈值**(且样本 ≥ 门槛)→ 簇内全部 key 标记为噪音。
+ *
+ * 只在样本足够(≥ NOISE_MIN_SAMPLE)时才判定, 避免小样本误杀。
+ */
+function detectBoilerplateKeys(rows: readonly SessionSearchRow[]): Set<string> {
+  const counts = new Map<string, number>()
+  let withSnippet = 0
+  for (const r of rows) {
+    if (typeof r.snippet !== 'string' || r.snippet === '') continue
+    withSnippet++
+    const k = noiseKey(r.snippet)
+    if (k === '') continue
+    counts.set(k, (counts.get(k) ?? 0) + 1)
+  }
+  const noise = new Set<string>()
+  if (withSnippet < NOISE_MIN_SAMPLE) return noise
+
+  // 1. 前缀同簇: 用 DSU 把互为前缀的 key 合并
+  const keys = [...counts.keys()]
+  const parent = new Map<string, string>(keys.map((k) => [k, k]))
+  const find = (x: string): string => {
+    let r = x
+    while (parent.get(r) !== r) r = parent.get(r) as string
+    // 路径压缩
+    let c = x
+    while (parent.get(c) !== r) { const n = parent.get(c) as string; parent.set(c, r); c = n }
+    return r
+  }
+  const union = (a: string, b: string) => {
+    const ra = find(a); const rb = find(b)
+    if (ra !== rb) parent.set(ra, rb)
+  }
+  /** 两个 key 的共同前缀长度 */
+  const commonPrefixLen = (a: string, b: string): number => {
+    const n = Math.min(a.length, b.length)
+    let i = 0
+    while (i < n && a[i] === b[i]) i++
+    return i
+  }
+  // 同簇判定: 互为前缀(短者被长者包含) **或** 共享一段足够长的公共前缀。
+  //
+  // 为什么两个条件都要(实测): 同一段样板的两个片段可能长度相同、只是后段分叉
+  // (例如都截到 NOISE_KEY_LEN, 一个是 `...alpha` 一个是 `...beta`), 此时谁也不是谁的前缀,
+  // 单靠 startsWith 判不出同簇 → 实测真实语料里 76.4%/22.4% 两簇都不会被判定。
+  for (let i = 0; i < keys.length; i++) {
+    for (let j = i + 1; j < keys.length; j++) {
+      const a = keys[i] as string; const b = keys[j] as string
+      const shorter = a.length <= b.length ? a : b
+      const longer = a.length <= b.length ? b : a
+      const shared = commonPrefixLen(a, b)
+      const minLen = Math.min(a.length, b.length)
+      if ((shorter.length >= 8 && longer.startsWith(shorter)) ||
+        (shared >= NOISE_MIN_SHARED_PREFIX && shared >= minLen * NOISE_MIN_SHARED_RATIO)) union(a, b)
+    }
+  }
+  // 2. 簇内计数
+  const clusterCount = new Map<string, number>()
+  for (const [k, n] of counts) {
+    const root = find(k)
+    clusterCount.set(root, (clusterCount.get(root) ?? 0) + n)
+  }
+  for (const k of keys) {
+    const n = clusterCount.get(find(k)) ?? 0
+    if (n / withSnippet >= NOISE_MIN_RATIO) noise.add(k)
+  }
+  return noise
 }
 
 /** 搜索单会话: 标题优先, 未命中再尽力扫内容(collectText 已跳过 reasoning 块)。 */
@@ -3155,18 +3886,49 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   })
 
   mcp.tool('harness_list_tools', '列出 Harness(宿主)自己注册的工具名清单。什么时候用: 想确认某个能力(如 bash/fs/web)在当前部署里是否可用, 或 agent_run 跑的 agent 抱怨没有某个工具时排查用的。返回一个字符串数组(纯名字, 无描述)。注意这是 Harness 内部工具, 与本插件的 26 个 MCP 工具是两回事。', {}, async () => {
-    const tools = ctx.tools as unknown as { keys?: () => Iterable<string> } | null
-    const names = tools && typeof tools.keys === 'function' ? Array.from(tools.keys()) : []
+    // [r6] 修: 旧实现读 ctx.tools.keys() —— 宿主 ToolRuntime 上**从来没有** keys() 方法
+    // (dsh-tools 只有 register/get/schemas), 且旧代码用 `as unknown as` 屏蔽了类型检查,
+    // 于是它长期静默返回 [], 而契约自检只校验 register 所以一直报绿。
+    // 且工具注册在 **scope 层**(view() 把 scope 自己的层并入 global), 不传 scope 只看全局 = 空。
+    // 正确取法: schemas(scope) → ToolSchema[], 取 .name; scope 从 live agent 池里取。
+    let names: string[] = []
+    let usedScope = false
+    try {
+      const tools = ctx.tools as unknown as { schemas?: (scope?: unknown) => Array<{ name?: string }> } | null
+      const schemasFn = tools?.schemas
+      if (tools && typeof schemasFn === 'function') {
+        const pick = (scope?: unknown) =>
+          schemasFn.call(tools, scope).map((s) => s?.name).filter((n): n is string => typeof n === 'string')
+        // 优先用任一 live agent 的 scope(能看到 preset 挂载的全部工具); 没有 live agent 则退回全局
+        for (const rec of liveAgents.values()) {
+          if (rec.scope !== undefined) {
+            const scoped = pick(rec.scope)
+            if (scoped.length > 0) { names = scoped; usedScope = true; break }
+          }
+        }
+        if (!usedScope) names = pick()
+        if (names.length === 0) {
+          degrade('tools.schemas', `ctx.tools.schemas() 返回空(无 live agent scope 且全局层为空); liveAgents=${liveAgents.size}`, undefined)
+        }
+      } else {
+        degrade('tools.schemas', 'ctx.tools.schemas() 不可用, harness_list_tools 回退空列表', undefined)
+      }
+    } catch (e) {
+      degrade('tools.schemas', 'ctx.tools.schemas() 抛错, harness_list_tools 回退空列表', e)
+    }
     return out(JSON.stringify(names))
   })
 
-  mcp.tool('status_get', '看服务器现在活着吗、在用什么模型、有没有卡住的活。什么时候用: ① 调工具前先确认 server 健康 ② agent_run 长时间没返回时查 queueActive/activeSessionsCount 看是不是真在忙 ③ 想知道有没有待审的权限申请(pendingApprovals>0 就去 approval_list)。返回 {version,uptimeSec,uptime,startedAt(ISO8601),startedAt_epoch,provider,model,preset,activeSessionsCount,agentsLive,queueActive,sandboxPolicy:{defaultMode,bridge,pendingApprovals},notify:{enabled,deliveredTotal,failedTotal},node,pid}。', {}, async () => {
+  mcp.tool('status_get', '看服务器现在活着吗、在用什么模型、有没有卡住的活。什么时候用: ① 调工具前先确认 server 健康 ② agent_run 长时间没返回时查 queueActive/activeSessionsCount 看是不是真在忙 ③ 想知道有没有待审的权限申请(pendingApprovals>0 就去 approval_list)。返回 {version,uptimeSec,uptime,startedAt(ISO8601),startedAt_epoch,provider,model,preset,activeSessionsCount,agentsLive,queueActive,sandboxPolicy:{defaultMode,bridge,pendingApprovals},notify:{enabled,deliveredTotal,failedTotal},sessionSearch:{backend,fallbackReason?},contract:{ok,missingRequired,missingOptional,incompleteMethods,checkedAt,checkedCount},providerCheck:{probed,provider,registered,explicit,available},degradationCount,degradations:[{scope,reason,at,count,error?}],node,pid}。契约自检(contract)在启动时探测一次: ok=false 或 missingRequired 非空 = 宿主升级引入了破坏性变更, 功能可能不完整(启动日志同款 ⛔ 告警); providerCheck 看「你用的 provider 宿主到底认不认」—— registered=false 且 explicit=false 表示你吃的是默认 provider 而宿主没注册它(启动日志同款 ⚠️ 告警), 请显式配置 provider; degradations 是契约/服务相关路径的降级留痕(repair 排查"功能不工作但没报错"时先看这里)。', {}, async () => {
     let queueActive = 0
     for (const t of taskQueue.values()) if (t.status === 'queued' || t.status === 'running') queueActive++
     let agentsLive = 0
     try {
       agentsLive = ctx.agents.list().length
-    } catch {
+    } catch (e) {
+      // [R2-3] 契约/服务类: agentsLive 是 status_get 判断「有几个 agent 活着」的唯一来源。
+      // 抛错时静默回退 0 = 报告「一个都没活」, 与事实相反且无任何线索 —— 必须留痕。
+      degrade('agents', 'ctx.agents.list() 抛错, status_get.agentsLive 回退 0(不代表真的没有存活 agent)', e)
       agentsLive = 0
     }
     // [P0 回调] 回调投递汇总(仅统计配置了 callback 的任务; deliveredTotal/failedTotal 为运行期累计)
@@ -3208,6 +3970,14 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         backend: sessionSearchBackend,
         ...(sessionSearchFallbackReason !== undefined ? { fallbackReason: sessionSearchFallbackReason } : {}),
       },
+      // [P0-1] 宿主契约自检结果(apply 时探测; 未探测时 null)
+      contract: runtimeConfig.contract ?? null,
+      // [R7 P1-1] provider 默认值自检(apply 时探测; 未探测时 null)
+      // registered=false 且 explicit=false = 你吃的是默认 provider 但宿主没注册它, 启动/调用会报上游错误
+      providerCheck: providerCheck ?? null,
+      // [P0-1] 可观测降级: 最近 N 条留痕(契约/服务相关路径的失败不再静默)
+      degradationCount: degradations.size,
+      degradations: degradationsSnapshot(),
       node: process.version,
       pid: process.pid,
     }, null, 2))
@@ -3255,7 +4025,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P0: 文件查看(fs_read / fs_list / fs_stat) — 路径安全: ~/.dsh + 工作区白名单, 拒绝敏感名 ──
   mcp.tool(
     'fs_read',
-    '直接读服务器上的文本文件(不用起 agent, 快且免费)。什么时候用: 想确认某个文件现在的内容/某行代码在不在, 又不想为一个只读操作付一次 agent_run 的代价。适合看配置、日志尾部、源码片段。限制: 只能读 ~/.dsh 与已注册工作区白名单内的路径, 且 .ssh/.env/*token*/*.pem 一律拒绝; 单文件 >8MB 拒绝。返回 {path,totalLines,offset,limit,truncated,content}; 文件大就配合 offset/limit 分段读。要看目录列表用 fs_list, 要只看元数据用 fs_stat, 要改文件用 fs_write(需部署开启)。',
+    '直接读服务器上的文本文件(不用起 agent, 快且免费)。什么时候用: 想确认某个文件现在的内容/某行代码在不在, 又不想为一个只读操作付一次 agent_run 的代价。适合看配置、日志尾部、源码片段。限制: 只能读 ~/.dsh 与已注册工作区白名单内的路径, 且 .ssh/.env/*token*/*.pem 一律拒绝; 单文件 >8MB 拒绝。返回 {path,totalLines,offset,limit,truncated,content,next?,note?}; 文件大就配合 offset/limit 分段读(offset 超过总行数时 content 会是空串, 此时返回体带 note 明确说明"越界、不是文件为空"—— 别把 content:"" 误判成空文件)。要看目录列表用 fs_list, 要只看元数据用 fs_stat, 要改文件用 fs_write(需部署开启)。',
     {
       path: z.string().describe('文件绝对路径(会 realpath 规范化)'),
       offset: z.number().int().min(1).optional().describe('起始行(1-based, 默认 1); 接着上次读完的位置继续读就靠它'),
@@ -3282,6 +4052,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         const totalLines = lines.length
         const off = Math.max(1, Math.trunc(offset ?? 1))
         const lim = Math.min(Math.max(1, Math.trunc(limit ?? 400)), 2000)
+        // [R7 P1-2] offset 越界显式提示: 否则 content:"" + truncated:false 会让 agent 误判"文件是空的"。
+        // 只加 note 字段, **不改动正常路径的返回结构**(越界时截断分支天然不成立, 两者互斥)。
+        const offsetNote = fsReadOffsetNote(off, totalLines)
         let content = lines.slice(off - 1, off - 1 + lim).join('\n')
         let truncated = off - 1 + lim < totalLines
         if (content.length > FS_READ_MAX_CHARS) {
@@ -3295,6 +4068,8 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           ...timeFields('modifiedAt', st.mtimeMs),
           // [r2] A: 被截断时直接告诉 agent 下一次该传什么
           ...(truncated ? { next: `文件共 ${totalLines} 行, 本次返回第 ${off}~${Math.min(off + lim - 1, totalLines)} 行; 继续读请传 offset=${off + lim}` } : {}),
+          // [R7 P1-2] 越界时显式说明"读不到内容 ≠ 文件为空"
+          ...(offsetNote !== undefined ? { note: offsetNote } : {}),
         }))
       } catch (e) {
         return out(JSON.stringify({ error: toolFailure('fs_read', e) }))
@@ -3438,9 +4213,19 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           const gate = await gateFsWritePath(path)
           if (gate.error) return out(JSON.stringify({ error: `${gate.error} (fs_write 只能写 workspaceRoots 内的路径; 用 config_get 查看允许的目录)` }))
           const canonical = gate.canonical as string
+          // [R7 P3-1] 旧实现是 stat 判存在后再 writeFile(非 wx) —— TOCTOU: 并发两次同路径
+          // create-new 都可能通过检查后互相覆盖。改为 O_EXCL('wx') 原子创建, 语义由内核保证。
+          // EEXIST 映射成与下面「文件已存在」分支**相同**的文案(不引入新文案)。
+          const fileExistsError = () => errText('file already exists', canonical, 'mode=create-new 但目标已存在', '改用 mode=overwrite 覆盖, 或 mode=append 追加, 或换个新路径')
           if (m === 'create-new') {
-            const exists = await stat(canonical).then(() => true, () => false)
-            if (exists) return out(JSON.stringify({ error: errText('file already exists', canonical, 'mode=create-new 但目标已存在', '改用 mode=overwrite 覆盖, 或 mode=append 追加, 或换个新路径') }))
+            await mkdir(dirname(canonical), { recursive: true })
+            try {
+              await writeFile(canonical, content, { encoding: 'utf8', flag: 'wx' })
+            } catch (e) {
+              if ((e as { code?: unknown })?.code === 'EEXIST') return out(JSON.stringify({ error: fileExistsError() }))
+              throw e
+            }
+            return out(JSON.stringify({ ok: true, path: canonical, bytes: formatBytes(bytes), bytes_raw: bytes, mode: m, next: `用 fs_read(path="${canonical}") 读回核对` }))
           }
           await mkdir(dirname(canonical), { recursive: true })
           if (m === 'append') {
@@ -3717,22 +4502,26 @@ function registerTools(mcp: McpServer, ctx: Context): void {
   // ── P2: 跨会话搜索(session_search) ──
   mcp.tool(
     'session_search',
-    '不记得 sessionId, 只记得聊过什么 —— 按关键词跨会话找。什么时候用: ① 想找回"上次讨论 X 的那个会话" ② 确认某个决定/方案在历史会话里出现过没有 ③ session_list 条目太多翻不过来。先匹配标题, 未命中再尽力扫内容(每会话 2s 超时, 跳过慢的)。返回 {query,regex,total,count,offset,limit,truncated,next?,content_search,results:[{sessionId,title,cwd,updatedAt(ISO8601),updatedAt_epoch,matched 为 title 或 content,snippet?}]}(默认最多 20 条, 按 updatedAt 倒序; 超 20 条用 offset/limit 翻页)。找到 sessionId 后用 session_log 看细节、或 agent_run(sessionId=...) 续接。注意: 内容匹配是"尽力而为", content_search=false 说明本次只搜了标题。',
+    '不记得 sessionId, 只记得聊过什么 —— 按关键词跨会话找。什么时候用: ① 想找回"上次讨论 X 的那个会话" ② 确认某个决定/方案在历史会话里出现过没有 ③ session_list 条目太多翻不过来。先匹配标题, 未命中再尽力扫内容(每会话 2s 超时, 跳过慢的)。**两个数字参数分工不同, 别传错**: scan = 最多扫描最近多少个会话(决定"找得全不全", 默认 50 最大 200, 调大更慢); limit = 本页最多返回多少条(决定"一次给多少", 默认 20 最大 100, 与 session_list/task_list 的 limit 同义), 不够就调大 limit 或用 offset 翻页 —— 调大 limit **不会**加深扫描, 想找得更全请调 scan。返回 {query,regex,total,count,offset,limit,truncated,hasMore,matchedTotal,omitted,scan,scannedSessions?,skippedNoCwd?,next?,content_search,filter_noise,boilerplate_count,backend,indexFallbackReason?,indexFallbackHint?,results:[{sessionId,title,cwd,updatedAt(ISO8601),updatedAt_epoch,matched 为 title 或 content,snippet?,boilerplate?}]}(按 updatedAt 倒序; 默认把"几乎每个会话都命中的样板文字"沉底并标 boilerplate=true, 可用 filter_noise=false 关闭)。⚠️ 三个数字口径: total=本次扫描的会话数(不是结果数), matchedTotal=命中总数, count=本页返回条数; 当 matchedTotal > count 时必然给出 omitted(还差多少条)+ hasMore=true + next(怎么取下一页), 绝不会静默丢弃。找到 sessionId 后用 session_log 看细节、或 agent_run(sessionId=...) 续接。注意: 内容匹配是"尽力而为", content_search=false 说明本次只搜了标题。',
     {
       query: z.string().min(1).describe('搜索词(默认大小写不敏感子串; regex=true 时按正则)'),
       cwd: z.string().optional().describe('只搜这个工作目录下的会话(realpath 精确匹配); 不传=全部'),
       regex: z.boolean().optional().describe('把 query 当正则解释(默认 false 当普通子串)'),
-      limit: z.number().int().min(1).max(200).optional().describe('最多扫描最近 N 个会话(默认 50, 最大 200; 调大更全但更慢)'),
+      scan: z.number().int().min(1).max(200).optional().describe('最多扫描最近 N 个会话(决定"找得全不全", 默认 50, 最大 200; 调大更全但更慢。与 limit 无关)'),
+      limit: z.number().int().min(1).max(LIST_PAGE_MAX).optional().describe(`本页最多返回 N 条命中(决定"一次给多少", 默认 ${LIST_PAGE_DEFAULT}, 最大 ${LIST_PAGE_MAX}; 与 session_list 的 limit 同义)。调大不会加深扫描, 想找得更全请调 scan`),
       offset: pageArgSchema.offset,
-      pageSize: z.number().int().min(1).max(LIST_PAGE_MAX).optional().describe(`本页最多返回条数(默认 ${LIST_PAGE_DEFAULT}, 最大 ${LIST_PAGE_MAX})`),
+      pageSize: z.number().int().min(1).max(LIST_PAGE_MAX).optional().describe(`[兼容旧调用方] 与 limit 同义的本页条数; 若同时传 limit 以 limit 为准`),
+      filter_noise: z.boolean().optional().describe('是否把"几乎每个会话都命中的样板文字"降权沉底(默认 true; 这类命中零信息量, 会挤占前排。设 false 可拿到原始 updatedAt 序)'),
     },
-    async ({ query, cwd, regex, limit, offset, pageSize }) => {
+    async ({ query, cwd, regex, scan, limit, offset, pageSize, filter_noise }) => {
       try {
         // [r3] C8: 入口参数预校验(必填/类型)
-        const bad = validateArgs('session_search', { query, cwd, regex, limit, offset, pageSize }, [
+        const bad = validateArgs('session_search', { query, cwd, regex, scan, limit, offset, pageSize, filter_noise }, [
           { name: 'query', type: 'string', required: true },
           { name: 'cwd', type: 'string' }, { name: 'regex', type: 'boolean' },
-          { name: 'limit', type: 'number' }, { name: 'offset', type: 'number' }, { name: 'pageSize', type: 'number' },
+          { name: 'scan', type: 'number' }, { name: 'limit', type: 'number' },
+          { name: 'offset', type: 'number' }, { name: 'pageSize', type: 'number' },
+          { name: 'filter_noise', type: 'boolean' },
         ])
         if (bad) return out(JSON.stringify({ error: bad }))
         // [r3] C7+C8: 空白 query 走统一句式, 但保留 `query must not be empty` 前缀(R2 契约)
@@ -3746,7 +4535,21 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           }
         }
         const needle = query.toLowerCase()
-        const maxScan = Math.min(Math.max(1, Math.trunc(limit ?? 50)), 200)
+        // [R9 P1] 语义拆分: scan = 扫描深度(默认 50, clamp 1..200); limit = 返回条数(默认 20, clamp 1..100)。
+        //
+        // 缺陷(REQ_r9 §2 P1): 旧代码里同一个参数 limit 既当扫描深度(Math.min(limit??50,200))
+        // 又经 parsePage 当返回条数(默认 20)。后果是**静默丢弃** —— 实测 limit=50 时 matched=44
+        // 只返回 20 条, 而响应里没有任何字段说明还差 24 条; 调用方会以为"只有 20 个命中"。
+        // 且与同 server 的 session_list/task_list/approval_list 的 limit(= 返回条数)语义相反,
+        // 调用方(含 LLM)必然猜错; 想"多返回几条"而调大 limit 反而只是把扫描深度拉大, 返回条数不变。
+        //
+        // 破坏性变更: 旧 limit(扫描深度) → 新 scan; 新 limit = 返回条数(与其余工具一致)。
+        // 同时保留 pageSize 作为"返回条数"的旧别名(limit 优先), 旧调用方传 pageSize 仍可用。
+        const scanDepth = Math.min(Math.max(1, Math.trunc(scan ?? 50)), 200)
+        // limit 优先; 未传 limit 时回落到旧别名 pageSize; 都没传用默认 20。
+        const pageLimit = limit !== undefined ? limit : pageSize
+        // [R9 P3] 样板文字降权开关(默认开; 显式传 false 关闭)
+        const filterNoise = filter_noise !== false
         // [r1] C1/C2: 优先尝试官方索引搜索(ctx.sessionQuery.searchSessions)。
         // 本机默认 openAt:'never' → 抛 SESSION_QUERY_SEARCH_DISABLED; 且上游 locate() bug 会让
         // 186/198 会话抛 SESSION_QUERY_PERSISTENCE_FAILED(PLAN_r1 §1.5)。两种情况都必须**静默回退**,
@@ -3754,12 +4557,15 @@ function registerTools(mcp: McpServer, ctx: Context): void {
 
         let indexFallbackReason: string | undefined
         if (regex !== true) {
-          const idxRes = await tryIndexSearch(ctx, { query, cwd, limit: maxScan })
+          const idxRes = await tryIndexSearch(ctx, { query, cwd, limit: scanDepth })
           if (idxRes.hits) {
             // 索引命中 → 直接走同一套分页/返回体, backend 标记为 index
             sessionSearchBackend = 'index'
-            const { offset: off2, limit: lim2 } = parsePage(offset, pageSize, LIST_PAGE_DEFAULT)
+            // [R9 P1] limit(返回条数) 优先, pageSize 为兼容旧别名
+            const { offset: off2, limit: lim2 } = parsePage(offset, pageLimit, LIST_PAGE_DEFAULT)
             const { page: page2, meta: meta2 } = pageEnvelope(idxRes.hits, off2, lim2, 'session_search')
+            // [R9 P1/P2] 命中数 > 返回数时, omitted 明确告知"还差多少条", 绝不静默丢弃
+            const omitted2 = Math.max(0, idxRes.hits.length - meta2.offset - page2.length)
             return out(JSON.stringify({
               query,
               regex: false,
@@ -3768,16 +4574,22 @@ function registerTools(mcp: McpServer, ctx: Context): void {
               offset: meta2.offset,
               limit: meta2.limit,
               truncated: meta2.truncated,
+              hasMore: meta2.hasMore,
               matched: idxRes.hits.length,
+              matchedTotal: idxRes.hits.length,
               scanned: idxRes.hits.length,
+              // [R9 P2] scannedSessions 与 total 同值(本次参与匹配的会话数), 名字自解释
+              scannedSessions: idxRes.hits.length,
+              omitted: omitted2,
+              scan: scanDepth,
               content_search: true,
               backend: 'index',
-              ...(meta2.truncated ? { next: `共 ${idxRes.hits.length} 条命中, 本页 ${page2.length} 条; 取下一页请传 offset=${meta2.offset + page2.length}` } : {}),
+              ...(meta2.truncated ? { next: `共 ${idxRes.hits.length} 条命中, 本页给了 ${page2.length} 条, 还有 ${omitted2} 条没给; 取下一页请传 offset=${meta2.offset + page2.length}` } : {}),
               results: page2.map((r) => {
                 const { updatedAt, ...rest } = r
                 return { ...rest, ...timeFields('updatedAt', updatedAt) }
               }),
-            }))
+            }, null, 2))
           }
           indexFallbackReason = idxRes.reason
         } else {
@@ -3809,7 +4621,7 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         }
         // 粗排(updatedAt desc)取最近 N 个扫描(排序键已在 listCorpus 内免费取得)
         rows.sort((a, b) => b.updatedAt - a.updatedAt)
-        const scanned = rows.slice(0, maxScan)
+        const scanned = rows.slice(0, scanDepth)
         const scannedRows = scanned.map((r) => ({ h: r.header, at: r.updatedAt }))
         // 并发 8 消费; 单会话读取有 ~2s 时限, 最坏总耗时 ≈ ceil(N/8)*2s
         const hits: SessionSearchRow[] = []
@@ -3827,35 +4639,75 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           }
         }
         await Promise.all(Array.from({ length: Math.min(8, queue.length) }, worker))
+        // [R9 P3] 样板文本降权: 先按 updatedAt 倒序(原有主序), 再把"疑似模板文字"的纯内容命中
+        // 沉到后面 —— 它们每个会话都命中, 对"找上次讨论 X 的会话"零信息量, 不该占据前排。
+        // 排序稳定(Array#sort 在 V8 上是稳定的), 所以组内仍保持 updatedAt 倒序。
         hits.sort((a, b) => b.updatedAt - a.updatedAt)
+        const boilerplateKeys = filterNoise ? detectBoilerplateKeys(hits) : new Set<string>()
+        const isBoilerplateHit = (r: SessionSearchRow): boolean =>
+          r.matched === 'content' && typeof r.snippet === 'string' && boilerplateKeys.has(noiseKey(r.snippet))
+        let boilerplateCount = 0
+        let orderedHits = hits
+        if (boilerplateKeys.size > 0) {
+          const real: SessionSearchRow[] = []
+          const noise: SessionSearchRow[] = []
+          for (const r of hits) {
+            if (isBoilerplateHit(r)) { noise.push({ ...r, boilerplate: true }); boilerplateCount++ } else real.push(r)
+          }
+          // 只在确实分出了噪音时才重排(否则保持原数组, 行为与旧版逐字节一致)
+          if (noise.length > 0) orderedHits = [...real, ...noise]
+        }
         // [r3] A1/A2: 统一分页 + 时间戳人类可读
-        const { offset: off, limit: lim } = parsePage(offset, pageSize, LIST_PAGE_DEFAULT)
-        const { page, meta } = pageEnvelope(hits, off, lim, 'session_search')
+        // [R9 P1] limit(返回条数) 优先, pageSize 为兼容旧别名
+        const { offset: off, limit: lim } = parsePage(offset, pageLimit, LIST_PAGE_DEFAULT)
+        const { page, meta } = pageEnvelope(orderedHits, off, lim, 'session_search')
+        // [R9 P1] 命中了但有没给的: omitted = 还剩多少条没给(不含已翻过的页)。
+        // 这是本轮的核心 —— 旧代码 matched=44/返回 20 时响应里毫无提示, 调用方以为"只有 20 个命中"。
+        const omitted = Math.max(0, hits.length - meta.offset - page.length)
         return out(JSON.stringify({
           query,
           regex: Boolean(regex),
+          // [R9 P2] 口径写死: total/scanned/scannedSessions 三者同值 = 本次**扫描的会话数**(不是结果数);
+          // matched/matchedTotal = **命中总数**; count = 本页返回条数。三者关系在工具描述里也写死了。
           total: scanned.length,
           count: page.length,
           offset: meta.offset,
           limit: meta.limit,
           truncated: meta.truncated,
-          // [r3] A1: total=本次实际扫描的会话数(保持 R2 口径); matched=命中总数; scanned 为等价别名
+          hasMore: meta.hasMore,
           matched: hits.length,
+          matchedTotal: hits.length,
           scanned: scanned.length,
+          scannedSessions: scanned.length,
+          // [R9 P1] 明确告知"还有多少条没拿到"; 无遗漏时为 0(调用方可直接判 omitted === 0)
+          omitted,
+          // [R9 P1] 本次生效的扫描深度(与 scan 入参区分: 会话池不足时 scanned < scan)
+          scan: scanDepth,
+          // [R9 P3] 样板文字降权: 开关状态 + 被判为样板并沉底的条数(0 = 本次没有噪音或被关闭)
+          filter_noise: filterNoise,
+          boilerplate_count: boilerplateCount,
           content_search: contentSearched,
           // [r1] C1/C2: 实际后端(scan=插件侧扫描; index=官方索引) + 回退原因(诊断用)
           backend: 'scan',
           ...(indexFallbackReason !== undefined ? { indexFallbackReason } : {}),
+          // [R7 P3-2 / C-3] indexFallbackReason 是上游原始错误码(如 SESSION_QUERY_SEARCH_DISABLED),
+          // 对 Hermes 侧不可读 —— 补一句人话解释(新增字段, 不改原字段, 向后兼容)。
+          ...(indexFallbackReason !== undefined ? { indexFallbackHint: INDEX_FALLBACK_HINT } : {}),
           ...(searchSkippedNoCwd > 0 ? { skippedNoCwd: searchSkippedNoCwd } : {}),
           results: page.map((r) => {
             const { updatedAt, ...rest } = r
             return { ...rest, ...timeFields('updatedAt', updatedAt) }
           }),
-          // [r2] A + [r3] A1: 自解释下一步 —— 找到的 id 怎么用 / 怎么翻页 / 没找到怎么办
-          ...(meta.next !== undefined ? { next: meta.next } : {}),
+          // [r2] A + [r3] A1 + [R9 P1]: 自解释下一步 —— 找到的 id 怎么用 / 怎么翻页 / 没找到怎么办。
+          // next 必须说清"还有几条没给"(不能只说 truncated=true)。
+          ...(meta.truncated
+            ? { next: `命中 ${hits.length} 条, 本页给了 ${page.length} 条, 还有 ${omitted} 条没给; 取下一页传 offset=${meta.offset + page.length}&limit=${meta.limit}` }
+            : {}),
           hint: hits.length > 0
-            ? '拿到 sessionId 后: 看细节用 session_log(sessionId=...), 续接干活用 agent_run(sessionId=...)'
-            : `没有命中; 可尝试: 调大 limit(当前扫了最近 ${scanned.length} 个)、换更短的关键词、或设 regex=true 用正则; 全部会话列表用 session_list`,
+            ? (meta.truncated
+              ? `本页只是前 ${page.length} 条; 想一次拿更多请调大 limit(最大 ${LIST_PAGE_MAX}), 想找得更全请调大 scan(当前 ${scanDepth}); 拿到 sessionId 后看细节用 session_log(sessionId=...), 续接干活用 agent_run(sessionId=...)`
+              : '拿到 sessionId 后: 看细节用 session_log(sessionId=...), 续接干活用 agent_run(sessionId=...)')
+            : `没有命中; 可尝试: 调大 scan(当前扫了最近 ${scanned.length} 个会话)、换更短的关键词、或设 regex=true 用正则; 全部会话列表用 session_list`,
         }, null, 2))
       } catch (e) {
         return out(JSON.stringify({ error: `${toolFailure('session_search', e)} (可去掉 regex 或缩小 cwd 再试; 单会话读取超时会被跳过, 属正常)` }))
@@ -3879,7 +4731,12 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             presets: discovered.map((p) => ({ id: p.id, name: p.name ?? p.id, description: p.description ?? '', trust: p.trust, broken: p.broken })),
           }, null, 2))
         }
-      } catch { /* 服务缺失 → 内置兜底名单 */ }
+      } catch (e) {
+        // [R2-3] 契约/服务类: 这里回退到**硬编码的 4 条 preset 名单**(standard/code/minimal/cordis)。
+        // 一旦 agentPresets 契约漂移, 调用方会拿到一份看似合法、实则与部署无关的 preset 名单,
+        // 拿去 agent_run 只会得到 "unknown preset" —— 不留痕就查不到真因。
+        degrade('agentPresets', 'ctx.agentPresets.list() 抛错, preset_list 已回退内置兜底名单(可能不是本部署真实可用的 preset)', e)
+      }
       return out(JSON.stringify({
         source: 'builtin-fallback',
         default: runtimeConfig.preset,
@@ -3985,7 +4842,14 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           if (live) {
             try {
               const preset = await ctx.agentPresets.recompose(live.ctx as never, presetId)
-              live.session.append('agent-preset/selected', { agentPreset: preset.id })
+              // [R7 P2-2] 契约/服务类: 写失败仍返回 ok:true, 用户以为 preset 切了实际没记下
+              // —— 典型"看起来成功其实没生效"。必须留痕。
+              try {
+                live.session.append('agent-preset/selected', { agentPreset: preset.id })
+              } catch (e) {
+                degrade('agentPresets.append', 'agent-preset/selected 事件写入 live 会话失败, preset 看似切换成功但未落盘(重启后不生效)', e)
+                throw e
+              }
               return out(JSON.stringify({ ok: true, scope: 'session', sessionId, preset: preset.id, source: 'live', next: HINT.resumeSession }))
             } catch (e) {
               return out(JSON.stringify({ error: `${toolFailure('preset_set', e)} (用 preset_list 确认 presetId 合法; 或重启会话后重试)` }))
@@ -4044,6 +4908,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
             globalDefaultUpdated = true
           }
         } catch (e) {
+          // [R2-3] 契约/服务类: settings.mutate 是「改全局默认 preset」的唯一落盘路径。
+          // 抛错时工具仍返回 ok:true(仅 globalDefaultUpdated:false + 一句 note), 用户以为默认改好了,
+          // 重启后又变回去 —— 必须留痕, 否则这是典型的「没报错但没生效」。
+          degrade('settings', 'ctx.get(settings).mutate() 抛错, 全局用户默认 preset 未写入(仅本次运行生效, 重启后失效)', e)
           note = `global user-default write skipped: ${(e as Error)?.message ?? String(e)}`
         }
         return out(JSON.stringify({
@@ -4120,15 +4988,28 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         let target: PolicySessionLike | undefined
         try {
           target = (ctx.agents.get(sid) as { session?: PolicySessionLike } | undefined)?.session
-        } catch { target = undefined }
+        } catch (e) {
+          // [R2-3] 契约/服务类: agents.get 抛错时 target 落空, 最终错误文案是
+          // 「会话不 live 或不存在」—— 把一个契约问题报成了用户侧的使用问题。
+          degrade('agents', 'ctx.agents.get() 抛错, set_policy 会把该会话误报为「不 live 或不存在」', e)
+          target = undefined
+        }
         if (!target?.append) {
           const store = ctx.get('sessions') as SessionsStoreView | undefined
           const attached = store?.get?.(sid) as PolicySessionLike | undefined
           if (attached?.append) target = attached
         }
         if (!target?.append) {
+          // [R7 P2-1] 句式收口: 旧文案前缀是 `session <id> is not live; ...`, 与家族前缀
+          // `session not found: <id> (...)` 不一致 —— agent 用 startsWith('session not found') 匹配会漏。
+          // 这里改走统一 errText/家族形状: `<错误>: <关键值> (<原因>; <下一步>)`, 附加说明并进 next 参数。
           return out(JSON.stringify({
-            error: `session ${sessionId} is not live; cold/persisted sessions must be resumed first (冷会话必须先跑一轮让它活起来: agent_run(task=..., sessionId=...) 或 task_inbox(task=..., sessionId=...), 之后再调 set_policy; 或直接在那一轮里用 sandbox=... 指定档位)`,
+            error: errText(
+              'session is not live',
+              sessionId,
+              '冷/已持久化的会话必须先在某一轮里被唤醒(它当前没有可写的 live 句柄)',
+              '先跑一轮让它活起来: agent_run(task=..., sessionId=...) 或 task_inbox(task=..., sessionId=...), 之后再调 set_policy; 或直接在那一轮里用 sandbox=... 指定档位; 用 session_list 确认该 id 存在',
+            ),
           }))
         }
         appendSandboxMode(target, mode)
@@ -4548,6 +5429,10 @@ function registerTools(mcp: McpServer, ctx: Context): void {
           try {
             agent.cancel({ kind: 'user' })
           } catch (e) {
+            // [R2-3] 契约/服务类(高价值): `cancel` **不在** @deepseek-ai/dsh-agent 的类型契约里
+            // (Agent 只声明了 readonly id; 只有 AgentHandle.dispose 是有类型的)。它是靠结构探测用的,
+            // 一旦上游改名/改签名, 这里就是**静默 no-op** —— 不留痕的话 task_cancel 会一直报成功而任务照跑。
+            degrade('agents.cancel', 'agent.cancel() 抛错, task_cancel 未能真正中止运行中的任务(该方法不在宿主类型契约内)', e)
             delete item.cancelled
             return out(JSON.stringify({ ok: false, error: toolFailure('task_cancel', e), hint: '等待完成或 sessionId 续接接管', next: '重试 task_cancel, 或等任务自然结束' }))
           }
@@ -4578,7 +5463,11 @@ function registerTools(mcp: McpServer, ctx: Context): void {
         if (bad) return out(JSON.stringify({ error: bad }))
         const sessions = ctx.get('sessions') as { get?: (id: string) => unknown } | undefined
         const session = sessions?.get?.(sessionId)
-        if (!session) return out(JSON.stringify({ error: `${sessionNotFoundError(sessionId)}; 注意本工具只能改 live 会话 —— 若该会话是冷的, 先用 agent_run(task=..., sessionId=...) 唤醒它再改名` }))
+        // [R7 P2-1] 句式收口: 旧写法是 `${sessionNotFoundError(id)}; 注意本工具只能改 live 会话 —— ...`
+        // 外挂拼接 —— sessionNotFoundError 已以 ')' 结尾, 拼完整体不再符合
+        // `<错误>: <关键值> (<原因>; <下一步>)`, 按 ')' 截断解析的 agent 会丢信息。
+        // 这里把附加说明并进 next 参数(信息不丢, 人读起来依旧完整)。
+        if (!session) return out(JSON.stringify({ error: sessionNotFoundError(sessionId, '本工具只能改 live 会话 —— 若该会话是冷的, 先用 agent_run(task=..., sessionId=...) 唤醒它再改名; 用 session_list 查看当前会话列表确认 id 拼写') }))
         const st = ctx.get('sessionTitle') as { rename?: (s: unknown, t: string) => unknown } | undefined
         if (!st?.rename) return out(JSON.stringify({ error: 'sessionTitle service unavailable (该 dsh 部署未加载会话标题服务, 无法改名; 不影响其他功能)' }))
         const snapshot = st.rename(session, title) as { title?: string } | undefined
@@ -4635,6 +5524,9 @@ function registerTools(mcp: McpServer, ctx: Context): void {
 export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   // 初始化运行时配置: 先重置为默认值再叠加 config(重复 apply 幂等, 不残留上一次的状态)
   Object.assign(runtimeConfig, runtimeConfigDefaults())
+  // [R7 P1-1] 与 runtimeConfig 同款幂等: 重复 apply 不残留上一次的「显式配置过」判定
+  providerExplicitlyConfigured = Boolean(config.provider)
+  providerCheck = undefined
   if (config.provider) runtimeConfig.provider = config.provider
   if (config.model) runtimeConfig.model = config.model
   if (config.preset) runtimeConfig.preset = config.preset
@@ -4696,6 +5588,15 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
       runtimeConfig.callbackPreset = p
     }
   }
+  // [r8] ask_user_question 挂起通知回调(同款校验; 不配 = 不注册 answerer, 保持旧行为)
+  if (config.questionCallback !== undefined) {
+    const q = normalizeCallbackPreset(config.questionCallback)
+    if (q === undefined || q.url === undefined || q.url === '') {
+      console.warn('[harness-mcp-server] invalid questionCallback, keep unset (expected object with url)')
+    } else {
+      runtimeConfig.questionCallback = q
+    }
+  }
 
   const port = config.port ?? 8090
   // 安全默认: 仅监听本机。暴露公网/局域网前必须自行加认证+反代+TLS(见 README 警告)
@@ -4703,7 +5604,37 @@ export async function apply(ctx: Context, config: Config = {}): Promise<void> {
   serverRuntime.port = port
   serverRuntime.host = host
   serverRuntime.startedAt = Date.now()
+  // [P0-1] 降级留痕随 apply 重置(与 runtimeConfig 同款幂等语义)
+  resetDegradations()
   console.log('[harness-mcp-server] apply called, port=', port)
+
+  // ── [R7 P1-1] provider 默认值引导: 运行时探测「默认 provider 是否在宿主注册」 ──
+  // 背景(R6 §B-2): runtimeConfigDefaults() 的 provider 默认是 'deepseek-official'。
+  // 部署方用自定义 provider(如本机 kenari)时只配 model 不配 provider, 启动会失败在上游组装阶段,
+  // 报 MISSING_CREDENTIAL 之类**指向错误对象**的信息, 排查成本极高。
+  // 设计: 只 warn + degrade 留痕, **绝不抛错、绝不阻断启动**(保留降级能力), 也**绝不**替用户改默认值。
+  // 探测走运行时 API `ctx.llm.listProviders()`(dsh-llm LlmProviderInfo[]{id,name})——
+  // 与 contract.ts 一致, **不做版本号比较**。
+  probeProviderDefault(ctx)
+
+  // ── [P0-1] 宿主契约启动自检(注册工具**之前**跑一次) ──
+  // 设计(DISCUSS_20261003 §3.1): 不抛错阻断启动(保留降级能力), 但必须让人看见;
+  // 结果写入 runtimeConfig.contract 供 status_get 暴露, 让 Hermes 侧也能看到。
+  const contractReport = probeHostContract({
+    ctx: ctx as unknown as { get: (key: string, strict?: boolean) => unknown },
+    // 校验的是**已 import 的绑定**本身(不是二次 module 解析): 捕获「导出被改名/变成非函数」
+    symbols: { createUserMessage, SessionId, scopeOf },
+  })
+  if (contractReport.missingRequired.length > 0) {
+    console.error('[harness-mcp-server] ⛔ 宿主契约缺失(必需):', contractReport.missingRequired)
+    console.error('   → 本次升级可能引入破坏性变更。已降级运行, 功能可能不完整。')
+    console.error(`   → 契约清单见 src/contract.ts; 用 node scripts/contract_probe.mjs 落盘基线并 diff。`)
+    degrade('contract', 'required 宿主契约缺失', contractReport.missingRequired.join(', '))
+  }
+  if (contractReport.missingOptional.length > 0) {
+    console.warn('[harness-mcp-server] ⚠️ 可选宿主能力缺失(已降级):', contractReport.missingOptional)
+  }
+  runtimeConfig.contract = contractReport
 
   const servers = new Map<string, McpServer>()
   const transports = new Map<string, StreamableHTTPServerTransport>()
@@ -4811,6 +5742,8 @@ export const __internals = {
   get activeBridgeKind() { return activeBridgeKind },
   // [r3] 纯函数通道: A(格式化/分页) 与 C(错误文案/参数校验) 可被单测直接断言, 不依赖 HTTP 时序
   errText, missingParamError, idNotFoundError, emptySessionError,
+  // [R7 P2-1] 句式收口: sessionNotFoundError 现支持可选 next 覆盖, 供单测断言"附加说明并进 next"
+  sessionNotFoundError,
   isDshServiceDown, toolFailure, validateArgs,
   humanTime, timeFields, formatBytes, formatDuration, parsePage, pageEnvelope,
   fileLandingHint, extractAbsPaths,
@@ -4823,5 +5756,24 @@ export const __internals = {
   // [r1] 会话快路径: 供单测断言批量 mtime / 数据源选择 / cwd 目录名推导
   listCorpus, projectDirNameOf, batchUpdatedAt,
   SESSION_LIST_INSPECT_CONCURRENCY, SESSION_LIST_INSPECT_TIMEOUT_MS,
+  // [P0-1] 契约自检与可观测降级: 供单测/变异检查直接断言, 不依赖 HTTP 时序
+  degrade, probeHostContract, HOST_CONTRACT,
+  degradationsSnapshot, resetDegradations, warnOnEmptyRun,
+  get contractReport() { return runtimeConfig.contract },
+  // [R7 P1-1] provider 默认值引导: 供单测直接断言探测三态, 不依赖 HTTP 时序
+  probeProviderDefault,
+  get providerCheck() { return providerCheck },
+  DEFAULT_PROVIDER_ID,
+  // [R7 P1-2] fs_read 越界判定纯函数(供单测断言边界: totalLines-1 / totalLines / totalLines+1 / 极大值)
+  fsReadOffsetNote,
+  // [R7 P3-2] session_search 回退人话解释(供单测断言字段存在且含中文说明)
+  INDEX_FALLBACK_HINT,
+  // [R8] ask_user_question 应答器: 供单测断言挂起表/文件协议/超时/回调载荷, 不依赖真实 agent
+  pendingQuestions, makeUserQuestionAnswerer, QUESTION_ANSWER_TIMEOUT_MS,
+  handleQuestionAnswerFile, cleanupQuestionFiles, questionFileDir,
+  get approvalBridgeFilesForTest() { return approvalBridgeFiles },
+  set approvalBridgeFilesForTest(v) { approvalBridgeFiles = v },
+  // [R9 P3] 样板文字统计过滤纯函数(供单测直接断言判定规则, 不依赖真实会话内容)
+  detectBoilerplateKeys, noiseKey, NOISE_MIN_SAMPLE, NOISE_MIN_RATIO,
   VERSION: PLUGIN_VERSION,
 }
