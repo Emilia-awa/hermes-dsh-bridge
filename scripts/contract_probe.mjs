@@ -19,12 +19,43 @@
  * 零依赖: 只用 node 内置能力 + 本仓库 lib/ 产物。
  */
 import { readFileSync, existsSync } from 'node:fs'
+import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
+
+/**
+ * 宿主全局树里 `@deepseek-ai` 的位置（探测用，找不到返回 undefined）。
+ *
+ * ⚠️ 为什么需要它：**服务包由宿主提供，不在本插件的 dependencies 里**。
+ * 只从插件自己的位置 `require.resolve` 会解析不到 —— 除非恰好有上层 node_modules
+ * 挡在路上（本机历史上 `/root/.dsh/profiles/node_modules` 就是这么个目录，于是
+ * 「生产看起来是绿的」，而**干净安装必报 required 服务缺失**）。这是诊断工具
+ * 的假警报，会让新用户以为装坏了。所以显式回退到宿主树解析。
+ */
+function detectHostScopeDir() {
+  // ⓪ 显式指定则**唯一**（与 link-host-deps 的 --tree 语义一致）——
+  //    否则「显式指一个空目录」会被自动探测悄悄兜住，测试与排查都无法复现「宿主不可用」
+  const env = process.env.DSH_HOST_TREE
+  if (env !== undefined && env !== '') return existsSync(env) ? env : undefined
+  // ① npm root -g（npm 可能不在 PATH，失败不致命）
+  try {
+    const globalRoot = execFileSync('npm', ['root', '-g'], { encoding: 'utf8', timeout: 15000, stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+    if (globalRoot) {
+      const p = join(globalRoot, '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai')
+      if (existsSync(p)) return p
+    }
+  } catch { /* 走 ② */ }
+  // ② 常见安装位置
+  for (const root of ['/opt/node22/lib/node_modules', '/usr/local/lib/node_modules', '/usr/lib/node_modules']) {
+    const p = join(root, '@deepseek-ai', 'dsh', 'node_modules', '@deepseek-ai')
+    if (existsSync(p)) return p
+  }
+  return undefined
+}
 
 /**
  * 加载契约清单与探测器。
@@ -51,13 +82,25 @@ async function loadContractModule() {
 
 /** 读一个包实际解析到的版本(解析不到返回 undefined, 不抛错) */
 function resolvedVersion(pkg) {
+  // ① 从插件自己的位置解析（依赖里声明的包走这条）
   try {
     const p = require.resolve(`${pkg}/package.json`)
     const json = JSON.parse(readFileSync(p, 'utf8'))
-    return { version: json.version, path: p }
-  } catch {
-    return undefined
+    return { version: json.version, path: p, from: 'plugin' }
+  } catch { /* 走 ② */ }
+  // ② 回退到宿主全局树 —— 服务包由宿主提供，不在插件 dependencies 里
+  //    （不这么做，干净安装会误报 required 服务缺失；本机曾因上层恰好有 node_modules 而侥幸为绿）
+  const host = detectHostScopeDir()
+  if (host) {
+    const p = join(host, pkg.replace(/^@deepseek-ai\//, ''), 'package.json')
+    if (existsSync(p)) {
+      try {
+        const json = JSON.parse(readFileSync(p, 'utf8'))
+        return { version: json.version, path: p, from: 'host' }
+      } catch { /* 坏文件 → 当解析不到 */ }
+    }
   }
+  return undefined
 }
 
 /**

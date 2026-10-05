@@ -43,6 +43,26 @@ const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 /** 已知的「宿主树无同名包」清单(技术债, 不在本轮范围; 仍为真实目录属预期, 不算失败) */
 const KNOWN_LOCAL_ONLY = ['dsh-agent-presets', 'dsh-code-runtime']
 
+/**
+ * 向上查找本插件依赖的 `@deepseek-ai` scope 目录。
+ *
+ * ⚠️ 不能只看 `<插件根>/node_modules/@deepseek-ai` —— npm 会把依赖 **hoist 到上层**
+ *（用户装 `<项目>/node_modules/hermes-dsh-bridge` 时，依赖在 `<项目>/node_modules/@deepseek-ai`，
+ * 插件内那个目录根本不存在）。按 Node 的解析顺序自下而上找第一个存在的，与运行时 import 一致。
+ * 找不到时返回插件内的路径（仅用于拼出可读的报错文案）。
+ */
+function detectScopeDirUp(start) {
+  let dir = start
+  for (let i = 0; i < 12; i++) {
+    const candidate = join(dir, 'node_modules', '@deepseek-ai')
+    if (existsSync(candidate)) return candidate
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  return join(start, 'node_modules', '@deepseek-ai')
+}
+
 // ── 参数解析 ──
 function parseArgs(argv) {
   const out = { port: DEFAULT_PORT, host: DEFAULT_HOST, url: undefined, profile: undefined, token: process.env.DSH_MCP_TOKEN || '' }
@@ -407,7 +427,10 @@ let allProfileNames = []
 // ── 6. 依赖树 symlink 状态(dual-package hazard; DISCUSS_20261003 §2.3 A2) ──
 section('依赖树')
 {
-  const scopeDir = join(REPO_ROOT, 'node_modules', '@deepseek-ai')
+  // ⚠️ 必须向上查找：npm 会把 @deepseek-ai/* **hoist 到上层** node_modules。
+  // 用户装 <项目>/node_modules/hermes-dsh-bridge 时，依赖落在 <项目>/node_modules/@deepseek-ai，
+  // 插件内那个目录根本不存在 —— 只盯插件内会误报「未找到」并把用户引向错误的修复动作。
+  const scopeDir = detectScopeDirUp(REPO_ROOT)
   let entries = []
   try {
     entries = readdirSync(scopeDir, { withFileTypes: true })
@@ -416,8 +439,8 @@ section('依赖树')
   } catch { /* 目录不存在 → entries 为空, 下面按失败处理 */ }
 
   if (entries.length === 0) {
-    record('依赖树 symlink 状态', false, `未找到 ${scopeDir}`,
-      `先在本插件目录跑 npm install; 然后 node scripts/link-host-deps.mjs 把 @deepseek-ai/* 对齐宿主全局树(消除 dual-package hazard)`)
+    record('依赖树 symlink 状态', false, `向上未找到 ${'@deepseek-ai'} 目录`,
+      `该插件还没装依赖。正常 npm install 会自动装好并跑 postinstall 对齐; 若你手动删过 node_modules, 重新 npm install 即可`)
     report(results[results.length - 1])
   } else {
     const symlinks = []

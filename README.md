@@ -234,7 +234,7 @@ dsh
 
 运行时
   ✓ 8090 端口监听 — 127.0.0.1:8090 已监听
-  ✓ MCP 握手 — serverInfo.name=harness version=0.11.1
+  ✓ MCP 握手 — serverInfo.name=harness version=0.11.2
   ✓ tools/list 工具可用 — 25 个工具(含 agent_run, session_stats, preset_set, fs_read)
 
 ────────────────────────────────────────────────────────────

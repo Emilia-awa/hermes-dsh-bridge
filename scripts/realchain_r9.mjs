@@ -24,6 +24,7 @@ import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { createRequire } from 'node:module'
 import zlib from 'node:zlib'
+const PKG_VERSION = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const require = createRequire(import.meta.url)
@@ -196,7 +197,7 @@ await sleep(300)
   await rpc(PORT, 'notifications/initialized', {})
   ok(Boolean(r?.result), '真链路 MCP initialize 成功', r)
   console.log(`  serverInfo.version = ${r?.result?.serverInfo?.version}`)
-  ok(r?.result?.serverInfo?.version === '0.11.0', '真链路握手版本 = 0.11.0', r?.result?.serverInfo?.version)
+  ok(r?.result?.serverInfo?.version === PKG_VERSION, `真链路握手版本 = ${PKG_VERSION}`, r?.result?.serverInfo?.version)
 }
 
 console.log('\n══ 真链路: session_search(真实会话库) ══')

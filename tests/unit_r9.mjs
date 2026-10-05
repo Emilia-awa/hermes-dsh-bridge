@@ -425,7 +425,9 @@ say('── G. 破坏性变更已在描述中点明 ──')
   ok(/100/.test(desc), 'G3 描述写明 limit 上限 100', desc.slice(0, 200))
   ok(/omitted/.test(desc), 'G4 描述写明 omitted 字段(知道丢了多少)', desc.slice(0, 200))
   // 版本已升
-  ok(internals.VERSION === '0.11.0', 'G5 PLUGIN_VERSION = 0.11.0', internals.VERSION)
+  // ⚠️ 与 package.json 比对，不写死版本号 —— 否则每次发版都要改测试（已踩两次）
+  const pkgVersion = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version
+  ok(internals.VERSION === pkgVersion, `G5 PLUGIN_VERSION 与 package.json 一致 (${pkgVersion})`, internals.VERSION)
 }
 
 say(`══ [R9] 单元级结果: PASS=${pass} FAIL=${fail} ══`)

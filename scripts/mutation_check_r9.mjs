@@ -140,10 +140,10 @@ const MUTATIONS = [
   },
   {
     id: 'R9-G5',
-    desc: '版本号没升到 0.11.0(破坏性变更未标注版本)',
-    from: "const PLUGIN_VERSION = '0.11.0'",
-    to: "const PLUGIN_VERSION = '0.10.4'",
-    expect: 'G5 PLUGIN_VERSION = 0.11.0',
+    desc: '版本号被改错(破坏性变更未标注版本)',
+    from: "const PLUGIN_VERSION = '0.11.2'",
+    to: "const PLUGIN_VERSION = '0.0.0-wrong'",
+    expect: 'G5 PLUGIN_VERSION 与 package.json 一致',
   },
 ]
 

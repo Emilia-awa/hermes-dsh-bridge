@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [`0.11.2`] — 诊断工具不再对新用户误报（干净安装的假警报）
+
+**升级收益一眼看**：干净安装后跑 `doctor` / `contract_probe`，过去会看到
+「✗ 宿主契约探测 — 缺失服务 sessionPersistence」和「✗ 依赖树 symlink 状态」两个红叉，
+让人以为装坏了。现在正确报绿 —— 这两个都是**诊断工具自己的假警报**，不是插件有问题。
+
+### Fixed
+- **契约探针把「服务包不在插件依赖里」误判成缺失**：服务包（`dsh-session-persistence`
+  等）**由宿主提供**，本来就不该在插件的 `dependencies` 里。探针只用 `require.resolve`
+  从插件自己的位置解析，于是干净安装必然报 required 服务缺失。
+  本机之所以「看起来正常」，纯粹是因为 `/root/.dsh/profiles/node_modules` 这个历史遗留
+  目录恰好挡在解析路径上 —— **换台机器就红**。
+  修法：解析失败时显式回退到宿主全局树（`npm root -g` → 常见安装位置；
+  `DSH_HOST_TREE` 可显式指定且**优先于自动探测**，便于复现「宿主不可用」）。
+  回退只在插件侧解析不到时生效 —— 宿主也没有时照旧报错，不是「无条件放过」。
+- **`doctor` 的依赖树检查只看插件内一层**：与 `link-host-deps` 同样的 hoist 问题
+  （npm 会把 `@deepseek-ai/*` 提到上层 `node_modules`）。修法同上：向上查找。
+  同时把失败文案从「先在本插件目录跑 npm install」改成符合实际的指引
+  （正常 `npm install` 已含 postinstall 自动对齐）。
+  实测：新装布局从 `8 通过 / 3 失败` → `10 通过 / 1 失败`，剩下那条是本机确实没有
+  `settings.yaml`（dsh 用默认值），属真事实而非误报。
+
+### Tests
+- `tests/contract_probe_hostfallback_r11.mjs`：**13 项**，用真实安装产物造出
+  「服务包在 / 仅宿主树有 / 宿主树也没有」三种形态，跑真探针断言结论。
+  变异验证：去掉宿主树回退 → 6 项变红。
+- 全量 `npm test`：**700 项全绿**（R10 基线 687 + R11 新增 13）。
+
 ## [`0.11.1`] — 安装自动化（dual-package hazard 修复不再手写）
 
 **升级收益一眼看**：过去装完插件必须手写一段 22 行的 symlink 命令，**不做 agent 就变成
