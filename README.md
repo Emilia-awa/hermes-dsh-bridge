@@ -98,13 +98,14 @@ agent 需要提权时走审批桥（`web` / `builtin` / `file-push` / `off` 四�
 PROFILE=<你的 profile 名>          # 例: web
 
 # ① 装插件（dual-package hazard 修复已由 postinstall 自动完成）
-cd ~/.dsh/profiles/$PROFILE/node_modules && npm install hermes-dsh-bridge
+cd ~/.dsh/profiles/$PROFILE
+npm install hermes-dsh-bridge
 
-# 装完可以核对一下（应显示 symlink 20 / 保留本地副本 2）：
+# 装完可以核对一下（应显示「已是正确 symlink 23 / 保留本地副本 2」）：
 node node_modules/hermes-dsh-bridge/scripts/link-host-deps.mjs --dry-run
 
 # ② 在 profile 的 cordis.patch.yml 末尾追加配置
-cat >> ~/.dsh/profiles/$PROFILE/cordis.patch.yml <<'EOF'
+cat >> cordis.patch.yml <<'EOF'
 - insert:
     - id: hermes-dsh-bridge
       name: 'hermes-dsh-bridge'
@@ -118,16 +119,22 @@ EOF
 
 # ③ 重启 + 自检
 systemctl restart dsh.service
-node scripts/doctor.mjs --profile $PROFILE     # 逐项告诉你哪里没配好
+node node_modules/hermes-dsh-bridge/scripts/doctor.mjs --profile $PROFILE
 ```
 
-看到 `全部通过` 后，验证真实连通（最便宜的调用是 `echo`）：
+> 后面所有 `node .../scripts/*.mjs` 和 `python3 .../examples/*.py` 都从**插件目录**跑，
+> 例如 `cd ~/.dsh/profiles/$PROFILE/node_modules/hermes-dsh-bridge`。
+
+看到 `结果: 10 项通过, 0 项失败` 后，验证真实连通（最便宜的调用是 `echo`）：
 
 ```bash
+cd ~/.dsh/profiles/$PROFILE/node_modules/hermes-dsh-bridge
 python3 examples/hermes_dsh_mcp.py list                  # 应列出 25 个工具
 python3 examples/hermes_dsh_mcp.py call echo '{"text":"hi"}'
 python3 examples/hermes_dsh_mcp.py run '回复:安装成功'    # 真跑一次 agent（会调 LLM）
 ```
+
+> 用 npm 装的话 `examples/` 也在包里，路径就是上面这个。
 
 ### 注册到你的 MCP 客户端
 
@@ -163,7 +170,7 @@ npm test                         # 全套单测（不需要真实 dsh）
 
 rm -rf ~/.dsh/profiles/$PROFILE/node_modules/hermes-dsh-bridge
 cp -r . ~/.dsh/profiles/$PROFILE/node_modules/hermes-dsh-bridge
-# 然后同样做上面第 ② 步的 symlink 修复并重启
+# 然后做上面第 ② 步的 patch 配置并重启（symlink 由 npm install 的 postinstall 自动对齐）
 ```
 
 **完整配置段**（想直接抄一份带全部选项的）：
@@ -204,9 +211,11 @@ cp -r . ~/.dsh/profiles/$PROFILE/node_modules/hermes-dsh-bridge
 
 ## 安装自检：`node scripts/doctor.mjs`
 
+从**插件目录**跑（`cd ~/.dsh/profiles/$PROFILE/node_modules/hermes-dsh-bridge`）。
+
 零依赖，**只读**（不改文件、不重启服务）。逐项输出 ✓/✗ + 修复建议，
 退出码 `0`=全通过 / `1`=有失败。检查项：Node 版本 / dsh 可执行与版本 / profile 存在 /
-settings 文件 / patch 是否配了插件 / 依赖树 symlink / 宿主契约 / 端口监听 / MCP 握手 + `tools/list`。
+patch 是否配了插件 / 依赖树 symlink / 宿主契约 / 端口监听 / MCP 握手 + `tools/list`。
 
 ```bash
 node scripts/doctor.mjs                      # 默认 127.0.0.1:8090，自动探测 profile
@@ -223,22 +232,22 @@ $ node scripts/doctor.mjs --profile <PROFILE>
   ✓ Node 版本 — v22.22.3 (需要 >= v22.18.0)
 
 dsh
-  ✓ dsh 可执行 + 版本 — dsh 0.1.7-rc.2 (本插件需要 >= 0.1.2-rc.1)
+  ✓ dsh 可执行 + 版本 — dsh 0.2.0-rc.2 (本插件需要 >= 0.1.2-rc.1)
   ✓ dsh profile 存在 — /home/you/.dsh/profiles/<PROFILE> (--profile 指定)
-  ✓ dsh settings 文件 — /home/you/.dsh/settings.yaml
-  ✓ profile patch 已配置插件 — → - id: hermes-dsh-bridge
+  ✓ profile patch 已配置插件 — .../cordis.patch.yml → - id: hermes-dsh-bridge
+  ✓ dsh 已装载插件(dump-config) — dump-config 输出里找到 "- id: hermes-dsh-bridge"
 
 依赖树
-  ✓ 依赖树 symlink 状态 — symlink 20 | 本地副本 2 (dsh-agent-presets, dsh-code-runtime)
-  ✓ 宿主契约探测 — 必需符号 3/3 + 必需服务 6/6 全部就绪
+  ✓ 依赖树 symlink 状态 — symlink 23 | 本地副本 2 (dsh-agent-presets, dsh-code-runtime)
+  ✓ 宿主契约探测 — 必需符号 3/3 + 必需服务 6/6 全部就绪(可选项 6 项)
 
 运行时
   ✓ 8090 端口监听 — 127.0.0.1:8090 已监听
-  ✓ MCP 握手 — serverInfo.name=harness version=0.11.2
-  ✓ tools/list 工具可用 — 25 个工具(含 agent_run, session_stats, preset_set, fs_read)
+  ✓ MCP 握手 — serverInfo.name=harness version=0.11.3
+  ✓ tools/list 工具可用 — 25 个工具(期望 25~26; 含 agent_run, session_stats, preset_set, fs_read, approval_respond)
 
 ────────────────────────────────────────────────────────────
-结果: 9 项通过, 0 项失败
+结果: 10 项通过, 0 项失败
 ```
 
 **怎么读**：`tools/list` 是 25 个（`enableFsWrite` 未开）；开了会是 26 个。

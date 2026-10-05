@@ -354,13 +354,18 @@ let allProfileNames = []
 
 // ── 4. settings / profile 配置文件 ──
 {
+  // ⚠️ settings.yaml 是 dsh **已移除的旧格式**：现代 dsh 会把它的段落迁移进 profile，
+  // 并把原文件改名成 settings.yaml.imported（见 @deepseek-ai/dsh-settings 的
+  // importLegacyDocument）。宿主树里**没有任何写入方**会生成它 —— 所以
+  // 「没有 settings.yaml」是**正常状态**，不是失败项。只有旧安装遗留时才提示一句。
   const settingsYaml = join(dshHome, 'settings.yaml')
   const settingsJson = join(dshHome, 'settings.json')
-  const hasSettings = existsSync(settingsYaml) || existsSync(settingsJson)
-  record('dsh settings 文件', hasSettings,
-    hasSettings ? (existsSync(settingsYaml) ? settingsYaml : settingsJson) : `未找到 ${settingsYaml} 或 settings.json`,
-    '启动一次 dsh 会自动生成 settings.yaml; 若确实缺失, 跑 `dsh --profile <name> --help` 或直接 `dsh --profile <name>` 触发初始化')
-  report(results[results.length - 1])
+  const legacy = existsSync(settingsYaml) ? settingsYaml : (existsSync(settingsJson) ? settingsJson : '')
+  if (legacy) {
+    console.log(`  · 旧版 settings 文件仍在 — ${legacy}`)
+    console.log('     现代 dsh 已不再使用它（配置在 profile 的 cordis.patch.yml 里）；')
+    console.log('     下次启动 dsh 会自动把内容迁移进 profile 并改名 .imported，属正常迁移。')
+  }
 }
 {
   const patchPath = profileName ? join(profilesDir, profileName, 'cordis.patch.yml') : ''
@@ -415,7 +420,7 @@ let allProfileNames = []
       console.log('  · dsh 已装载插件(dump-config) — dump-config 输出里没有插件配置段 — ⚠️ 非失败项(自动探测兜底的 profile)')
     } else {
       record('dsh 已装载插件(dump-config)', false, `dump-config 输出里没有插件配置段(别名: ${PLUGIN_ALIASES.join(', ')})`,
-        `确认插件已装进 profile 的 node_modules 且 patch 里 name 拼写正确: cd ~/.dsh/profiles/${profileName}/node_modules && npm install ${PLUGIN_NAME}`)
+        `确认插件已装进 profile 的 node_modules 且 patch 里 name 拼写正确: cd ~/.dsh/profiles/${profileName} && npm install ${PLUGIN_NAME}`)
       report(results[results.length - 1])
     }
   } else {

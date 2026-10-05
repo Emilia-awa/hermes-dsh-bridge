@@ -4,6 +4,42 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [`0.11.3`] — 照着 README 能真装上了（安装文档三处死路 + 第三个假警报）
+
+**升级收益一眼看**：这一版修的全是**新用户第一次安装就会撞上**的问题。
+照 README 的「30 秒跑通」抄命令，过去第 ① 步和第 ③ 步**都会直接报
+`Cannot find module`**，第 ④ 步要跑的文件**根本不在 npm 包里**。
+
+### Fixed
+- **README 第 ① 步装错位置**：`cd ~/.dsh/profiles/$PROFILE/node_modules && npm install`
+  会在 `node_modules/` 里再套一层 `node_modules/`，插件装到错误路径。
+  改成在 profile 目录装（`cd ~/.dsh/profiles/$PROFILE`）。
+- **README 第 ③ 步路径不成立**：`node scripts/doctor.mjs` 在用户当时的 cwd
+  （`.../node_modules`）下解析不到。改成完整路径
+  `node node_modules/hermes-dsh-bridge/scripts/doctor.mjs`，并加了一句
+  「后面所有脚本都从插件目录跑」。
+- **README 让跑 `python3 examples/hermes_dsh_mcp.py`，但 npm 包里没有 `examples/`**：
+  `files` 白名单漏了它。已加进白名单 —— 现在 npm 装完 `examples/` 就在包里。
+- **`doctor` 的失败指引过时**：让人 `cd ~/.dsh/profiles/<p>/node_modules && npm install`，
+  与上面同一处错误。已修。
+- **`doctor` 的 `dsh settings 文件` 是第三个假警报**：`settings.yaml` 是 dsh
+  **已移除的旧格式** —— 现代 dsh 会把它迁移进 profile 并改名 `.imported`，宿主树里
+  **没有任何写入方**会生成它。所以「没有 settings.yaml」是**正常状态**，
+  这一项在干净机器上**恒为失败**。改成信息项（只有检测到旧文件时才提示一句迁移）。
+- **README 示例输出与实际不符**：`symlink 20`（实测新装是 23）、`9 项通过`
+  （改完 settings 后是 10 项）、dsh 版本号、缺 `dump-config` 行 —— 全部按真实输出重写。
+
+### Changed
+- **npm 包 `files` 白名单收窄**：过去把整个 `scripts/` 塞进包里，含 9 个
+  `mutation_check_*` / `e2e_r7` / `realchain_r9` 等**开发期**脚本，对新用户是噪音。
+  现在只保留运行/自检必需的四个（`link-host-deps`、`doctor`、`contract_probe`、
+  `check-build-artifacts`）。包内文件数 27 → 21。
+
+### Verification
+- **照修好的 README 完整跑一遍干净安装**：`npm install` → symlink 23 自动对齐 →
+  `doctor` 报 `10 项通过, 0 项失败` → `examples/` 在包里可执行。全程零手工补救。
+- 全量 `npm test`：**700 项全绿**（与 R11 一致，本轮未动逻辑）。
+
 ## [`0.11.2`] — 诊断工具不再对新用户误报（干净安装的假警报）
 
 **升级收益一眼看**：干净安装后跑 `doctor` / `contract_probe`，过去会看到
