@@ -23,6 +23,8 @@ import { dirname, join } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 const SRC_INDEX = join(ROOT, 'src/index.ts')
+// 版本号从 package.json 动态取（锚点不写死，见 R9-G5）
+const PKG_VERSION = JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version
 const TEST_R9 = join(ROOT, 'tests/unit_r9.mjs')
 const TSDOWN = process.env.TSDOWN_BIN || join(ROOT, 'node_modules/.bin/tsdown')
 
@@ -141,7 +143,9 @@ const MUTATIONS = [
   {
     id: 'R9-G5',
     desc: '版本号被改错(破坏性变更未标注版本)',
-    from: "const PLUGIN_VERSION = '0.11.2'",
+    // ⚠️ 锚点从 package.json 动态取，不写死 —— 否则每次发版都会失配，
+    //    表现为「锚点命中 0 次」导致 mutation 步骤红灯（已踩过两次）。
+    from: `const PLUGIN_VERSION = '${PKG_VERSION}'`,
     to: "const PLUGIN_VERSION = '0.0.0-wrong'",
     expect: 'G5 PLUGIN_VERSION 与 package.json 一致',
   },

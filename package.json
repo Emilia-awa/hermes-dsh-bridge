@@ -1,6 +1,6 @@
 {
   "name": "hermes-dsh-bridge",
-  "version": "0.11.3",
+  "version": "0.11.4",
   "description": "Expose DeepSeek Harness agent capabilities as an MCP server, so an external MCP client (e.g. Hermes) can drive Harness to execute coding tasks. Hermes = brain, Harness = arms.",
   "type": "module",
   "main": "lib/index.js",
@@ -75,6 +75,7 @@
     "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-typert-protocol": "^0.1.2-rc.1",
     "@deepseek-ai/dsh-user-approval": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-user-questions": "^0.1.2-rc.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.4.3"
   },

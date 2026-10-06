@@ -4,6 +4,28 @@ All notable changes to this project are documented in this file. The format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/), and the
 project adheres to [Semantic Versioning](https://semver.org/).
 
+## [`0.11.4`] — CI 转绿（依赖声明缺失 + 版本锚点写死）
+
+**升级收益一眼看**：仓库的 CI 从 0.11.0 起一路红灯。这一版修掉两个让它红的原因 ——
+都不影响运行时行为，只影响「clone 下来能不能构建/测试」。
+
+### Fixed
+- **`@deepseek-ai/dsh-user-questions` 没在 `dependencies` 里声明**：R8 引入的
+  `user-questions/request` 类型声明来自这个包，本地能解析只是因为宿主树恰好挡在解析路径上
+  （与 R11 同一类问题）。干净安装下 `tsc -b` 直接报
+  `TS2307: Cannot find module '@deepseek-ai/dsh-user-questions'`
+  以及连带的 `TS2345: 'user-questions/request' is not assignable to 'keyof Events'`。
+  已按其他 19 个依赖同款声明为 `^0.1.2-rc.1`（npm 上该版本存在且声明了此事件）。
+- **变异检查 R9-G5 的锚点写死了版本号**：`from: "const PLUGIN_VERSION = '0.11.2'"`
+  在发版升到 0.11.3 后失配，报「锚点命中 0 次」→ mutation 步骤红灯。
+  改成从 `package.json` 动态取版本，以后发版不用再改脚本。
+
+### Verification
+- 在隔离副本里**忠实复现 CI 全序列**（`npm ci` → symlink Harness-only peers →
+  `tsc -b` → build → `npm test` → mutation → contract → py_compile），六步全绿。
+- 关键一步是强制用 npm 真包 `dsh-user-questions@0.1.2-rc.1`（而非本地宿主树 symlink）
+  跑 typecheck —— 这才等价于 CI 的依赖形态，否则本地会「假绿」。
+
 ## [`0.11.3`] — 照着 README 能真装上了（安装文档三处死路 + 第三个假警报）
 
 **升级收益一眼看**：这一版修的全是**新用户第一次安装就会撞上**的问题。
