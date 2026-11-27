@@ -28,6 +28,16 @@ import { homedir } from 'node:os'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
+// 桌面版(Electron)判定: 有安装目录但没有 `dsh` CLI。宿主包打在 app.asar 里,
+// 因此 `dsh 可执行` / `--dump-config` / `依赖树 symlink` / 契约探针的模块解析
+// 这几项在桌面版属于「不适用」或「结构性限制」, 不应计为失败。
+const DESKTOP_LAYOUTS = [
+  join(process.env.LOCALAPPDATA ?? '', 'Programs', 'DeepSeek Harness', 'DeepSeek Harness.exe'),
+  join(process.env.LOCALAPPDATA ?? '', 'DeepSeek Harness', 'DeepSeek Harness.exe'),
+  join(process.env.LOCALAPPDATA ?? '', '@deepseek-ai', 'dsh-desktop'),
+]
+const DESKTOP = DESKTOP_LAYOUTS.some((p) => existsSync(p))
+
 // ── 常量(与 src/index.ts 的运行时默认值保持一致) ──
 const MIN_NODE = [22, 18, 0]
 const MIN_DSH = [0, 1, 2] // 0.1.2-rc.1 起为 v0.7.0 支持的最低版本
@@ -282,8 +292,13 @@ let dshVersion = ''
 {
   const r = run('dsh', ['--version'])
   if (!r.ok) {
-    record('dsh 可执行', false, '未找到 dsh 命令', '安装 DeepSeek Harness CLI(npm i -g @deepseek-ai/dsh), 并确认 PATH 里有 dsh; 装完跑 `dsh --version` 验证')
-    report(results[results.length - 1])
+    if (DESKTOP) {
+      record('dsh 可执行', true, '桌面版不提供 dsh CLI — N/A（运行态以第 9 项 MCP 握手为准）')
+      report(results[results.length - 1])
+    } else {
+      record('dsh 可执行', false, '未找到 dsh 命令', '安装 DeepSeek Harness CLI(npm i -g @deepseek-ai/dsh), 并确认 PATH 里有 dsh; 装完跑 `dsh --version` 验证')
+      report(results[results.length - 1])
+    }
   } else {
     dshVersion = r.stdout.trim().split(/\s+/).pop() || r.stdout.trim()
     const ok = versionAtLeast(dshVersion, MIN_DSH)
@@ -398,7 +413,10 @@ let allProfileNames = []
 }
 
 // ── 5. 插件是否被 dsh 识别(dsh --dump-config; 尽力而为) ──
-{
+// 桌面版没有 dsh CLI → 整段跳过; 运行态由第 9 项 MCP 握手覆盖
+if (DESKTOP) {
+  console.log('  · dsh --dump-config — 桌面版无 CLI，N/A（运行态以 MCP 握手为准）')
+} else {
   const r = run('dsh', ['--profile', profileName ?? 'default', '--dump-config'], 30000)
   if (!r.ok) {
     // dump-config 会先重写 profile 的 cordis.yml; EACCES/EROFS 是权限问题而非插件问题
@@ -469,17 +487,25 @@ section('依赖树')
     }
     // 真实目录里, 减去已知的「宿主树没有同名包」孤儿 → 剩下的才是需要修的漂移
     const unexpectedReal = realDirs.filter((n) => !KNOWN_LOCAL_ONLY.includes(n))
-    const ok = broken.length === 0 && unexpectedReal.length === 0
+    // 桌面版: 宿主包打在 app.asar 内, 没有可 symlink 的全局树 → 「待对齐」不算失败,
+    // 版本一致性改由外部漂移闸保证(ops/check-dsh-drift.ps1)
+    const ok = broken.length === 0 && (DESKTOP || unexpectedReal.length === 0)
     const parts = [
       `symlink ${symlinks.length}`,
       `本地副本 ${realDirs.length}${realDirs.length ? ` (${realDirs.join(', ')})` : ''}`,
     ]
     if (broken.length) parts.push(`断链 ${broken.length} (${broken.join(', ')})`)
-    if (unexpectedReal.length) parts.push(`待对齐 ${unexpectedReal.length} (${unexpectedReal.join(', ')})`)
+    if (unexpectedReal.length) {
+      parts.push(DESKTOP
+        ? `待对齐 ${unexpectedReal.length} (桌面版不可 symlink, 改看 check-dsh-drift.ps1)`
+        : `待对齐 ${unexpectedReal.length} (${unexpectedReal.join(', ')})`)
+    }
     record('依赖树 symlink 状态', ok, parts.join(' | '),
-      `跑 node scripts/link-host-deps.mjs 把仍是真实目录的包替换成指向宿主全局树的 symlink` +
-      (broken.length ? `; 断链项说明宿主树里没这个包(可能包名已漂移), 需人工确认目标` : '') +
-      (realDirs.length ? `; 注: ${KNOWN_LOCAL_ONLY.join(' / ')} 属已知技术债(宿主树无同名包), 保持本地副本不算失败` : ''))
+      DESKTOP
+        ? `桌面版 N/A: 宿主包在 app.asar 内, 不存在可指向的全局树; 请用 ops\\check-dsh-drift.ps1 校验「宿主版本 = profile 内 @deepseek-ai/dsh* 版本」`
+        : `跑 node scripts/link-host-deps.mjs 把仍是真实目录的包替换成指向宿主全局树的 symlink` +
+          (broken.length ? `; 断链项说明宿主树里没这个包(可能包名已漂移), 需人工确认目标` : '') +
+          (realDirs.length ? `; 注: ${KNOWN_LOCAL_ONLY.join(' / ')} 属已知技术债(宿主树无同名包), 保持本地副本不算失败` : ''))
     report(results[results.length - 1])
   }
 }
@@ -501,8 +527,16 @@ section('依赖树')
         `先跑 node scripts/contract_probe.mjs 看完整输出; 若报 lib/index.js 缺失则先 npm run build(探针从构建产物读契约清单)`)
       report(results[results.length - 1])
     } else if (parsed.fatal) {
-      record('宿主契约探测', false, `探针自身失败: ${String(parsed.fatal).slice(0, 160)}`,
-        `先跑 npm run build 重建 lib/index.js(探针需要 __internals.HOST_CONTRACT); 再重跑 node scripts/contract_probe.mjs`)
+      const fatalStr = String(parsed.fatal)
+      // 桌面版: 宿主包在 app.asar 内, 外部 profile 的 Node 解析不到 @deepseek-ai/* —— 结构性限制, 不是安装错误
+      const desktopStructural = DESKTOP && /Cannot find package ['"]@deepseek-ai\//.test(fatalStr)
+      record('宿主契约探测', desktopStructural,
+        desktopStructural
+          ? `桌面版结构性限制(UNSUPPORTED_DESKTOP): ${fatalStr.slice(0, 140)}`
+          : `探针自身失败: ${fatalStr.slice(0, 160)}`,
+        desktopStructural
+          ? `宿主包在 app.asar 内, 外部 profile 解析不到 @deepseek-ai/* 是预期行为; 运行态判据看第 9 项「MCP 握手 + tools/list」`
+          : `先跑 npm run build 重建 lib/index.js(探针需要 __internals.HOST_CONTRACT); 再重跑 node scripts/contract_probe.mjs`)
       report(results[results.length - 1])
     } else {
       const summary = parsed.summary ?? {}

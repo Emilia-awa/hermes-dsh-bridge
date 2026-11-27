@@ -20,16 +20,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # dsh-agent-presets（npm 独立版）的源码 import 了 cordis-plugin-include / loader，
-      # 这两个包没发布到 npm registry，只存在于 Harness 的全局树里 —— 装完 dsh 后 symlink 进来。
-      # （与 README「dual-package hazard」一节的修复循环同思路。）
-      - name: Install Harness global tree & link Harness-only peers
+      # dsh 生态的包(@deepseek-ai/*)现在声明为 peerDependencies —— 运行期由 Harness 宿主提供,
+      # 不在本包的 dependencies 里(桌面版宿主包打在 app.asar 内, 既不能 symlink 也不能 hoist)。
+      # CI 没有 Harness 宿主, 所以装一份全局树, 把整棵 @deepseek-ai 树 symlink 进 node_modules 模拟宿主解析。
+      # (dsh-agent-presets 依赖的 cordis-plugin-include / loader 也只存在于这棵树里; 与 README「dual-package hazard」一节同思路。)
+      - name: Install Harness global tree & link host packages
         run: |
-          npm i -g @deepseek-ai/dsh@0.2.0-rc.2
+          npm i -g @deepseek-ai/dsh@0.2.2-rc.5
           GLOBAL=$(npm root -g)/@deepseek-ai/dsh/node_modules/@deepseek-ai
           mkdir -p node_modules/@deepseek-ai
-          for p in cordis-plugin-include cordis-plugin-loader; do
-            ln -sfn "$GLOBAL/$p" "node_modules/@deepseek-ai/$p"
+          for p in "$GLOBAL"/*; do
+            name=$(basename "$p")
+            [ -e "node_modules/@deepseek-ai/$name" ] || ln -sfn "$p" "node_modules/@deepseek-ai/$name"
           done
 
       - name: TypeScript typecheck

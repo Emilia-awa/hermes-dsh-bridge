@@ -21,7 +21,7 @@
 import { readFileSync, existsSync } from 'node:fs'
 import { execFileSync } from 'node:child_process'
 import { createRequire } from 'node:module'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { dirname, join } from 'node:path'
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
@@ -72,7 +72,7 @@ async function loadContractModule() {
   if (!existsSync(libIndex)) {
     throw new Error('lib/index.js 不存在 —— 先跑 `npm run build`(本脚本从构建产物读取契约清单)')
   }
-  const mod = await import(libIndex)
+  const mod = await import(pathToFileURL(libIndex).href)
   const internals = mod.__internals
   if (!internals?.HOST_CONTRACT || typeof internals.probeHostContract !== 'function') {
     throw new Error('lib/index.js 里的 __internals 缺少 HOST_CONTRACT/probeHostContract —— 产物落后, 请 `npm run build` 重建')

@@ -24,7 +24,6 @@
     "docs/TROUBLESHOOTING.md"
   ],
   "scripts": {
-    "postinstall": "node scripts/link-host-deps.mjs || echo \"[hermes-dsh-bridge] postinstall: link-host-deps 未成功（多半是找不到 Harness 全局树）—— 请手动跑 `node scripts/link-host-deps.mjs`，或看 README「dual-package hazard」一节。这不影响安装完成。\"",
     "build": "tsdown --env.DSH_BUILD_FACE host && tsc -b && node scripts/check-build-artifacts.mjs",
     "build:clean": "rm -rf lib && npm run build",
     "doctor": "node scripts/doctor.mjs",
@@ -57,34 +56,76 @@
   },
   "license": "GPL-3.0-only",
   "dependencies": {
-    "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-agent-presets": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-atomic-write": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-attachment": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-brand": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-code-runtime": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-home-paths": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-invariants": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-scope": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-session": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-settings": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-system-prompt": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-timeout": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-user-approval": "^0.1.2-rc.1",
-    "@deepseek-ai/dsh-user-questions": "^0.1.2-rc.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
-    "zod": "^4.4.3"
+    "zod": "^4.4.3",
+    "@deepseek-ai/dsh-agent-presets": "^0.1.2-rc.1",
+    "@deepseek-ai/dsh-llm": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-session": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-scope": "0.2.2-rc.5"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "^4.0.2"
+    "@deepseek-ai/dsh-agent": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-atomic-write": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-attachment": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-brand": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-code-runtime": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-home-paths": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-invariants": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-settings": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-system-prompt": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-timeout": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-tools": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-user-approval": "^0.2.2-rc.5",
+    "@deepseek-ai/dsh-user-questions": "^0.2.2-rc.5"
   },
   "devDependencies": {
     "@types/node": "~22",
-    "typescript": "~5.7",
-    "tsdown": "^0.12.9"
+    "tsdown": "^0.12.9",
+    "typescript": "~5.7"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-agent": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-atomic-write": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-attachment": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-brand": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-code-runtime": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-home-paths": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-invariants": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-settings": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-system-prompt": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-timeout": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-typert-protocol": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-user-approval": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-user-questions": {
+      "optional": true
+    }
   }
 }
